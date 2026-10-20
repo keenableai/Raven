@@ -25,6 +25,7 @@ here writes to it or to its file.
 from __future__ import annotations
 
 import json
+import re
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
@@ -66,7 +67,8 @@ class ContextRetrieveTool(Tool):
     def description(self) -> str:
         return (
             "Read back the verbatim text behind [[ref ...]] tags in a compacted summary or a "
-            "pruned tool result, when the one-line record is not enough. Pass the tags as written."
+            "pruned tool result, when the one-line record is not enough. Pass the tags as written, "
+            'e.g. refs=["[[ref session/<scope>#118]]"].'
         )
 
     @property
@@ -98,7 +100,13 @@ class ContextRetrieveTool(Tool):
     async def execute(self, **kwargs: Any) -> str:
         refs = kwargs.get("refs") or []
         if isinstance(refs, str):
-            refs = [refs]
+            # A list the model serialised into one string is still the list it
+            # meant; measured, a model asked this way did exactly that.
+            try:
+                decoded = json.loads(refs)
+            except ValueError:
+                decoded = None
+            refs = decoded if isinstance(decoded, list) else [refs]
         if not isinstance(refs, list) or not refs:
             return "Error: refs must be a non-empty list of [[ref ...]] tags."
         mode = kwargs.get("mode") or "exact"
@@ -121,7 +129,7 @@ class ContextRetrieveTool(Tool):
         # asked for both.
         wanted: list[SourceRef | str] = []
         for raw in refs:
-            found = SourceRef.find_all(str(raw))
+            found = SourceRef.find_all(str(raw)) or SourceRef.find_all(_bracketed(str(raw)))
             wanted.extend(found or [str(raw)])
         answered = wanted[:_MAX_REFS]
 
@@ -278,6 +286,19 @@ def _fit(body: str, budget: int) -> str:
     while keep > 0 and (over := _tokens(body[:keep]) - budget) > 0:
         keep -= max(1, int(over * per_token))
     return body[: max(0, keep)]
+
+
+_BARE_REF = re.compile(r"(?:\bref\s+)?(?P<body>[\w.-]+/[^#\]\s\[]+#\d+(?:-\d+)?)")
+
+
+def _bracketed(raw: str) -> str:
+    """``raw`` with every bare ``store/scope#n`` respelled as a full tag.
+
+    A model that copies the address out of a tag and leaves the brackets behind
+    named the entry it wants; refusing it on the spelling cost one measured run
+    the answer, because the model took the refusal as "not retrievable".
+    """
+    return _BARE_REF.sub(lambda m: f"[[ref {m['body']}]]", raw)
 
 
 __all__ = ["ContextRetrieveTool"]

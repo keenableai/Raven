@@ -274,6 +274,27 @@ class TestRetrieval:
 
         assert "small result" in out
 
+    async def test_an_address_without_its_brackets_is_still_read(self, tmp_path: Path) -> None:
+        """Measured on a live run: the model copied the address out of the tag
+        and left the brackets behind, then took the refusal as "gone"."""
+        manager, session = _saved(tmp_path, "small result")
+        bare = _ref(session, 2).render().removeprefix("[[ref ").removesuffix("]]")
+
+        out = await _retriever(manager, session).execute(refs=[bare])
+
+        assert "small result" in out
+
+    async def test_a_list_serialised_into_one_string_is_still_read(self, tmp_path: Path) -> None:
+        """The same live call also sent the list as a JSON string."""
+        import json as _json
+
+        manager, session = _saved(tmp_path, "small result")
+        bare = _ref(session, 2).render().removeprefix("[[ref ").removesuffix("]]")
+
+        out = await _retriever(manager, session).execute(refs=_json.dumps([bare]), max_tokens="8000")
+
+        assert "small result" in out
+
     async def test_an_unusable_budget_falls_back_to_the_default(self, tmp_path: Path) -> None:
         manager, session = _saved(tmp_path, "small result")
 
