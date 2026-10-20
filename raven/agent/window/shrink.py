@@ -28,6 +28,7 @@ from raven.agent.window.images import (
     withdrawn_image_note,
 )
 from raven.agent.window.turn_log import STAND_IN_KEY
+from raven.config.raven import PRUNE_LINE_MAX_CHARS
 from raven.context_engine.history.markers import HISTORY_PINNED_KEY
 from raven.providers.capabilities import image_placeholder_text
 from raven.utils.images import is_image_part
@@ -104,8 +105,10 @@ def emergency_shrink(messages: list[dict]) -> tuple[list[dict], int]:
     placeholder = ELIDED_TOOL_OUTPUT
     # A pinned result is held whatever its age: the history strategy kept it
     # because a missing copy is silently wrong, and an elided one is missing.
-    # So is a result that already carries a ref: it is a one-line record of a
-    # pruned body, and eliding it saves a line and loses the way back.
+    # So is a pruned body's record -- one short line carrying a ref: eliding it
+    # saves a line and loses the way back. Only a short one: a long result that
+    # merely opens on a ref (what ``context_retrieve`` returns) is bulk like any
+    # other, and holding it would leave an overflow nothing to give up.
     tool_idxs = [
         i
         for i, m in enumerate(messages)
@@ -136,7 +139,7 @@ def emergency_shrink(messages: list[dict]) -> tuple[list[dict], int]:
 
 
 def _carries_ref(content: Any) -> bool:
-    return isinstance(content, str) and REF_PATTERN.search(content) is not None
+    return isinstance(content, str) and len(content) <= PRUNE_LINE_MAX_CHARS and REF_PATTERN.search(content) is not None
 
 
 def demote_tool_images(messages: list[dict]) -> tuple[list[dict], int]:

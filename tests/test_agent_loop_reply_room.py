@@ -271,3 +271,67 @@ async def test_a_streamed_overflow_reaches_the_recovery_instead_of_ending_the_tu
     assert isinstance(response, LLMResponse)
     assert response.finish_reason == "error"
     assert response.error_classification is not None and response.error_classification.should_compress
+
+
+def test_a_long_retrieved_body_that_opens_on_a_ref_is_still_given_up():
+    messages: list[dict[str, Any]] = [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}]
+    retrieved = "[[ref session/x@0#3]] role=tool name=read_file chars=40,000\n" + "body " * 2000
+    messages.append({"role": "tool", "tool_call_id": "r", "content": retrieved})
+    for i in range(3):
+        messages.append({"role": "tool", "tool_call_id": f"t{i}", "content": f"body {i}"})
+
+    shrunk, elided = shrink.emergency_shrink(messages)
+
+    assert elided == 1
+    assert shrunk[2]["content"] == shrink.ELIDED_TOOL_OUTPUT
+
+
+@pytest.mark.asyncio
+async def test_the_overflow_tells_the_lesson_whether_the_refused_request_was_narrowed(workspace, monkeypatch):
+    from raven.contracts.harness import WindowPressure, WindowState
+
+    agent = _agent(workspace, _Recording([]), monkeypatch)
+    memory = agent.harness.memory
+    monkeypatch.setattr(memory, "_output_ceiling", lambda model=None: _CEILING)
+    # The prompt alone decides it here: the default tool surface is several
+    # thousand tokens, which on this window would narrow every request.
+    monkeypatch.setattr(memory, "_tool_definitions", lambda: [])
+    lessons: list[bool] = []
+    real = headroom.learn_from_overflow
+
+    def spy(*a, narrowed=False, **k):
+        lessons.append(narrowed)
+        return real(*a, narrowed=narrowed, **k)
+
+    monkeypatch.setattr(headroom, "learn_from_overflow", spy)
+    for words in (10, 10_000):
+        await memory.shrink(
+            _prompt(words), pressure=WindowPressure.OVERFLOW, state=WindowState(image_window=2), model="stub"
+        )
+
+    assert lessons == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_the_wrap_up_on_an_exhausted_turn_is_sized_like_any_call(workspace, monkeypatch):
+    provider = _Recording([LLMResponse(content="wrapped up", finish_reason="stop")])
+    agent = _agent(workspace, provider, monkeypatch)
+
+    await agent._synthesize_final_on_exhaustion(_prompt(10_000), "stub", None, fallback="static")
+
+    call = provider.calls[0]
+    assert call["max_tokens"] < _CEILING, "near the window the wrap-up asks only for the room beside it"
+
+
+def test_the_after_turn_pipeline_reads_the_envelope_without_its_recall():
+    from raven.agent.loop.turn_path import _without_scratch
+    from raven.context_engine.scratch import TURN_SCRATCH_KEY
+
+    scratch = "[Turn Scratch — recalled for this turn only, not conversation history]\n\n# Memory\n\n- a recalled fact"
+    envelope = {"role": "user", "content": f"the question\n\n{scratch}", TURN_SCRATCH_KEY: scratch}
+
+    out = _without_scratch([envelope, {"role": "assistant", "content": "answer"}])
+
+    assert out[0]["content"] == "the question"
+    assert TURN_SCRATCH_KEY not in out[0]
+    assert TURN_SCRATCH_KEY in envelope, "the record itself is left alone"

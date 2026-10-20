@@ -237,6 +237,19 @@ def _turns_a_person_opened(messages: list[dict[str, Any]]) -> list[dict[str, Any
     return out
 
 
+def _without_scratch(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The turn as the after-turn pipeline should read it: its envelope without
+    the recall the assembler appended, which is this turn's input, not its record."""
+    from raven.context_engine.scratch import TURN_SCRATCH_KEY, strip_turn_scratch
+
+    out = []
+    for m in messages:
+        if m.get(TURN_SCRATCH_KEY):
+            m = {k: v for k, v in m.items() if k != TURN_SCRATCH_KEY} | {"content": strip_turn_scratch(m) or ""}
+        out.append(m)
+    return out
+
+
 def _stamp_turn_observers(messages: list[dict[str, Any]], metadata: dict[str, Any] | None, turn_base: int) -> None:
     """File the turn's observer record onto its last substantive assistant message.
 
@@ -2890,7 +2903,7 @@ class TurnPathMixin:
             key,
             {
                 "final_content": final_content,
-                "messages": turn_msgs[turn_start_idx:],
+                "messages": _without_scratch(turn_msgs[turn_start_idx:]),
             },
         )
         # Plugin-side indexing (third peer step in the after-turn pipeline).
