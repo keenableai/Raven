@@ -37,10 +37,10 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 #
 # Every part of the turn context is produced by a :class:`SegmentBuilder`.
-# seg1–5 (identity / bootstrap / memory / active-skills / skills) and the
-# Curator are all SegmentBuilders — there is no separate "lane" category.
-# :class:`ContextAssembler` runs them in two phases and routes their
-# outputs into the system / history slots.
+# seg1–5 (identity / bootstrap / active-skills / memory / skills) and the
+# history strategy are all SegmentBuilders — there is no separate "lane"
+# category. :class:`ContextAssembler` runs them in two phases and routes their
+# outputs into the system / user / history slots.
 
 
 @dataclass(frozen=True)
@@ -150,9 +150,11 @@ class Segment:
     """The uniform product of a :class:`SegmentBuilder`.
 
     - ``text`` — the segment's contribution to the **system** slot
-      (joined by ``order``); ``""`` means "no segment this turn".
-    - ``history`` — the **history** slot contribution; only the Curator
-      sets this (``None`` for every other builder).
+      (joined by ``order``), or to the turn scratch at the end of the user
+      message when the builder is not ``stable`` and the scratch is on;
+      ``""`` means "no segment this turn".
+    - ``history`` — the **history** slot contribution; only the history
+      strategy's builder sets this (``None`` for every other builder).
     - ``meta`` — merged into ``AssembledContext.metadata`` (e.g.
       ``injected_skill_ids`` / ``memory_hits`` / ``path``).
     """
@@ -186,7 +188,9 @@ class SegmentBuilder(Protocol):
     so one volatile segment ends the run for every stable segment behind it.
     The default ``False`` is the safe answer: a segment wrongly called stable
     would have its neighbours cached under a key that changes anyway, which
-    costs the write and returns nothing.
+    costs the write and returns nothing. With ``context.cache.turnScratch`` on,
+    a phase-A segment that declares ``False`` leaves the system prompt for the
+    end of the turn's user message.
     """
 
     name: str
@@ -206,10 +210,8 @@ class ContextEngine(ABC):
     :class:`ContextAssembler <raven.context_engine.assembler.ContextAssembler>`
     — assembles a flat list of :class:`SegmentBuilder` into the turn's
     messages. Phase A runs seg1–5 concurrently (identity / bootstrap /
-    memory+recall / active-skills / router-skills); phase B runs the
-    Curator (``# Curator Working State`` + budget-trimmed ``*history``).
-    ``owns_compaction=True``; AgentLoop defers compaction to
-    :meth:`after_turn`.
+    active-skills / memory+recall / router-skills); phase B runs the history
+    strategy ``context.history.strategy`` selects, which fills ``*history``.
     """
 
     @property
