@@ -1,0 +1,264 @@
+"""``context_retrieve`` -- the way back from a ref to the text it stands for.
+
+A ``[[ref ...]]`` in the window is a promise: the thing it names is one call
+away, verbatim. This tool is that call. Without it a ref is decoration, and the
+pruner that mints refs would just be deleting output with a citation attached.
+
+Only the ``session`` store resolves here, and only for the session the turn
+belongs to. That second half is the part worth stating: a ref is a string the
+model can compose, so a tool that resolved whatever scope it was handed would
+read another conversation's log on request. The scope is checked against the
+session's current :class:`~raven.contracts.context.SessionRevision`, which also
+makes a ref minted before a ``/new`` or an undo a miss rather than a wrong
+answer.
+
+What comes back is byte-for-byte what the tool returned, up to the caller's
+token budget -- the budget is reported when it binds, so a partial answer is
+never mistaken for a whole one. A span written before the log kept results
+whole is reported as truncated instead: those bytes were never stored and no
+amount of asking will produce them.
+
+Read-only: the session is looked up with ``SessionManager.peek`` and nothing
+here writes to it or to its file.
+"""
+
+from __future__ import annotations
+
+import json
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
+
+from raven.contracts.context import SessionRevision
+from raven.contracts.tool import Tool
+from raven.session.refs import SESSION_REF_STORE, belongs_to, is_truncated
+from raven.utils.refs import SourceRef
+from raven.utils.tokens import estimate_message_tokens
+
+if TYPE_CHECKING:
+    from raven.session.manager import SessionManager
+
+_DEFAULT_MAX_TOKENS = 4_000
+_MIN_MAX_TOKENS = 256
+_MAX_MAX_TOKENS = 32_000
+_SNIPPET_HEAD_CHARS = 800
+_SNIPPET_TAIL_CHARS = 400
+_HEADER_ALLOWANCE_CHARS = 80
+"""Room left for an entry's header when its body has to be cut to the budget,
+so the line that says how much was shown is not itself what overruns."""
+_MAX_REFS = 20
+"""Refs answered in one call. A span already carries many messages, and the
+budget is shared, so a longer list only splits the same allowance further."""
+
+
+class ContextRetrieveTool(Tool):
+    """Reads back the messages a ref names, from this session's log."""
+
+    def __init__(self, sessions: SessionManager) -> None:
+        self._sessions = sessions
+        self._session_key: ContextVar[str | None] = ContextVar("context_retrieve_session_key", default=None)
+
+    def set_context(self, channel: str, chat_id: str, session_key: str | None = None) -> None:
+        """Bind the turn's session (turn-local, like every other routed tool)."""
+        self._session_key.set(session_key or f"{channel}:{chat_id}")
+
+    @property
+    def name(self) -> str:
+        return "context_retrieve"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Retrieve the verbatim original text behind a [[ref ...]] tag that appears in a "
+            "compacted summary or in place of a pruned tool result. Pass the tags exactly as "
+            "they appear, e.g. [[ref session/4f9c0e2a7b1d4c3e8a6f5b2d1c0e9f8a@0#118]]. Use it when "
+            "the one-line record of a call is not enough to go on -- the full output is still "
+            "stored, only the window no longer carries it."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "The [[ref ...]] tags to resolve, as they appear in the context.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["exact", "snippet"],
+                    "description": (
+                        "exact (default) returns the stored text verbatim; snippet returns the "
+                        "opening and closing of each entry, for deciding whether the whole is worth reading."
+                    ),
+                },
+                "max_tokens": {
+                    "type": "integer",
+                    "minimum": _MIN_MAX_TOKENS,
+                    "maximum": _MAX_MAX_TOKENS,
+                    "description": (
+                        f"Budget for everything this call returns (default {_DEFAULT_MAX_TOKENS}). "
+                        "Raise it to read a large result whole."
+                    ),
+                },
+            },
+            "required": ["refs"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        refs = kwargs.get("refs") or []
+        if isinstance(refs, str):
+            refs = [refs]
+        if not isinstance(refs, list) or not refs:
+            return "Error: refs must be a non-empty list of [[ref ...]] tags."
+        mode = kwargs.get("mode") or "exact"
+        if mode not in ("exact", "snippet"):
+            return f"Error: unknown mode {mode!r}; expected 'exact' or 'snippet'."
+        budget = _clamp_budget(kwargs.get("max_tokens"))
+
+        session_key = self._session_key.get()
+        if not session_key:
+            return "Error: context_retrieve has no session bound; nothing to retrieve from."
+        session = self._sessions.peek(session_key)
+        if session is None:
+            return f"Error: session {session_key!r} has no stored log."
+        # Both off the same object, read once: the revision is what says which
+        # messages the ordinals of an accepted ref name.
+        messages = session.messages
+        revision = session.revision
+
+        sections: list[str] = []
+        for raw in refs[:_MAX_REFS]:
+            section, spent = self._resolve(str(raw), messages, revision, mode=mode, budget=budget)
+            sections.append(section)
+            budget -= spent
+            if budget <= 0:
+                remaining = len(refs[:_MAX_REFS]) - len(sections)
+                if remaining > 0:
+                    sections.append(
+                        f"[{remaining} more ref(s) not read: the token budget for this call is spent. "
+                        "Ask again for them, or raise max_tokens.]"
+                    )
+                break
+        if len(refs) > _MAX_REFS:
+            sections.append(f"[{len(refs) - _MAX_REFS} ref(s) beyond the {_MAX_REFS} this call answers were ignored.]")
+        return "\n\n".join(sections)
+
+    # ------------------------------------------------------------------
+
+    def _resolve(
+        self,
+        raw: str,
+        messages: Sequence[Mapping[str, Any]],
+        revision: SessionRevision,
+        *,
+        mode: str,
+        budget: int,
+    ) -> tuple[str, int]:
+        """One ref: its entries and what reading them cost."""
+        ref = SourceRef.parse(raw)
+        if ref is None:
+            return (f"[{raw!r} is not a ref; expected the [[ref store/scope#n]] form]", 0)
+        if ref.store != SESSION_REF_STORE:
+            return (f"[{ref.render()}: the {ref.store!r} store is not retrievable here]", 0)
+        if not belongs_to(ref, revision):
+            if ref.scope.partition("@")[0] == revision.log_id:
+                return (
+                    f"[{ref.render()}: minted before an undo rewrote this conversation's log; the "
+                    "entries it named may now hold other messages, so it is not read back]",
+                    0,
+                )
+            return (
+                f"[{ref.render()}: not part of this conversation's log. A ref from before a /new, "
+                "or from another session, names nothing that can be read back]",
+                0,
+            )
+        if not 0 <= ref.lo <= ref.hi < len(messages):
+            return (f"[{ref.render()}: out of range; this log holds {len(messages)} message(s)]", 0)
+
+        rendered: list[str] = []
+        spent = 0
+        for index in range(ref.lo, ref.hi + 1):
+            if spent >= budget:
+                rendered.append(f"[entries {index}-{ref.hi} not read: the token budget for this call is spent]")
+                break
+            entry, cost = _render_entry(
+                SourceRef(ref.store, ref.scope, index, index),
+                messages[index],
+                mode=mode,
+                budget=budget - spent,
+            )
+            rendered.append(entry)
+            spent += cost
+        return ("\n\n".join(rendered), spent)
+
+
+def _clamp_budget(raw: Any) -> int:
+    try:
+        asked = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_TOKENS
+    return max(_MIN_MAX_TOKENS, min(_MAX_MAX_TOKENS, asked))
+
+
+def _render_entry(
+    ref: SourceRef,
+    message: Mapping[str, Any],
+    *,
+    mode: str,
+    budget: int,
+) -> tuple[str, int]:
+    """One message, headed by what it is and how much of it is here."""
+    body = _body(message.get("content"))
+    header = [ref.render(), f"role={message.get('role', '?')}"]
+    if name := message.get("name"):
+        header.append(f"name={name}")
+    header.append(f"chars={len(body):,}")
+    if is_truncated(message.get("content")):
+        # Written under the old 16000-character cap. The rest was never stored,
+        # so saying so is the only honest answer.
+        header.append("truncated=true")
+
+    shown = body if mode == "exact" else _snippet(body)
+    shown, clipped = _fit(shown, budget)
+    if clipped or shown != body:
+        header.append(f"shown={len(shown):,}/{len(body):,} chars")
+    text = f"{' '.join(header)}\n{shown}"
+    return text, estimate_message_tokens({"role": "tool", "content": text})
+
+
+def _body(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    return json.dumps(content, ensure_ascii=False)
+
+
+def _snippet(body: str) -> str:
+    if len(body) <= _SNIPPET_HEAD_CHARS + _SNIPPET_TAIL_CHARS:
+        return body
+    elided = len(body) - _SNIPPET_HEAD_CHARS - _SNIPPET_TAIL_CHARS
+    return f"{body[:_SNIPPET_HEAD_CHARS]}\n\n[... {elided:,} chars, ask again with mode=exact ...]\n\n{body[-_SNIPPET_TAIL_CHARS:]}"
+
+
+def _fit(body: str, budget: int) -> tuple[str, bool]:
+    """``body`` cut to ``budget`` tokens, and whether it had to be.
+
+    The characters-per-token ratio is taken from this body rather than assumed,
+    so a Chinese stack trace and an English one are both cut where they
+    actually reach the budget.
+    """
+    if not body:
+        return body, False
+    cost = estimate_message_tokens({"role": "tool", "content": body})
+    if cost <= budget:
+        return body, False
+    per_token = max(1.0, len(body) / max(1, cost))
+    keep = max(0, int(budget * per_token) - _HEADER_ALLOWANCE_CHARS)
+    return body[:keep], True
+
+
+__all__ = ["ContextRetrieveTool"]

@@ -241,6 +241,7 @@ class OrganGlueMixin:
                 chat_id=chat_id,
                 surface=surface,
                 selected_skills=selected_skills,
+                session_revision=session.revision if isinstance(session, Session) else None,
             ),
         )
         # Stash the engine's injected_skill_ids so the after-turn

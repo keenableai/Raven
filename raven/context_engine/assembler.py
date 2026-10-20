@@ -159,6 +159,7 @@ class ContextAssembler(ContextEngine):
             task_done_when=turn.task_done_when,
             session_messages=session_messages,
             budget=budget,
+            session_revision=turn.session_revision,
         )
 
         # ── Phase A — independent segment builders, concurrent ──────

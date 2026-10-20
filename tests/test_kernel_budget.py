@@ -277,6 +277,21 @@ all of them this addition: without it the package stands at 3,632.
 
 Measured at 3,682.
 
+
+And once more, 3,700 -> 3,815 (2026-10-20), for the compacting history
+strategy on the context paper. Two carriers: ``SessionRevision``, the log id,
+generation and message count a ``[[ref ...]]`` into the session log is scoped
+by, so a ref minted before a ``/new`` or an undo misses instead of naming
+another message; and ``OverflowOutcome``, what an engine reclaimed from a
+prompt the provider refused as too long. ``ContextEngine`` gains two
+capability properties, ``wants_full_history`` and ``mints_source_refs``, and
+``on_context_overflow``, all defaulting to "not mine" so every existing engine
+is unchanged; ``AssemblyContext`` and ``TurnContext`` each append one
+``session_revision`` field. 95 lines, all of them this addition: the package
+stood at the old ceiling, 3,700, without it.
+
+Measured at 3,795.
+
 """
 
 from __future__ import annotations
@@ -287,7 +302,7 @@ import sys
 from pathlib import Path
 
 LINE_CEILING = 2_000
-CONTRACTS_LINE_CEILING = 3_700
+CONTRACTS_LINE_CEILING = 3_815
 THIRD_PARTY_ALLOWED = frozenset({"loguru"})
 DEBT_MARKER = re.compile(r"\b(TODO|FIXME|HACK)\b")
 
