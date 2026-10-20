@@ -3154,6 +3154,9 @@ class TurnPathMixin:
         duration. ``trace_id`` travels with it and marks the same entry, so a
         selection of turns can find each turn's messages in the record.
         """
+        # Deferred: ``raven.context_engine`` imports back out of this tier.
+        from raven.context_engine.scratch import strip_turn_scratch
+
         # Both exits that persist a turn come through here, so a question noted
         # on the turn is filed once whichever exit runs. The early inbound write
         # also comes through, before any question, and files nothing.
@@ -3253,6 +3256,16 @@ class TurnPathMixin:
             if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
                 entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
             elif role == "user":
+                # The turn scratch (recalled memory, routed skills) is rebuilt
+                # from the query every turn. Recording it would turn the log
+                # from append-only into rewritten -- next turn's cache prefix
+                # would no longer match this turn's, and the recalled text would
+                # pile up in history forever.
+                without_scratch = strip_turn_scratch(content)
+                if without_scratch is None:
+                    continue
+                if without_scratch is not content:
+                    content = entry["content"] = without_scratch
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the runtime-context prefix, keep only the user text.
                     parts = content.split("\n\n", 1)

@@ -4,9 +4,12 @@ Assembles a uniform list of :class:`SegmentBuilder` into the turn's
 message array. Two phases:
 
 - **Phase A (parallel)** — every builder with ``needs_prefix=False``
-  (seg1–5: identity / bootstrap / memory / active-skills / skills) runs
+  (seg1–5: identity / bootstrap / active-skills / memory / skills) runs
   concurrently. Their ``text`` joins into the system prefix; their
-  ``meta`` merges into the assembled metadata.
+  ``meta`` merges into the assembled metadata. Under turn scratch (the
+  default) the text of a builder that declares ``stable = False`` goes to
+  the end of the turn's user message instead (:mod:`.scratch`), so the
+  system prompt holds nothing that moves with the query.
 - **Phase B (serial)** — builders with ``needs_prefix=True`` (the
   Curator) run with ``ctx.prefix`` populated (the assembled prefix +
   user message + tool defs), so they size ``*history`` against the exact
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
@@ -30,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from loguru import logger
 
 from raven.context_engine.scent import ScentMenu
+from raven.context_engine.scratch import append_turn_scratch, render_turn_scratch
 from raven.context_engine.segments import render
 from raven.contracts.assembled import AssembledContext, TokenBudget
 from raven.contracts.context import AssembledPrefix, AssemblyContext, ContextEngine, SegmentBuilder
@@ -96,6 +101,7 @@ class ContextAssembler(ContextEngine):
         wants_full_history: bool = True,
         owns_compaction: bool = True,
         mints_source_refs: bool = False,
+        turn_scratch: bool = True,
     ) -> None:
         # The three are the history strategy's, declared in its registry entry;
         # the defaults are the Curator's, which is what an assembler built
@@ -111,6 +117,7 @@ class ContextAssembler(ContextEngine):
         self._phase_b = [b for b in self._builders if b.needs_prefix]
         self.get_tool_definitions = get_tool_definitions
         self.get_tool_notices = get_tool_notices
+        self._turn_scratch = turn_scratch
         self._now_fn = now_fn or datetime.now
 
     @property
@@ -173,13 +180,19 @@ class ContextAssembler(ContextEngine):
                 logger.opt(exception=seg).error("segment builder {} failed; assembling without it", builder.name)
         meta: dict[str, Any] = {}
         prefix_parts: list[tuple[int, str, bool]] = []
+        scratch_parts: list[tuple[int, str]] = []
         for builder, seg in zip(self._phase_a, a_segs):
             if seg is None or isinstance(seg, Exception):
                 continue
             meta |= seg.meta
-            if seg.text:
+            if not seg.text:
+                continue
+            if self._turn_scratch and self._is_turn_scoped(builder):
+                scratch_parts.append((builder.order, seg.text))
+            else:
                 prefix_parts.append((builder.order, seg.text, bool(getattr(builder, "stable", False))))
         prefix_parts.sort(key=lambda t: t[0])
+        scratch_parts.sort(key=lambda t: t[0])
         system_prefix = _SEG_SEP.join(text for _, text, _ in prefix_parts)
 
         if self._scent is not None:
@@ -190,7 +203,8 @@ class ContextAssembler(ContextEngine):
                 # only writer of this key: the after-turn backend feedback
                 # keeps receiving the skills the model was offered.
                 meta |= {"injected_skill_ids": list(scent.skill_ids)}
-        user_msg = self._build_user(ctx)
+        scratch = render_turn_scratch([text for _, text in scratch_parts])
+        user_msg = self._build_user(ctx, extra_tail=[scratch] if scratch else [])
 
         # ── Phase B — prefix-dependent builders (Curator), serial ───
         ctx_b = replace(
@@ -238,8 +252,18 @@ class ContextAssembler(ContextEngine):
         messages = [system_msg, *_coalesce_assistant(history), user_msg]
         return AssembledContext(
             messages=messages,
-            metadata=meta | {"engine": self.name},
+            metadata=meta | {"engine": self.name, "turn_scratch": bool(scratch)},
         )
+
+    @staticmethod
+    def _is_turn_scoped(builder: SegmentBuilder) -> bool:
+        """Whether this builder's text is kept out of the system prompt.
+
+        Only a builder that declares ``stable = False`` moves. An undeclared one
+        stays where it has always been: the flag is for new contributors, and
+        silently relocating a plugin's segment would change what the model reads.
+        """
+        return getattr(builder, "stable", None) is False
 
     async def after_turn(
         self,
@@ -282,8 +306,8 @@ class ContextAssembler(ContextEngine):
             if setter is not None:
                 setter(tokens)
 
-    def _build_user(self, ctx: AssemblyContext) -> dict[str, Any]:
-        """The single structural user message: runtime context + content.
+    def _build_user(self, ctx: AssemblyContext, *, extra_tail: Sequence[str] = ()) -> dict[str, Any]:
+        """The single structural user message: runtime context + content + tail.
 
         The scent menu (pull-mode skill discovery) rides the same envelope
         as the clock: per-turn material belongs at the sequence tail, where
@@ -296,6 +320,12 @@ class ContextAssembler(ContextEngine):
         it — stored as the user's own text it would render as such on resume
         and feed the next turn's novelty window its own output. Hence the
         single-newline join and the collapse of any blank lines within.
+
+        ``extra_tail`` carries per-turn blocks that must reach the model but
+        never the session log -- recalled memory, routed skills, and whatever a
+        plugin appends next. They ride at the very end because everything before
+        them is the prefix providers cache; each entry is appended in the
+        content's existing shape, so a plain string stays a plain string.
         """
         notices = self.get_tool_notices() if self.get_tool_notices is not None else None
         runtime_ctx = render.build_runtime_context(
@@ -314,6 +344,8 @@ class ContextAssembler(ContextEngine):
             merged: Any = f"{runtime_ctx}\n\n{user_content}"
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
+        for block in extra_tail:
+            merged = append_turn_scratch(merged, block)
         return {"role": "user", "content": merged}
 
 

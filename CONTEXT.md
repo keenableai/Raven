@@ -1235,12 +1235,23 @@ defer into Phase B.
 A SegmentBuilder's uniform output: system-slot text, optional history (only the
 Curator sets this), and metadata merged into the assembled context.
 
+**Turn Scratch** (`context_engine/scratch.py`):
+The tagged block appended to the end of the turn's user message carrying the
+phase-A segments whose builder declares `stable = False`, which today is
+`# Memory` and `# Skills`. It reaches the model but never `session.messages` —
+the loop's `_save_turn` strips it, the same way it strips the runtime-context
+header — and it keeps the system prompt byte-identical across turns.
+`context.cache.turnScratch = false` puts those segments back in the system prompt.
+_Avoid_: calling it "injected memory" — it is a slot, and what occupies it is
+whatever the builders declared too volatile for the system prompt.
+
 **Prompt Segments**:
 The ordered blocks `ContextAssembler` renders into the system prompt, one per
-SegmentBuilder: `# Raven` (identity), the Bootstrap Files block, `# Memory`
-(host `user.md` ⊕ EverOS recall), `# Active Skills` (always-on) and `# Skills`
+SegmentBuilder: `# Raven` (identity), the Bootstrap Files block, `# Active Skills`
+(always-on), `# Memory` (host `user.md` ⊕ EverOS recall) and `# Skills`
 (SkillForge-routed candidates — see SkillForge), and `# Curator Working State`
-(Segment 6). `context.dropSegments` names, by builder name, the host segments an agent does
+(Segment 6). Under Turn Scratch, `# Memory` and `# Skills` ride in the user
+message instead. `context.dropSegments` names, by builder name, the host segments an agent does
 without — an agent whose bootstrap files carry its own identity drops `identity`.
 _Avoid_: treating the system prompt as one opaque blob — each segment has an owner and order.
 

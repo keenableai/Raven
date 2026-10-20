@@ -5,12 +5,16 @@ ordered list of :class:`SegmentBuilder`s, each owning one section of the
 system prompt:
 
 - **Identity / Bootstrap / ActiveSkills** — the host's own sections.
-- **Memory** — ``backend.recall(user_id=...)`` (segment 3, ``# Memory``).
+- **Memory** — ``backend.recall(user_id=...)`` (segment 4, ``# Memory``).
 - **Skills** — a :class:`SkillForgeRouter` over 1-3 sources (segment 5,
   ``# Skills``), built only under pull discovery.
 - **History** — the strategy ``context.history.strategy`` names (see
   :mod:`raven.context_engine.history`): ``compacting`` by default, or the
   Curator. Owns ``*history``.
+
+With ``context.cache.turn_scratch`` on (the default), the two sections that
+move with the query -- ``# Memory`` and ``# Skills`` -- are appended to the
+turn's user message instead of the system prompt.
 
 The SkillForgeRouter is assembled from up to three sources:
 
@@ -223,6 +227,7 @@ def build_context_engine(
         wants_full_history=strategy.wants_full_history,
         owns_compaction=strategy.owns_compaction,
         mints_source_refs=strategy.mints_source_refs,
+        turn_scratch=getattr(getattr(config, "cache", None), "turn_scratch", True),
     )
     # The find_skill tool searches through the same router the engine
     # retrieves with, whichever discovery mode is active.

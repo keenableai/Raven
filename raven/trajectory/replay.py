@@ -50,7 +50,11 @@ content or tool arguments still counts as a real divergence:
   lines (``security.trust.wrap_untrusted``) — fence *bodies* stay untouched;
 - prompt-cache breakpoints, removed from both sides via
   ``providers.prompt_cache.strip`` — cache placement is a transport
-  optimization, not conversation semantics.
+  optimization, not conversation semantics;
+- the turn scratch at the end of a user message
+  (``context_engine.scratch``) — recalled memory and routed skills, the same
+  environmental material as the system prompt below, only placed in the user
+  slot so the system prompt stays cacheable.
 
 System-role message *content* is deliberately not compared: it is assembled
 from the live environment (workspace paths, current time, memory state) that
@@ -445,6 +449,10 @@ def _canonical_message(msg: Any) -> Any:
     out: dict[str, Any] = {"role": msg.get("role")}
     if msg.get("role") == "system":
         out["content"] = "<system prompt: not compared>"
+    elif msg.get("role") == "user":
+        from raven.context_engine.scratch import strip_turn_scratch
+
+        out["content"] = _canonical(strip_turn_scratch(msg.get("content")))
     else:
         out["content"] = _canonical(msg.get("content"))
     for key in ("name", "tool_call_id", "reasoning_content", "thinking_blocks"):
