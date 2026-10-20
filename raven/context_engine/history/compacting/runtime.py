@@ -12,7 +12,8 @@ call and a ref, which reclaims most of a large session without any message
 leaving the window. The prompt is then measured again, and a turn that is back
 under the line ships with every exchange still present. Only what the pruner
 could not buy is paid for by removing messages -- and what is removed leaves a
-checkpoint behind: a fold saying how much went and where to ask for it.
+checkpoint behind: eight sections written by the turn's own model, or, when no
+model answers, a fold saying how much went and where to ask for it.
 
 Three properties hold the history together across turns:
 
@@ -70,9 +71,19 @@ from raven.context_engine.history.compacting.pruner import PruneOutcome, ToolRes
 from raven.context_engine.history.compacting.retention import Ranges, RetentionPlanner, Selection
 from raven.context_engine.history.compacting.store import CHECKPOINT_DIR, CheckpointStore, CompactingState
 from raven.context_engine.history.compacting.trigger import CompactionPlan, CompactionTrigger, TriggerPolicy
+from raven.context_engine.history.compacting.writer import (
+    SYSTEM_KEY,
+    USER_KEY,
+    CheckpointWriter,
+    MessageKey,
+    RequestRecord,
+    checkpoint_key,
+    session_message_key,
+)
 from raven.context_engine.history.markers import HISTORY_CHECKPOINT_KEY, HISTORY_PINNED_KEY, HISTORY_PRIVATE_KEYS
 from raven.context_engine.history_trimmer import HistoryTrimmer, TrimOutcome
 from raven.contracts.context import AssemblyContext, OverflowOutcome, Segment
+from raven.providers import prompt_cache
 from raven.providers.binding import ModelBinding, active_window, resolve
 from raven.session.refs import session_ref
 from raven.utils.tokens import estimate_message_tokens, estimate_prompt_tokens
@@ -88,8 +99,9 @@ SEGMENT_PATH = "compacting"
 _MAX_TRACKED_SESSIONS = 64
 """Sessions whose in-process memo is kept, most recent first.
 
-Bounded so a process serving many sessions does not keep every standing
-checkpoint alive. Evicting one costs nothing: everything that decides the
+Bounded because the memo holds the last request verbatim, which keeps that
+session's messages alive for as long as the entry does. Evicting one costs one
+cache reuse on the next summary and nothing else: everything that decides the
 history is on disk.
 """
 
@@ -99,13 +111,23 @@ class _Memo:
     """What this process remembers about a session between turns.
 
     A cache, never the authority: the history is decided from the state on
-    disk. What lives here is what the overflow path needs to recognise the
-    standing checkpoint in a prompt it is handed.
+    disk. What lives only here is what losing costs at most one prefix reuse --
+    the last request as it was sent, and the key list that names its messages.
     """
 
     scope: str = ""
     generation: int = 0
     checkpoint_message: dict[str, Any] | None = None
+    keys: tuple[MessageKey, ...] = ()
+    """What each message of the list this turn produced stands for, in order:
+    the system message, every history message, the user message."""
+
+    view: tuple[dict[str, Any], ...] = ()
+    """The history this turn produced, normalised the way :func:`_comparable`
+    reads a sent message, so :meth:`CompactingHistoryBuilder.note_request` can
+    tell a request that carried it unchanged from one that did not."""
+
+    record: RequestRecord | None = None
     warned: bool = False
 
 
@@ -137,6 +159,7 @@ class CompactingHistoryBuilder:
         self.planner = RetentionPlanner(self.cfg, list(getattr(config, "pinned_skill_ids", None) or []))
         self.pruner = ToolResultPruner(self.cfg.prune)
         self.trimmer = HistoryTrimmer(provider, model, get_tool_definitions, context_window_tokens)
+        self.writer = CheckpointWriter(self.cfg.summary, now_fn=now_fn)
         self._now_fn = now_fn
         self.store = CheckpointStore(workspace / CHECKPOINT_DIR)
         self._sessions: dict[str, _Memo] = {}
@@ -175,6 +198,43 @@ class CompactingHistoryBuilder:
         self.trimmer.context_window_tokens = tokens
 
     # ------------------------------------------------------------------
+    # The request the loop actually sent
+    # ------------------------------------------------------------------
+
+    def note_request(self, session_key: str, messages: list[dict[str, Any]], model: str = "") -> None:
+        """Keep a request the loop is sending, for the next summary to reuse.
+
+        The next compaction is built out of these bytes rather than out of a
+        freshly derived equivalent, which is what makes it a prefix the provider
+        can serve from cache. Derivation is not enough: the pruner rewrites a
+        body on the turn it fires, a cache breakpoint is marked on the way out,
+        and a cache matches on bytes.
+
+        Kept only when its leading messages are still this turn's history. The
+        assembler may have merged two adjacent assistant messages, and in-turn
+        window management may have rewritten a body; either way the keys no
+        longer name what was sent, and the record is left as it was -- reusing
+        nothing beats reusing one message's bytes under another's name. Later
+        iterations of a turn append after the history, so the latest request
+        that still carries it is the one kept.
+
+        ``model`` is the model the request went out under. Losing a record --
+        to a restart or an eviction -- costs one summary its cache reuse.
+        """
+        memo = self._sessions.get(session_key)
+        if memo is None or not memo.keys:
+            return
+        count = len(memo.keys)
+        if len(messages) < count:
+            return
+        head = [dict(message) for message in messages[:count]]
+        if head[0].get("role") != "system" or head[-1].get("role") != "user":
+            return
+        if tuple(_comparable(message) for message in head[1:-1]) != memo.view:
+            return
+        memo.record = RequestRecord(messages=tuple(head), keys=memo.keys, model=model or "")
+
+    # ------------------------------------------------------------------
     # One turn
     # ------------------------------------------------------------------
 
@@ -190,6 +250,7 @@ class CompactingHistoryBuilder:
 
         memo = self._memo(ctx.session_key, revision.scope)
         state = self.store.load(ctx.session_key, revision, message_count=len(session))
+        binding = resolve(None, self._fallback)
         window = self.context_window_tokens
         headroom_tokens = ctx.budget.reserved_output
 
@@ -226,11 +287,16 @@ class CompactingHistoryBuilder:
         written: CompactionCheckpoint | None = None
         if removed:
             generation += 1
-            written = self._checkpoint_for(
+            written = await self._checkpoint_for(
                 ctx.session_key,
+                prefix,
+                binding,
                 revision,
+                session,
                 ledger,
+                memo,
                 checkpoint,
+                checkpoint_message,
                 selection,
                 removed,
                 retired,
@@ -285,8 +351,11 @@ class CompactingHistoryBuilder:
             ),
         )
 
+        plain = _splice(outcome.history, checkpoint_message, checkpoint_at)
         memo.generation = generation
         memo.checkpoint_message = checkpoint_message
+        memo.keys = self._keys(outcome, checkpoint, checkpoint_at)
+        memo.view = tuple(_comparable(message) for message in plain) if memo.keys else ()
         return Segment(
             text="",
             history=self._marked(outcome, checkpoint_message, checkpoint_at, pinned),
@@ -505,12 +574,17 @@ class CompactingHistoryBuilder:
             retired=retired,
         )
 
-    def _checkpoint_for(
+    async def _checkpoint_for(
         self,
         session_key: str,
+        prefix: "AssembledPrefix",
+        binding: ModelBinding,
         revision: "SessionRevision",
+        session: list[dict[str, Any]],
         ledger: MessageLedger,
+        memo: _Memo,
         previous: CompactionCheckpoint | None,
+        previous_message: dict[str, Any] | None,
         selection: Selection,
         removed: frozenset[int],
         retired: frozenset[int],
@@ -520,20 +594,109 @@ class CompactingHistoryBuilder:
 
         What the checkpoint stands for is everything compaction has taken out
         by the end of this turn, not only this turn's share -- it replaces the
-        one before it rather than sitting beside it.
+        one before it rather than sitting beside it. The rung is chosen on this
+        turn's removal, which is what the model call would be paying for.
         """
-        if not self.cfg.summary.fold:
-            return None
         covered = removed | retired
-        return fold_checkpoint(
-            session_key=session_key,
-            generation=generation,
-            covers=session_ref(revision, min(covered), max(covered)),
-            previous=previous,
-            folded_messages=len(covered),
-            folded_tokens=ledger.tokens_for(covered),
-            created_at=timestamp(self._now_fn),
+        covers = session_ref(revision, min(covered), max(covered))
+        folded_messages = len(covered)
+        folded_tokens = ledger.tokens_for(covered)
+        wants_summary = self.writer.prefers_summary(
+            reached_target=not selection.exhausted,
+            folded_messages=len(removed),
         )
+        if wants_summary:
+            keys, fresh = self._summary_input(
+                prefix, session, ledger, previous, previous_message, retired, through=max(removed)
+            )
+        else:
+            keys, fresh = ((), ())
+        if wants_summary and keys:
+            return await self.writer.compact(
+                provider=binding.provider,
+                model=binding.model,
+                session_key=session_key,
+                generation=generation,
+                covers=covers,
+                previous=previous,
+                keys=keys,
+                fresh=fresh,
+                record=memo.record,
+                tool_defs=prefix.tool_defs,
+                folded_messages=folded_messages,
+                folded_tokens=folded_tokens,
+            )
+        if self.cfg.summary.fold:
+            return fold_checkpoint(
+                session_key=session_key,
+                generation=generation,
+                covers=covers,
+                previous=previous,
+                folded_messages=folded_messages,
+                folded_tokens=folded_tokens,
+                created_at=timestamp(self._now_fn),
+            )
+        return None
+
+    def _summary_input(
+        self,
+        prefix: "AssembledPrefix",
+        session: list[dict[str, Any]],
+        ledger: MessageLedger,
+        previous: CompactionCheckpoint | None,
+        previous_message: dict[str, Any] | None,
+        retired: frozenset[int],
+        *,
+        through: int,
+    ) -> tuple[tuple[MessageKey, ...], tuple[dict[str, Any], ...]]:
+        """The leading messages a summarising request is built from.
+
+        Everything the conversation has said up to and including the last
+        message being removed, in order, with the standing checkpoint where the
+        messages it replaced used to be. The cut runs forward to the next place
+        no tool call is left open, so the request never ends on a call whose
+        result was going to arrive two messages later.
+
+        These are the *fresh* versions. Whichever of them the recorded request
+        also holds is substituted for the recorded bytes before the request goes
+        out; this is what the rest is built from, and what the whole request
+        falls back to when there is no record to reuse.
+        """
+        end = ledger.align_forward(through + 1, self.cfg.boundary)
+        ordinals = [index for index in range(end) if index not in retired]
+        messages = HistoryTrimmer.history_from_ids(session, ordinals)
+        if len(messages) != len(ordinals):
+            return ((), ())
+        keys: list[MessageKey] = [session_message_key(index) for index in ordinals]
+        if previous is not None and previous_message is not None and retired:
+            at = sum(1 for index in ordinals if index < min(retired))
+            keys = _splice(keys, checkpoint_key(previous.checkpoint_id), at)
+            messages = _splice(messages, previous_message, at)
+        leading = [{"role": "system", "content": prefix.system_prefix}, *messages]
+        errors = HistoryTrimmer.structural_errors(leading)
+        if errors:
+            logger.warning("Compaction skipped a summary whose request would not close: {}", errors)
+            return ((), ())
+        return (SYSTEM_KEY, *keys), tuple(leading)
+
+    @staticmethod
+    def _keys(
+        outcome: TrimOutcome,
+        checkpoint: CompactionCheckpoint | None,
+        checkpoint_at: int,
+    ) -> tuple[MessageKey, ...]:
+        """What each message of the list this turn produced stands for.
+
+        Empty when the history and the ids it was projected from do not line up,
+        which is the honest answer: an unaligned key list would make the next
+        compaction reuse one message's bytes under another message's name.
+        """
+        if len(outcome.history) != len(outcome.included_ids):
+            return ()
+        keys: list[MessageKey] = [session_message_key(index) for index in outcome.included_ids]
+        if checkpoint is not None:
+            keys = _splice(keys, checkpoint_key(checkpoint.checkpoint_id), checkpoint_at)
+        return (SYSTEM_KEY, *keys, USER_KEY)
 
     @staticmethod
     def _marked(
@@ -708,6 +871,16 @@ def _splice(items: Sequence[Any], item: Any, at: int) -> list[Any]:
         return listed
     position = max(0, min(at, len(listed)))
     return [*listed[:position], item, *listed[position:]]
+
+
+def _comparable(message: dict[str, Any]) -> dict[str, Any]:
+    """A message as the provider-facing request carries it.
+
+    Cache breakpoints and the history markers are both added or removed on
+    the way out, so neither is evidence that a message changed.
+    """
+    stripped, _tools = prompt_cache.strip([message], None)
+    return {key: value for key, value in stripped[0].items() if key not in HISTORY_PRIVATE_KEYS}
 
 
 def _carry_private_keys(

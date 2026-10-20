@@ -60,6 +60,7 @@ def test_the_strategy_package_exists_and_is_not_empty() -> None:
         "retention",
         "pruner",
         "checkpoint",
+        "writer",
         "store",
         "runtime",
     }
