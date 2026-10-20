@@ -21,6 +21,7 @@ Layering note:
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -40,6 +41,50 @@ if TYPE_CHECKING:
 # Curator are all SegmentBuilders — there is no separate "lane" category.
 # :class:`ContextAssembler` runs them in two phases and routes their
 # outputs into the system / history slots.
+
+
+@dataclass(frozen=True)
+class SessionRevision:
+    """Identity and high-water mark of one append-only session-log view.
+
+    ``log_id`` changes when a new logical log is started (``/new``),
+    ``generation`` changes before an operation can hand an existing ordinal to
+    a different message (an undo), and ``message_count`` is how much of that
+    generation the reader observed. A ref into the log carries ``scope``, so a
+    ref minted before either change names a scope that no longer exists -- a
+    miss rather than a wrong answer.
+    """
+
+    log_id: str
+    generation: int
+    message_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.log_id, str) or re.fullmatch(r"[0-9a-f]{32}", self.log_id) is None:
+            raise ValueError("log_id must be a lowercase UUID hex string")
+        if not isinstance(self.generation, int) or isinstance(self.generation, bool) or self.generation < 0:
+            raise ValueError("generation must be non-negative")
+        if not isinstance(self.message_count, int) or isinstance(self.message_count, bool) or self.message_count < 0:
+            raise ValueError("message_count must be non-negative")
+
+    @property
+    def scope(self) -> str:
+        """The scope refs into this revision of the log carry."""
+        return f"{self.log_id}@{self.generation}"
+
+
+@dataclass(frozen=True)
+class OverflowOutcome:
+    """What an engine did with a prompt the provider refused as too long.
+
+    ``advanced`` is the whole discipline: ``False`` means nothing was
+    reclaimed, and the caller must not re-send a prompt of the same size on
+    the strength of it.
+    """
+
+    messages: list[dict[str, Any]]
+    reclaimed_tokens: int
+    advanced: bool
 
 
 @dataclass(frozen=True)
@@ -93,6 +138,11 @@ class AssemblyContext:
     # failing loudly.
     task_brief: str = ""
     task_done_when: str = ""
+    # The log revision ``session_messages`` was read at, for a builder that
+    # names messages in it (a ref) or keeps state keyed by it. None where the
+    # caller has no session behind the turn. Appended last for the reason the
+    # pair above is.
+    session_revision: SessionRevision | None = None
 
 
 @dataclass
@@ -174,6 +224,29 @@ class ContextEngine(ABC):
         lets the engine manage history compaction itself (Curator archives
         messages out-of-band)."""
 
+    @property
+    def wants_full_history(self) -> bool:
+        """If True, the Memory role hands over ``session.messages`` -- the whole
+        append-only log -- instead of the post-consolidation slice.
+
+        Defaults False because the full log is the more dangerous input: an
+        engine that does not budget it will overflow the window. Claiming it is
+        a statement that the engine budgets history itself.
+        """
+        return False
+
+    @property
+    def mints_source_refs(self) -> bool:
+        """If True, this engine puts ``[[ref ...]]`` tags where the model can
+        read them, and the loop registers ``context_retrieve`` so they can be
+        cashed in.
+
+        Defaults False because the tool is only honest beside an engine that
+        mints them: registered next to one that does not, it is a capability
+        the model will reach for and always be told "found nothing".
+        """
+        return False
+
     def set_provider(self, provider: "LLMProvider", model: str) -> None:
         """Adopt the provider a live ``/model`` switch just built.
 
@@ -213,6 +286,23 @@ class ContextEngine(ABC):
         """
         return None
 
+    async def on_context_overflow(
+        self,
+        session_key: str,
+        messages: list[dict[str, Any]],
+        *,
+        attempt: int,
+        window: int,
+    ) -> OverflowOutcome | None:
+        """Reclaim room in a prompt the provider just refused as too long.
+
+        ``messages`` is the request that was refused, ``attempt`` counts the
+        refusals this turn from 1. ``None`` means the engine has nothing to say
+        about overflow and the caller's own shrink runs, which is the default
+        for every engine that never asked to own its history.
+        """
+        return None
+
     def set_context_window(self, tokens: int) -> None:
         """Follow a ``/model`` switch: re-budget whichever builders sized
         themselves against the window at construction. Default is no-op so
@@ -246,14 +336,19 @@ class TurnContext:
     # turn carries it at all.
     task_brief: str = ""
     task_done_when: str = ""
+    # The revision the loop read the session at; carried through to
+    # ``AssemblyContext.session_revision``.
+    session_revision: SessionRevision | None = None
 
 
 __all__ = [
     "AssembledPrefix",
     "AssemblyContext",
     "ContextEngine",
+    "OverflowOutcome",
     "Segment",
     "SegmentBuilder",
+    "SessionRevision",
     "TurnContext",
 ]
 
