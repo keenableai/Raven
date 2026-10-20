@@ -56,7 +56,9 @@ def _forget_learned_headroom():
     headroom.reset()
 
 
-def _agent(workspace: Path, provider: LLMProvider, monkeypatch, iterations: int = 4) -> AgentLoop:
+def _agent(
+    workspace: Path, provider: LLMProvider, monkeypatch, iterations: int = 4, window: int = _WINDOW
+) -> AgentLoop:
     agent = AgentLoop(
         provider=provider,
         workspace=workspace,
@@ -64,7 +66,7 @@ def _agent(workspace: Path, provider: LLMProvider, monkeypatch, iterations: int 
         policy=TurnPolicy(max_iterations=iterations),
         tools=ToolWiring(restrict_to_workspace=True),
         engine=EngineWiring(
-            context_window_tokens=_WINDOW,
+            context_window_tokens=window,
             runtime_config=RuntimeConfig(checkpoint=CheckpointConfig(policy="never")),
         ),
     )
@@ -81,7 +83,8 @@ async def test_a_short_prompt_goes_out_with_the_ceiling_it_always_had(workspace,
     from raven.providers.base import send_max_tokens
 
     provider = _Recording([LLMResponse(content="ok", finish_reason="stop")])
-    agent = _agent(workspace, provider, monkeypatch)
+    # Wide, because the default tool surface alone is several thousand tokens.
+    agent = _agent(workspace, provider, monkeypatch, window=200_000)
 
     await agent._run_agent_loop(_prompt(10))
 

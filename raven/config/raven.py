@@ -371,15 +371,15 @@ class ContextCompactionConfig(_Base):
 class ContextHistoryConfig(_Base):
     """Which strategy fills the history slot, and its tuning."""
 
-    strategy: str = "curator"
+    strategy: str = "compacting"
     """Which builder fills the history slot.
 
-    ``compacting`` hands the conversation over verbatim
+    ``compacting``, the default, hands the conversation over verbatim
     until the window nears its trigger, then prunes large tool results to a
     one-line record and a ref, folds what it drops, and past that writes an
     eight-section checkpoint. ``curator`` is the earlier strategy, tuned by the
-    flat ``context.*`` Curator keys. Anything else is refused at startup,
-    naming the two.
+    flat ``context.*`` Curator keys and kept so a deployment can go back to it.
+    Anything else is refused at startup, naming the two.
     """
 
     compacting: ContextCompactionConfig = Field(default_factory=ContextCompactionConfig)

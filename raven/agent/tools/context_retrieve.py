@@ -65,11 +65,8 @@ class ContextRetrieveTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Retrieve the verbatim original text behind a [[ref ...]] tag that appears in a "
-            "compacted summary or in place of a pruned tool result. Pass the tags exactly as "
-            "they appear, e.g. [[ref session/4f9c0e2a7b1d4c3e8a6f5b2d1c0e9f8a@0#118]]. Use it when "
-            "the one-line record of a call is not enough to go on -- the full output is still "
-            "stored, only the window no longer carries it."
+            "Read back the verbatim text behind [[ref ...]] tags in a compacted summary or a "
+            "pruned tool result, when the one-line record is not enough. Pass the tags as written."
         )
 
     @property
@@ -81,24 +78,18 @@ class ContextRetrieveTool(Tool):
                     "type": "array",
                     "items": {"type": "string"},
                     "minItems": 1,
-                    "description": "The [[ref ...]] tags to resolve, as they appear in the context.",
+                    "description": "The [[ref ...]] tags.",
                 },
                 "mode": {
                     "type": "string",
                     "enum": ["exact", "snippet"],
-                    "description": (
-                        "exact (default) returns the stored text verbatim; snippet returns the "
-                        "opening and closing of each entry, for deciding whether the whole is worth reading."
-                    ),
+                    "description": "exact (default): the text; snippet: each entry's opening and closing.",
                 },
                 "max_tokens": {
                     "type": "integer",
                     "minimum": _MIN_MAX_TOKENS,
                     "maximum": _MAX_MAX_TOKENS,
-                    "description": (
-                        f"Budget for everything this call returns (default {_DEFAULT_MAX_TOKENS}). "
-                        "Raise it to read a large result whole."
-                    ),
+                    "description": f"Budget for the reply (default {_DEFAULT_MAX_TOKENS}).",
                 },
             },
             "required": ["refs"],
