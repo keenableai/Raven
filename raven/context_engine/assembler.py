@@ -36,7 +36,7 @@ from raven.contracts.context import AssembledPrefix, AssemblyContext, ContextEng
 from raven.providers.prompt_cache import STABLE_PREFIX_KEY
 
 if TYPE_CHECKING:
-    from raven.contracts.context import TurnContext
+    from raven.contracts.context import OverflowOutcome, TurnContext
     from raven.contracts.llm_provider import LLMProvider
 
 
@@ -92,7 +92,17 @@ class ContextAssembler(ContextEngine):
         now_fn: Callable[[], datetime] | None = None,
         get_tool_notices: Callable[[], list[str]] | None = None,
         scent: "ScentMenu | None" = None,
+        *,
+        wants_full_history: bool = True,
+        owns_compaction: bool = True,
+        mints_source_refs: bool = False,
     ) -> None:
+        # The three are the history strategy's, declared in its registry entry;
+        # the defaults are the Curator's, which is what an assembler built
+        # without a registry entry (a test, an embedder) has always meant.
+        self._wants_full_history = wants_full_history
+        self._owns_compaction = owns_compaction
+        self._mints_source_refs = mints_source_refs
         self._scent = scent
         self.skills_router = None
         """Set by the factory: the SkillForgeRouter behind find_skill."""
@@ -108,10 +118,16 @@ class ContextAssembler(ContextEngine):
         return "context_assembler"
 
     @property
+    def wants_full_history(self) -> bool:
+        return self._wants_full_history
+
+    @property
     def owns_compaction(self) -> bool:
-        # The Curator lane archives history itself, so AgentLoop hands it
-        # the full append-only log and skips the host MemoryConsolidator.
-        return True
+        return self._owns_compaction
+
+    @property
+    def mints_source_refs(self) -> bool:
+        return self._mints_source_refs
 
     def set_provider(self, provider: "LLMProvider", model: str) -> None:
         # Duck-typed on purpose: only the builders that actually call an LLM
@@ -235,6 +251,27 @@ class ContextAssembler(ContextEngine):
             hook = getattr(builder, "after_turn", None)
             if hook is not None:
                 await hook(session_key, outcome, usage)
+
+    async def on_context_overflow(
+        self,
+        session_key: str,
+        messages: list[dict[str, Any]],
+        *,
+        attempt: int,
+        window: int,
+    ) -> "OverflowOutcome | None":
+        # Asked of the history builder: it is the one that knows which part of
+        # the refused prompt it put there and what it can give back. The first
+        # builder that answers decides; none answering leaves the loop's own
+        # shrink to run.
+        for builder in self._phase_b:
+            hook = getattr(builder, "on_context_overflow", None)
+            if hook is None:
+                continue
+            outcome = await hook(session_key, messages, attempt=attempt, window=window)
+            if outcome is not None:
+                return outcome
+        return None
 
     def set_context_window(self, tokens: int) -> None:
         # Delegate to any builder that sized itself against the window at

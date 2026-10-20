@@ -40,8 +40,9 @@ from raven.contracts.harness import (
 class _Engine:
     """The context engine's turn-facing surface, and nothing else."""
 
-    def __init__(self, owns_compaction: bool = True) -> None:
+    def __init__(self, owns_compaction: bool = True, wants_full_history: bool = True) -> None:
         self.owns_compaction = owns_compaction
+        self.wants_full_history = wants_full_history
         self.assembled: list[str] = []
         self.after: list[str] = []
 
@@ -115,23 +116,23 @@ def test_binding_something_missing_a_member_fails_at_assembly():
 # --------------------------------------------------------------------------- #
 
 
-def test_an_archiving_engine_is_offered_the_whole_append_only_log():
-    """``owns_compaction`` means the engine decides what to evict, so it has to
+def test_an_engine_that_budgets_its_history_is_offered_the_whole_append_only_log():
+    """``wants_full_history`` means the engine decides what to keep, so it has to
     see everything -- handing it the trimmed view would evict twice."""
-    memory = _modules(engine=_Engine(owns_compaction=True)).memory
+    memory = _modules(engine=_Engine(wants_full_history=True)).memory
     session = SimpleNamespace(messages=[{"role": "user", "content": "a"}], get_history=lambda **k: [])
     assert memory.candidate_messages(session) == [{"role": "user", "content": "a"}]
 
 
-def test_a_non_archiving_engine_is_offered_the_post_consolidation_slice():
-    memory = _modules(engine=_Engine(owns_compaction=False)).memory
+def test_an_engine_that_does_not_budget_its_history_is_offered_the_post_consolidation_slice():
+    memory = _modules(engine=_Engine(owns_compaction=False, wants_full_history=False)).memory
     slice_ = [{"role": "user", "content": "kept"}]
     session = SimpleNamespace(messages=[{"role": "user", "content": "all"}], get_history=lambda **k: slice_)
     assert memory.candidate_messages(session) == slice_
 
 
 def test_the_candidate_view_is_a_copy_the_engine_may_not_mutate_back():
-    memory = _modules(engine=_Engine(owns_compaction=True)).memory
+    memory = _modules(engine=_Engine(wants_full_history=True)).memory
     messages = [{"role": "user", "content": "a"}]
     session = SimpleNamespace(messages=messages, get_history=lambda **k: [])
     assert memory.candidate_messages(session) is not messages

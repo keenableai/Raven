@@ -368,22 +368,18 @@ class ContextCompactionConfig(_Base):
         return self
 
 
-HISTORY_STRATEGIES = ("compacting", "curator")
-"""The names ``context.history.strategy`` accepts, in registry order."""
-
-
 class ContextHistoryConfig(_Base):
     """Which strategy fills the history slot, and its tuning."""
 
-    strategy: str = "compacting"
+    strategy: str = "curator"
     """Which builder fills the history slot.
 
-    ``compacting`` is the default: it hands the conversation over verbatim
+    ``compacting`` hands the conversation over verbatim
     until the window nears its trigger, then prunes large tool results to a
     one-line record and a ref, folds what it drops, and past that writes an
     eight-section checkpoint. ``curator`` is the earlier strategy, tuned by the
-    flat ``context.*`` Curator keys and kept so a deployment can go back to it.
-    Anything else is refused at startup, naming the two.
+    flat ``context.*`` Curator keys. Anything else is refused at startup,
+    naming the two.
     """
 
     compacting: ContextCompactionConfig = Field(default_factory=ContextCompactionConfig)

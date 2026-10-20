@@ -7,10 +7,10 @@ were sized against this generation's context window, so a generation's window
 the seat: the loop asks the Memory role rather than reaching past it, and the
 turn-side decisions that were never the shell's live here with it.
 
-``candidate_messages`` turns on ``owns_compaction``, which is this role's own
-property: an engine that archives for itself wants the whole append-only log
-so it can decide what to evict, one that does not wants the post-consolidation
-slice so the view matches what the consolidator left behind.
+``candidate_messages`` turns on the engine's ``wants_full_history``: a history
+strategy that budgets for itself wants the whole append-only log so it can
+decide what to keep, one that does not wants the post-consolidation slice so
+the view matches what the consolidator left behind.
 
 ``token_budget`` sizes the prompt against the model's own ceiling, which is the
 window's arithmetic by definition -- and the five things it reads (provider,
@@ -87,7 +87,10 @@ class DefaultMemory:
         return self._engine.owns_compaction
 
     def candidate_messages(self, session: Any) -> list[dict[str, Any]]:
-        if self._engine.owns_compaction:
+        # An engine slotted in through the runtime door need not subclass the
+        # contract, and one written before the property existed answered this
+        # question with ``owns_compaction``; it keeps the view it always had.
+        if getattr(self._engine, "wants_full_history", self._engine.owns_compaction):
             return list(session.messages)
         return session.get_history(max_messages=0)
 

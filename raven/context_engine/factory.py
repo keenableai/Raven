@@ -8,8 +8,9 @@ system prompt:
 - **Memory** — ``backend.recall(user_id=...)`` (segment 3, ``# Memory``).
 - **Skills** — a :class:`SkillForgeRouter` over 1-3 sources (segment 5,
   ``# Skills``), built only under pull discovery.
-- **Curator** — manifest build, history selection and
-  ``# Curator Working State``. Owns ``*history``.
+- **History** — the strategy ``context.history.strategy`` names (see
+  :mod:`raven.context_engine.history`): ``compacting`` by default, or the
+  Curator. Owns ``*history``.
 
 The SkillForgeRouter is assembled from up to three sources:
 
@@ -34,6 +35,7 @@ from typing import TYPE_CHECKING, Callable
 
 from raven.agent.context import ContextBuilder
 from raven.config.live import LiveConfig, curator_pin, skill_gate_pin
+from raven.context_engine import history as history_strategies
 from raven.context_engine.assembler import ContextAssembler
 from raven.context_engine.scent import ScentMenu
 from raven.context_engine.segments import (
@@ -43,7 +45,6 @@ from raven.context_engine.segments import (
     MemorySegmentBuilder,
     SkillsSegmentBuilder,
 )
-from raven.context_engine.segments.curator import CuratorSegmentBuilder
 from raven.contracts.context import ContextEngine
 from raven.contracts.llm_provider import LLMProvider
 from raven.providers.pool import live_pin_resolver
@@ -94,8 +95,9 @@ def build_context_engine(
     credential of its own and the subsystem follows the conversation's model.
 
     ``builder`` is read only for the shared ``MemoryStore`` and
-    ``LocalSkillCatalog`` it holds; nothing here dispatches on a configured
-    engine name, because there is one engine.
+    ``LocalSkillCatalog`` it holds. The one configured name read here is the
+    history strategy's, and it is resolved by the registry, which raises on a
+    name it does not know -- at startup, not at the first turn.
     """
     from raven.config.raven import (
         MemoryConfig as _MemoryConfig,
@@ -176,8 +178,9 @@ def build_context_engine(
                 ),
             )
         )
+    strategy = history_strategies.resolve(config.history.strategy)
     builders.append(
-        CuratorSegmentBuilder(
+        strategy.build(
             pin_resolver=live_pin_resolver(
                 provider_pool,
                 lambda: curator_pin(live),
@@ -212,7 +215,14 @@ def build_context_engine(
     if dropped:
         builders = [b for b in builders if b.name not in dropped]
     engine = ContextAssembler(
-        builders, get_tool_definitions, now_fn=now_fn, get_tool_notices=get_tool_notices, scent=scent
+        builders,
+        get_tool_definitions,
+        now_fn=now_fn,
+        get_tool_notices=get_tool_notices,
+        scent=scent,
+        wants_full_history=strategy.wants_full_history,
+        owns_compaction=strategy.owns_compaction,
+        mints_source_refs=strategy.mints_source_refs,
     )
     # The find_skill tool searches through the same router the engine
     # retrieves with, whichever discovery mode is active.
