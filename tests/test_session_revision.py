@@ -631,6 +631,7 @@ class TestLoadRace:
         later: otherwise the next save skips the merge and writes the old
         generation back over the newer one."""
         import builtins
+        import shutil
 
         import raven.session.manager as manager_module
 
@@ -643,14 +644,21 @@ class TestLoadRace:
         rewriting = writer.get_or_create(session.key)
         fired: list[bool] = []
 
+        snapshot = tmp_path / "opened-before-the-rewrite.jsonl"
+
         def racing_open(file, *args, **kwargs):
-            handle = builtins.open(file, *args, **kwargs)
-            if not fired:
-                fired.append(True)
-                rewriting.undo_last_turn()
-                rewriting.add_message("user", "replaced")
-                writer.save(rewriting)
-            return handle
+            if fired:
+                return builtins.open(file, *args, **kwargs)
+            fired.append(True)
+            # The file as this copy opened it, size and mtime kept: what an open
+            # handle on POSIX goes on reading after the path is replaced. Read
+            # from a copy because Windows refuses to replace a file that has an
+            # open handle, which would turn the race into a failed rewrite.
+            shutil.copy2(file, snapshot)
+            rewriting.undo_last_turn()
+            rewriting.add_message("user", "replaced")
+            writer.save(rewriting)
+            return builtins.open(snapshot, *args, **kwargs)
 
         monkeypatch.setattr(manager_module, "open", racing_open, raising=False)
         loader = SessionManager(tmp_path)
