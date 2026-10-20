@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
@@ -34,7 +33,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from loguru import logger
 
 from raven.context_engine.scent import ScentMenu
-from raven.context_engine.scratch import append_turn_scratch, render_turn_scratch
+from raven.context_engine.scratch import mark_turn_scratch, render_turn_scratch
 from raven.context_engine.segments import render
 from raven.contracts.assembled import AssembledContext, TokenBudget
 from raven.contracts.context import AssembledPrefix, AssemblyContext, ContextEngine, SegmentBuilder
@@ -204,7 +203,9 @@ class ContextAssembler(ContextEngine):
                 # keeps receiving the skills the model was offered.
                 meta |= {"injected_skill_ids": list(scent.skill_ids)}
         scratch = render_turn_scratch([text for _, text in scratch_parts])
-        user_msg = self._build_user(ctx, extra_tail=[scratch] if scratch else [])
+        # Appended after the envelope is built, and recorded on it: what the
+        # session write and every other reader strip is exactly this text.
+        user_msg = mark_turn_scratch(self._build_user(ctx), scratch)
 
         # ── Phase B — prefix-dependent builders (Curator), serial ───
         ctx_b = replace(
@@ -320,8 +321,8 @@ class ContextAssembler(ContextEngine):
             if setter is not None:
                 setter(tokens)
 
-    def _build_user(self, ctx: AssemblyContext, *, extra_tail: Sequence[str] = ()) -> dict[str, Any]:
-        """The single structural user message: runtime context + content + tail.
+    def _build_user(self, ctx: AssemblyContext) -> dict[str, Any]:
+        """The single structural user message: runtime context + content.
 
         The scent menu (pull-mode skill discovery) rides the same envelope
         as the clock: per-turn material belongs at the sequence tail, where
@@ -334,12 +335,6 @@ class ContextAssembler(ContextEngine):
         it — stored as the user's own text it would render as such on resume
         and feed the next turn's novelty window its own output. Hence the
         single-newline join and the collapse of any blank lines within.
-
-        ``extra_tail`` carries per-turn blocks that must reach the model but
-        never the session log -- recalled memory, routed skills, and whatever a
-        plugin appends next. They ride at the very end because everything before
-        them is the prefix providers cache; each entry is appended in the
-        content's existing shape, so a plain string stays a plain string.
         """
         notices = self.get_tool_notices() if self.get_tool_notices is not None else None
         runtime_ctx = render.build_runtime_context(
@@ -358,8 +353,6 @@ class ContextAssembler(ContextEngine):
             merged: Any = f"{runtime_ctx}\n\n{user_content}"
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
-        for block in extra_tail:
-            merged = append_turn_scratch(merged, block)
         return {"role": "user", "content": merged}
 
 

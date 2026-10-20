@@ -3189,7 +3189,7 @@ class TurnPathMixin:
         selection of turns can find each turn's messages in the record.
         """
         # Deferred: ``raven.context_engine`` imports back out of this tier.
-        from raven.context_engine.scratch import strip_turn_scratch
+        from raven.context_engine.scratch import TURN_SCRATCH_KEY, cut_turn_scratch
 
         # Both exits that persist a turn come through here, so a question noted
         # on the turn is filed once whichever exit runs. The early inbound write
@@ -3211,6 +3211,17 @@ class TurnPathMixin:
                     entry["trace_id"] = trace_id
                 first_user_pending = False
             entry.pop(TURN_LOG_KEY, None)
+            if (scratch := entry.pop(TURN_SCRATCH_KEY, None)) and role == "user":
+                # The turn scratch (recalled memory, routed skills) is rebuilt
+                # from the query every turn. Recording it would turn the log
+                # from append-only into rewritten -- next turn's request would
+                # carry this turn's recall in its history -- and the recalled
+                # text would pile up in history forever. Cut before the rewrites
+                # below, which compare against the exact text that was appended.
+                content = cut_turn_scratch(content, scratch)
+                if content is None:
+                    continue
+                entry["content"] = content
             if entry.get("_recovery_synthetic"):
                 continue  # #1a synthetic recovery nudge — never persist scaffolding
             if entry.get(ATTACHED_IMAGE_KEY):
@@ -3293,16 +3304,6 @@ class TurnPathMixin:
                 # way to disk rather than pass a prefix off as the whole.
                 entry["content"] = content[:cap] + TOOL_RESULT_TRUNCATION_MARKER
             elif role == "user":
-                # The turn scratch (recalled memory, routed skills) is rebuilt
-                # from the query every turn. Recording it would turn the log
-                # from append-only into rewritten -- next turn's cache prefix
-                # would no longer match this turn's, and the recalled text would
-                # pile up in history forever.
-                without_scratch = strip_turn_scratch(content)
-                if without_scratch is None:
-                    continue
-                if without_scratch is not content:
-                    content = entry["content"] = without_scratch
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the runtime-context prefix, keep only the user text.
                     parts = content.split("\n\n", 1)

@@ -451,7 +451,7 @@ def turn_question(messages: list[dict[str, Any]] | None) -> str:
             continue
         # The turn scratch rides at the end of the same message; it is recalled
         # context, not part of what was asked.
-        content = strip_turn_scratch(m.get("content"))
+        content = strip_turn_scratch(m)
         text = ""
         if isinstance(content, str):
             text = content

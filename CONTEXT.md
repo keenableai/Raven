@@ -1238,9 +1238,16 @@ Curator sets this), and metadata merged into the assembled context.
 **Turn Scratch** (`context_engine/scratch.py`):
 The tagged block appended to the end of the turn's user message carrying the
 phase-A segments whose builder declares `stable = False`, which today is
-`# Memory` and `# Skills`. It reaches the model but never `session.messages` —
-the loop's `_save_turn` strips it, the same way it strips the runtime-context
-header — and it keeps the system prompt byte-identical across turns.
+`# Memory` and `# Skills`. It reaches the model but never `session.messages`:
+the assembler records on the envelope exactly what it appended (`_turn_scratch`),
+and the loop's `_save_turn`, the hooks' turn question, the watched-work judge and
+replay remove that recorded text, never whatever merely contains the tag. It
+keeps the system prompt byte-identical across turns, so the tools and system
+cache marks are read back on the next turn; the history behind it is not, since
+the envelope is filed in its stripped form, and reads back only through a
+provider's look-back over earlier breakpoints. The trade-off: recalled memory now
+sits in a user-role message rather than the system prompt; its untrusted-data
+fence and the scratch tag still say what it is.
 `context.cache.turnScratch = false` puts those segments back in the system prompt.
 _Avoid_: calling it "injected memory" — it is a slot, and what occupies it is
 whatever the builders declared too volatile for the system prompt.

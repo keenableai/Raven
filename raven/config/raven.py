@@ -68,8 +68,11 @@ class ContextCacheConfig(_Base):
     ``# Memory`` and ``# Skills`` are recomputed from the current message every
     turn. Rendered into the system prompt they sit ahead of the conversation in
     every provider's cache prefix, so each turn re-bills the whole history
-    behind them; rendered at the end of the turn's user message they sit behind
-    it and the history stays cacheable.
+    behind them; rendered at the end of the turn's user message they leave the
+    system prompt byte-identical, so the tools and system marks are read back on
+    the next turn. The history itself reads back only through a provider's
+    look-back over earlier breakpoints: the turn's message is filed without the
+    scratch, so its stored form was never sent.
 
     ``False`` puts them back in the system prompt. Note that the segment order
     is normalised either way -- ``# Active Skills`` now precedes ``# Memory``,

@@ -1,10 +1,11 @@
 """Turn scratch: the query-conditioned segments ride in the user tail, never the log.
 
-Covers the block helpers, where the assembler puts ``stable = False`` segments
-with the switch on and off, the normalised segment order, the session write
-that must never record the block, the replay comparison that must not read it
-as a divergence, the hook-facing question that must not include it, and the
-cache-breakpoint budget with the block in place.
+Covers the block helpers and the mark the assembler leaves on the envelope,
+where the assembler puts ``stable = False`` segments with the switch on and off,
+the normalised segment order, the session write that must never record the
+block, the replay comparison that must not read it as a divergence, the
+hook-facing question that must not include it, the cache-breakpoint budget with
+the block in place, and the loop paths that copy or re-file the envelope.
 """
 
 from __future__ import annotations
@@ -19,10 +20,14 @@ import pytest
 from raven.agent.context import ContextBuilder
 from raven.context_engine import ContextAssembler, TurnContext
 from raven.context_engine.scratch import (
+    TURN_SCRATCH_KEY,
     TURN_SCRATCH_TAG,
     append_turn_scratch,
+    cut_turn_scratch,
+    mark_turn_scratch,
     render_turn_scratch,
     strip_turn_scratch,
+    strip_turn_scratch_by_tag,
 )
 from raven.context_engine.segments import (
     ActiveSkillsSegmentBuilder,
@@ -35,11 +40,15 @@ from raven.contracts.assembled import TokenBudget
 from raven.contracts.context import AssemblyContext, Segment
 from raven.contracts.memory import Memory
 from raven.memory_engine.skill_forge import RouterHit, SkillForgeRouter
-from raven.providers.base import LLMProvider, LLMResponse
+from raven.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from raven.providers.prompt_cache import STABLE_PREFIX_KEY
 
 _SEP = "\n\n---\n\n"
 _MEMORY_HEADING = re.compile(r"(?m)^# Memory$")
 _SKILLS_HEADING = re.compile(r"(?m)^# Skills$")
+_RUNTIME = f"{ContextBuilder._RUNTIME_CONTEXT_TAG}\nCurrent Time: now"
+_SCRATCH = render_turn_scratch(["# Memory\n\nrecalled: espresso"])
+_PASTED = f"the log says\n\n{TURN_SCRATCH_TAG}\n\nwhat does that mean?"
 
 
 def _budget() -> TokenBudget:
@@ -56,7 +65,16 @@ def _whole_prompt(messages: list[dict[str, Any]]) -> str:
     return "\n".join(t for m in messages for t in _texts(m.get("content")))
 
 
+def _envelope(content: Any, scratch: str = _SCRATCH) -> dict[str, Any]:
+    return mark_turn_scratch({"role": "user", "content": content}, scratch)
+
+
 class _EchoBackend:
+    """Recall that moves with the query, and a record of what was stored."""
+
+    def __init__(self) -> None:
+        self.stored: list[list[dict]] = []
+
     async def start(self):
         pass
 
@@ -64,7 +82,7 @@ class _EchoBackend:
         pass
 
     async def store(self, session_id, messages, *, metadata=None):
-        pass
+        self.stored.append(json.loads(json.dumps(messages, default=str)))
 
     async def feedback(self, signals):
         pass
@@ -72,7 +90,7 @@ class _EchoBackend:
     async def recall(self, query, *, user_id=None, agent_id=None, top_k):
         if user_id is None:
             return []
-        return [Memory(text=f"recalled for {query}", score=1.0)]
+        return [Memory(text=f"RECALL<{query}>", score=1.0)]
 
 
 class _EchoSource:
@@ -89,9 +107,12 @@ class _HistoryCurator:
     needs_prefix = True
     stable = False
 
+    def __init__(self, text: str = "") -> None:
+        self._text = text
+
     async def build(self, ctx: AssemblyContext) -> Segment:
         assert ctx.prefix is not None
-        return Segment(text="", history=list(ctx.session_messages))
+        return Segment(text=self._text, history=list(ctx.session_messages))
 
 
 @pytest.fixture
@@ -106,23 +127,23 @@ def builder(tmp_path: Path) -> ContextBuilder:
     return ContextBuilder(workspace=tmp_path)
 
 
-def _builders(builder: ContextBuilder) -> list[Any]:
+def _builders(builder: ContextBuilder, history_text: str = "") -> list[Any]:
     return [
         IdentitySegmentBuilder(builder.workspace),
         BootstrapSegmentBuilder(builder.workspace),
         MemorySegmentBuilder(builder.memory, _EchoBackend()),
         ActiveSkillsSegmentBuilder(builder.skills),
         SkillsSegmentBuilder(SkillForgeRouter([_EchoSource()])),
-        _HistoryCurator(),
+        _HistoryCurator(history_text),
     ]
 
 
-def _engine(builder: ContextBuilder, **kw) -> ContextAssembler:
-    return ContextAssembler(_builders(builder), lambda: [], **kw)
+def _engine(builder: ContextBuilder, history_text: str = "", **kw) -> ContextAssembler:
+    return ContextAssembler(_builders(builder, history_text), lambda: [], **kw)
 
 
 # ---------------------------------------------------------------------------
-# The block helpers
+# The block helpers and the mark
 # ---------------------------------------------------------------------------
 
 
@@ -144,26 +165,52 @@ class TestBlockHelpers:
         assert out[:-1] == content
         assert out[-1] == {"type": "text", "text": "S"}
 
-    def test_an_empty_scratch_leaves_the_content_alone(self) -> None:
-        content = [{"type": "text", "text": "hi"}]
-        assert append_turn_scratch(content, "") is content
+    def test_the_mark_records_exactly_what_was_appended(self) -> None:
+        message = _envelope("hi")
+        assert message["content"] == f"hi\n\n{_SCRATCH}"
+        assert message[TURN_SCRATCH_KEY] == _SCRATCH
 
-    def test_strip_undoes_append_for_both_shapes(self) -> None:
-        block = render_turn_scratch(["# Memory\n\nrecalled"])
-        assert strip_turn_scratch(append_turn_scratch("hi", block)) == "hi"
-        content = [{"type": "text", "text": "hi"}]
-        assert strip_turn_scratch(append_turn_scratch(content, block)) == content
+    def test_nothing_appended_leaves_no_mark(self) -> None:
+        message = mark_turn_scratch({"role": "user", "content": "hi"}, "")
+        assert message == {"role": "user", "content": "hi"}
 
-    def test_strip_returns_the_same_object_when_there_is_no_scratch(self) -> None:
+    def test_strip_undoes_the_mark_for_both_shapes(self) -> None:
+        assert strip_turn_scratch(_envelope("hi")) == "hi"
         content = [{"type": "text", "text": "hi"}]
-        assert strip_turn_scratch(content) is content
-        assert strip_turn_scratch("hi") == "hi"
-        assert strip_turn_scratch(None) is None
+        assert strip_turn_scratch(_envelope(content)) == content
 
-    def test_strip_of_scratch_alone_is_none(self) -> None:
-        block = render_turn_scratch(["x"])
-        assert strip_turn_scratch(block) is None
-        assert strip_turn_scratch([{"type": "text", "text": block}]) is None
+    def test_an_unmarked_message_is_returned_as_it_is(self) -> None:
+        content = [{"type": "text", "text": _PASTED}]
+        assert strip_turn_scratch({"role": "user", "content": content}) is content
+        assert strip_turn_scratch({"role": "user", "content": _PASTED}) == _PASTED
+
+    def test_a_pasted_tag_survives_the_cut(self) -> None:
+        """Only the recorded text goes: a user quoting the tag keeps every word."""
+        assert strip_turn_scratch(_envelope(_PASTED)) == _PASTED
+        assert strip_turn_scratch(_envelope([{"type": "text", "text": _PASTED}])) == [{"type": "text", "text": _PASTED}]
+
+    def test_a_note_appended_after_the_scratch_stays(self) -> None:
+        """A hook note lands on the last message, which at turn start is the envelope."""
+        message = _envelope("hi")
+        message["content"] += "\n\n[hook note]"
+        assert strip_turn_scratch(message) == "hi\n\n[hook note]"
+
+    def test_a_cache_marked_string_is_cut_inside_its_one_block(self) -> None:
+        content = [{"type": "text", "text": f"hi\n\n{_SCRATCH}", "cache_control": {"type": "ephemeral"}}]
+        assert cut_turn_scratch(content, _SCRATCH) == [
+            {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+        ]
+
+    def test_scratch_alone_is_none(self) -> None:
+        assert cut_turn_scratch(_SCRATCH, _SCRATCH) is None
+        assert cut_turn_scratch([{"type": "text", "text": _SCRATCH}], _SCRATCH) is None
+
+    def test_the_tag_fallback_is_only_for_recordings(self) -> None:
+        assert strip_turn_scratch_by_tag(f"hi\n\n{_SCRATCH}") == "hi"
+        assert strip_turn_scratch_by_tag([{"type": "text", "text": "hi"}, {"type": "text", "text": _SCRATCH}]) == [
+            {"type": "text", "text": "hi"}
+        ]
+        assert strip_turn_scratch_by_tag("hi") == "hi"
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +231,7 @@ class TestPlacement:
         tail = user[user.index(TURN_SCRATCH_TAG) :]
         assert len(_MEMORY_HEADING.findall(_whole_prompt(ac.messages))) == 1
         assert len(_MEMORY_HEADING.findall(tail)) == 1
-        assert "recalled for espresso" in tail
+        assert "RECALL<espresso>" in tail
         assert "skill for espresso" in tail
         assert tail.index("# Memory") < tail.index("# Skills")
         assert user.count(TURN_SCRATCH_TAG) == 1
@@ -223,8 +270,8 @@ class TestPlacement:
 
         assert first.messages[0] == second.messages[0]
         assert first.messages[:-1] == second.messages[:-1]
-        assert "recalled for one" in _whole_prompt(first.messages[-1:])
-        assert "recalled for two" in _whole_prompt(second.messages[-1:])
+        assert "RECALL<one>" in _whole_prompt(first.messages[-1:])
+        assert "RECALL<two>" in _whole_prompt(second.messages[-1:])
 
     async def test_an_undeclared_builder_stays_in_system(self, builder: ContextBuilder) -> None:
         class _Plugin:
@@ -297,6 +344,32 @@ class TestTurnScratchOff:
         assert _build(False)._turn_scratch is False
 
 
+class TestStableHead:
+    async def test_the_declared_head_is_the_three_stable_segments(self, builder: ContextBuilder) -> None:
+        """With the scratch on and the history builder appending text, the head a
+        provider may cache across turns is identity, bootstrap and active skills,
+        separator included, and nothing that moves with the query."""
+        ac = await _engine(builder, history_text="# Working State\n\nws").assemble(
+            "s", [], _budget(), turn=TurnContext(current_message="espresso")
+        )
+
+        ctx = AssemblyContext(
+            session_key="s",
+            current_message="espresso",
+            media=None,
+            channel=None,
+            chat_id=None,
+            session_messages=[],
+            budget=_budget(),
+        )
+        identity, bootstrap, _memory, active, _skills, _history = _builders(builder)
+        head = _SEP.join([(await b.build(ctx)).text for b in (identity, bootstrap, active)])
+        system = ac.messages[0]
+        assert system[STABLE_PREFIX_KEY] == len(head) + len(_SEP)
+        assert system["content"][: system[STABLE_PREFIX_KEY]] == head + _SEP
+        assert system["content"][system[STABLE_PREFIX_KEY] :] == "# Working State\n\nws"
+
+
 # ---------------------------------------------------------------------------
 # The session write
 # ---------------------------------------------------------------------------
@@ -323,61 +396,62 @@ class TestSessionNeverRecordsTheScratch:
         manager.save(session)
         return session.messages, manager.session_path("cli:x").read_text(encoding="utf-8")
 
-    def test_both_shapes_reach_disk_without_the_block(self, tmp_path: Path) -> None:
-        runtime = f"{ContextBuilder._RUNTIME_CONTEXT_TAG}\nCurrent Time: now"
-        scratch = render_turn_scratch(["# Memory\n\nrecalled: espresso"])
-        plain = append_turn_scratch(f"{runtime}\n\nwhat did I say?", scratch)
-        blocks = append_turn_scratch(
-            [{"type": "text", "text": runtime}, {"type": "text", "text": "and this?"}],
-            scratch,
-        )
+    def test_both_shapes_reach_disk_without_the_block_or_the_mark(self, tmp_path: Path) -> None:
+        plain = _envelope(f"{_RUNTIME}\n\nwhat did I say?")
+        blocks = _envelope([{"type": "text", "text": _RUNTIME}, {"type": "text", "text": "and this?"}])
 
-        stored, on_disk = self._save(
-            tmp_path,
-            [
-                {"role": "user", "content": plain},
-                {"role": "user", "content": blocks},
-                {"role": "assistant", "content": "answer"},
-            ],
-        )
+        stored, on_disk = self._save(tmp_path, [plain, blocks, {"role": "assistant", "content": "answer"}])
 
         assert TURN_SCRATCH_TAG not in on_disk
+        assert TURN_SCRATCH_KEY not in on_disk
         assert "recalled: espresso" not in on_disk
         assert [m["content"] for m in stored] == ["what did I say?", [{"type": "text", "text": "and this?"}], "answer"]
 
     def test_the_inbound_original_path_records_the_words_sent(self, tmp_path: Path) -> None:
-        runtime = f"{ContextBuilder._RUNTIME_CONTEXT_TAG}\nCurrent Time: now"
-        scratch = render_turn_scratch(["# Memory\n\nrecalled: espresso"])
-
         stored, on_disk = self._save(
             tmp_path,
-            [{"role": "user", "content": append_turn_scratch(f"{runtime}\n\nhello", scratch)}],
+            [_envelope(f"{_RUNTIME}\n\nhello")],
             inbound_original="hello",
             received_at="2026-10-20T11:59:00",
         )
 
         assert TURN_SCRATCH_TAG not in on_disk
+        assert TURN_SCRATCH_KEY not in on_disk
         assert stored[0]["content"] == "hello"
 
     def test_a_block_list_inbound_drops_only_the_scratch_block(self, tmp_path: Path) -> None:
-        runtime = f"{ContextBuilder._RUNTIME_CONTEXT_TAG}\nCurrent Time: now"
-        scratch = render_turn_scratch(["# Memory\n\nrecalled: espresso"])
-        content = append_turn_scratch(
-            [
-                {"type": "text", "text": runtime},
-                {"type": "text", "text": "look"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-            ],
-            scratch,
-        )
+        content = [
+            {"type": "text", "text": _RUNTIME},
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]
 
-        stored, on_disk = self._save(tmp_path, [{"role": "user", "content": content}], inbound_original="look")
+        stored, on_disk = self._save(tmp_path, [_envelope(content)], inbound_original="look")
 
         assert TURN_SCRATCH_TAG not in on_disk
         assert "recalled: espresso" not in on_disk
         texts = [b.get("text") for b in stored[0]["content"] if b.get("type") == "text"]
         assert "look" in texts
-        assert not any(TURN_SCRATCH_TAG in (t or "") for t in texts)
+
+    def test_a_mid_turn_message_quoting_the_tag_is_filed_whole(self, tmp_path: Path) -> None:
+        from raven.agent.loop._shared import _MID_TURN_USER_KEY
+
+        stored, _ = self._save(
+            tmp_path,
+            [
+                _envelope(f"{_RUNTIME}\n\nstart"),
+                {"role": "assistant", "content": "working"},
+                {"role": "user", "content": _PASTED, _MID_TURN_USER_KEY: True},
+            ],
+        )
+
+        assert stored[0]["content"] == "start"
+        assert stored[-1]["content"] == _PASTED
+
+    def test_the_users_own_question_quoting_the_tag_is_filed_whole(self, tmp_path: Path) -> None:
+        stored, _ = self._save(tmp_path, [_envelope(f"{_RUNTIME}\n\n{_PASTED}")])
+
+        assert stored[0]["content"] == _PASTED
 
 
 # ---------------------------------------------------------------------------
@@ -393,48 +467,58 @@ class TestReplayIgnoresTheScratch:
             "tools": [],
         }
 
-    def test_a_string_message_with_scratch_matches_the_recording_without(self) -> None:
+    def _live(self, message: dict) -> list[dict]:
+        return [{"role": "system", "content": "sys"}, message]
+
+    def test_a_string_message_matches_a_recording_without_the_scratch(self) -> None:
         from raven.trajectory.replay import compare_llm_request
 
-        live = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": append_turn_scratch("hi", render_turn_scratch(["# Memory\n\nx"]))},
-        ]
+        assert compare_llm_request(self._recorded("hi"), self._live(_envelope("hi")), [], "m") is None
 
-        assert compare_llm_request(self._recorded("hi"), live, [], "m") is None
-
-    def test_a_block_list_message_with_scratch_matches_the_recording_without(self) -> None:
+    def test_a_block_list_message_matches_a_recording_without_the_scratch(self) -> None:
         from raven.trajectory.replay import compare_llm_request
 
         content = [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
-        live = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": append_turn_scratch(content, render_turn_scratch(["# Memory\n\nx"]))},
-        ]
+        assert compare_llm_request(self._recorded(content), self._live(_envelope(content)), [], "m") is None
 
-        assert compare_llm_request(self._recorded(content), live, [], "m") is None
+    def test_a_recording_that_carried_other_recall_still_matches(self) -> None:
+        """A recorded request went through the trace without the mark; its scratch
+        is cut by the tag, and the live one by the mark."""
+        from raven.trajectory.replay import compare_llm_request
+
+        recorded = append_turn_scratch("hi", render_turn_scratch(["# Memory\n\nwhat the recording recalled"]))
+        assert compare_llm_request(self._recorded(recorded), self._live(_envelope("hi")), [], "m") is None
+
+    def test_a_pasted_tag_inside_the_envelope_still_counts(self) -> None:
+        """The recorded twin is cut at its last tag, which is its own scratch, so
+        what the user wrote around a pasted one is still compared."""
+        from raven.trajectory.replay import compare_llm_request
+
+        recorded = append_turn_scratch(_PASTED, render_turn_scratch(["# Memory\n\nold recall"]))
+        assert compare_llm_request(self._recorded(recorded), self._live(_envelope(_PASTED)), [], "m") is None
+        edited = _envelope(_PASTED.replace("what does that mean?", "why?"))
+        assert compare_llm_request(self._recorded(recorded), self._live(edited), [], "m") is not None
 
     def test_a_different_question_still_diverges(self) -> None:
         from raven.trajectory.replay import compare_llm_request
 
-        live = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": append_turn_scratch("bye", render_turn_scratch(["# Memory\n\nx"]))},
-        ]
-
-        mismatch = compare_llm_request(self._recorded("hi"), live, [], "m")
+        mismatch = compare_llm_request(self._recorded("hi"), self._live(_envelope("bye")), [], "m")
         assert mismatch is not None and mismatch.field == "messages[1]"
 
+    def test_a_pasted_tag_is_compared_like_any_other_text(self) -> None:
+        from raven.trajectory.replay import compare_llm_request
 
-def test_the_turn_question_leaves_the_scratch_out() -> None:
+        live = self._live({"role": "user", "content": f"hi\n\n{TURN_SCRATCH_TAG} one"})
+        mismatch = compare_llm_request(self._recorded(f"hi\n\n{TURN_SCRATCH_TAG} two"), live, [], "m")
+        assert mismatch is not None
+
+
+def test_the_turn_question_leaves_the_scratch_out_and_keeps_a_pasted_tag() -> None:
     from raven.agent.loop._shared import turn_question
 
-    runtime = f"{ContextBuilder._RUNTIME_CONTEXT_TAG}\nCurrent Time: now"
-    scratch = render_turn_scratch(["# Memory\n\nrecalled"])
-
-    assert turn_question([{"role": "user", "content": append_turn_scratch(f"{runtime}\n\nwhy?", scratch)}]) == "why?"
-    blocks = append_turn_scratch([{"type": "text", "text": "why?"}], scratch)
-    assert turn_question([{"role": "user", "content": blocks}]) == "why?"
+    assert turn_question([_envelope(f"{_RUNTIME}\n\nwhy?")]) == "why?"
+    assert turn_question([_envelope([{"type": "text", "text": "why?"}])]) == "why?"
+    assert turn_question([_envelope(f"{_RUNTIME}\n\n{_PASTED}")]) == _PASTED
 
 
 # ---------------------------------------------------------------------------
@@ -453,16 +537,18 @@ def _marks(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -
     return count(messages) + count(tools or [])
 
 
+_TOOLS = [{"type": "function", "function": {"name": "exec", "parameters": {}}}]
+
+
 class TestCacheOptimizerBudget:
     async def test_at_most_four_breakpoints_on_the_first_and_second_iteration(self, builder: ContextBuilder) -> None:
         from raven.token_wise.cache_optimizer import CacheOptimizer
 
         optimizer = CacheOptimizer(supports_caching=lambda _model: True)
-        tools = [{"type": "function", "function": {"name": "exec", "parameters": {}}}]
         history = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "sure"}]
         ac = await _engine(builder).assemble("s", history, _budget(), turn=TurnContext(current_message="espresso"))
 
-        first, first_tools, _ = await optimizer.before_llm_call(list(ac.messages), tools, "m")
+        first, first_tools, _ = await optimizer.before_llm_call(list(ac.messages), _TOOLS, "m")
         assert _marks(first, first_tools) <= 4
         assert "cache_control" in str(first[0])
 
@@ -475,60 +561,108 @@ class TestCacheOptimizerBudget:
             },
             {"role": "tool", "tool_call_id": "c1", "name": "exec", "content": "ok"},
         ]
-        second, second_tools, _ = await optimizer.before_llm_call(second_in, tools, "m")
+        second, second_tools, _ = await optimizer.before_llm_call(second_in, _TOOLS, "m")
         assert _marks(second, second_tools) <= 4
         assert second[0] == first[0]
 
-    async def test_the_system_mark_reads_the_same_on_the_next_turn(self, builder: ContextBuilder) -> None:
+    async def test_across_turns_only_the_tools_and_system_marks_carry_over(self, builder: ContextBuilder) -> None:
+        """Turn N+1 opens on turn N's filed history. The tools and system marks
+        read the same; the envelope turn N sent carried its scratch and the filed
+        one does not, so no later mark keys on a prefix turn N wrote."""
+        from raven.agent.loop.main import AgentLoop
+        from raven.session.manager import Session
         from raven.token_wise.cache_optimizer import CacheOptimizer
 
         optimizer = CacheOptimizer(supports_caching=lambda _model: True)
         eng = _engine(builder)
-        one = await eng.assemble("s", [], _budget(), turn=TurnContext(current_message="one"))
-        two = await eng.assemble("s", [], _budget(), turn=TurnContext(current_message="two"))
+        history = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "sure"}]
+        one = await eng.assemble("s", history, _budget(), turn=TurnContext(current_message="one"))
+        session = Session(key="cli:x")
+        AgentLoop._save_turn(_loop_stub(), session, [one.messages[-1], {"role": "assistant", "content": "ok"}], 0)
+        two = await eng.assemble("s", [*history, *session.messages], _budget(), turn=TurnContext(current_message="two"))
 
-        marked_one, _, _ = await optimizer.before_llm_call(list(one.messages), None, "m")
-        marked_two, _, _ = await optimizer.before_llm_call(list(two.messages), None, "m")
+        sent_one, tools_one, _ = await optimizer.before_llm_call(list(one.messages), _TOOLS, "m")
+        sent_two, tools_two, _ = await optimizer.before_llm_call(list(two.messages), _TOOLS, "m")
 
-        assert marked_one[0] == marked_two[0]
+        assert tools_one == tools_two
+        assert sent_one[0] == sent_two[0]
+        assert _whole_prompt([sent_one[-1]]) != _whole_prompt([sent_two[-3]])
+        assert TURN_SCRATCH_TAG not in _whole_prompt(sent_two[:-1])
 
 
 # ---------------------------------------------------------------------------
-# A real loop over two turns
+# The loop paths that copy or re-file the envelope
 # ---------------------------------------------------------------------------
 
 
-class _RecordingProvider(LLMProvider):
-    """Answers every call and keeps each request's messages."""
+class _ScriptedProvider(LLMProvider):
+    """Answers from a script and keeps each request's messages."""
 
-    def __init__(self) -> None:
+    def __init__(self, script: list[Any] | None = None) -> None:
         super().__init__(api_key="test")
         self.requests: list[list[dict]] = []
+        self._script = list(script or [])
 
     async def chat(self, messages, tools=None, model=None, max_tokens=4096, temperature=0.7, **_kw):
         self.requests.append(json.loads(json.dumps(messages, default=str)))
-        return LLMResponse(content="ok", finish_reason="stop")
+        step = self._script.pop(0) if self._script else LLMResponse(content="ok", finish_reason="stop")
+        if isinstance(step, BaseException):
+            raise step
+        return step
 
     def get_default_model(self) -> str:
         return "stub"
 
 
-def _agent(workspace: Path, *, turn_scratch: bool = True):
-    from raven.agent.loop import AgentLoop
-    from raven.agent.loop.bundles import EngineWiring, ToolWiring, TurnPolicy
-    from raven.config.raven import ContextCacheConfig, ContextConfig
+def _tool_call() -> LLMResponse:
+    return LLMResponse(
+        content="", tool_calls=[ToolCallRequest(id="t1", name="faketool", arguments={})], finish_reason="tool_calls"
+    )
 
-    return AgentLoop(
-        provider=_RecordingProvider(),
+
+def _agent(workspace: Path, *, turn_scratch: bool = True, script: list[Any] | None = None, hooks=(), backend=None):
+    from raven.agent.loop import AgentLoop
+    from raven.agent.loop.bundles import EngineWiring, HostWiring, ToolWiring, TurnPolicy
+    from raven.config.raven import CheckpointConfig, ContextCacheConfig, ContextConfig, RuntimeConfig
+    from raven.contracts.tool import Tool
+
+    class _FakeTool(Tool):
+        @property
+        def name(self) -> str:
+            return "faketool"
+
+        @property
+        def description(self) -> str:
+            return "fake"
+
+        @property
+        def parameters(self) -> dict:
+            return {"type": "object", "properties": {}, "required": []}
+
+        async def execute(self, **kwargs) -> str:
+            return "tool-ran"
+
+    agent = AgentLoop(
+        provider=_ScriptedProvider(script),
         workspace=workspace,
         model="stub",
-        policy=TurnPolicy(max_iterations=2),
+        policy=TurnPolicy(max_iterations=6),
+        host=HostWiring(hooks=list(hooks)),
         tools=ToolWiring(restrict_to_workspace=True),
         engine=EngineWiring(
-            backend=_EchoBackend(),
+            backend=backend or _EchoBackend(),
             context_config=ContextConfig(cache=ContextCacheConfig(turn_scratch=turn_scratch)),
+            runtime_config=RuntimeConfig(checkpoint=CheckpointConfig(policy="never")),
         ),
     )
+
+    async def _noop(**_kw) -> None:
+        return None
+
+    agent._start_executor = _noop
+    agent._connect_mcp = _noop
+    agent.tools.register(_FakeTool())
+    return agent
 
 
 def _request(text: str):
@@ -542,9 +676,24 @@ def _request(text: str):
     )
 
 
-class TestTwoTurnsThroughTheLoop:
-    async def test_system_is_identical_and_memory_rides_the_tail(self, tmp_path: Path) -> None:
-        agent = _agent(tmp_path)
+def _on_disk(agent) -> str:
+    return agent.sessions.session_path("mock:c1").read_text(encoding="utf-8")
+
+
+def _assert_clean(text: str) -> None:
+    assert TURN_SCRATCH_TAG not in text
+    assert TURN_SCRATCH_KEY not in text
+    assert "RECALL<" not in text
+
+
+async def _collect(_event) -> None:
+    return None
+
+
+class TestTheLoopNeverFilesTheScratch:
+    async def test_two_turns_share_a_system_prompt_and_the_store_sees_no_scratch(self, tmp_path: Path) -> None:
+        backend = _EchoBackend()
+        agent = _agent(tmp_path, backend=backend)
 
         await agent._process_message(_request("first question about espresso"))
         await agent._process_message(_request("second question about tea"))
@@ -558,16 +707,75 @@ class TestTwoTurnsThroughTheLoop:
             assert len(_MEMORY_HEADING.findall(_whole_prompt(request))) == 1
             tail = _whole_prompt(request[-1:])
             assert len(_MEMORY_HEADING.findall(tail)) == 1
-            assert "recalled for" not in _whole_prompt(request[:-1])
+            assert "RECALL<" not in _whole_prompt(request[:-1])
             assert query in tail[tail.index(TURN_SCRATCH_TAG) :]
-        # The first turn's scratch is gone from the second turn's history.
         assert TURN_SCRATCH_TAG not in _whole_prompt(second[:-1])
 
         await agent.drain_backend_stores(timeout=5.0)
-        on_disk = agent.sessions.session_path("mock:c1").read_text(encoding="utf-8")
-        assert TURN_SCRATCH_TAG not in on_disk
-        assert "recalled for" not in on_disk
-        assert "first question about espresso" in on_disk
+        _assert_clean(_on_disk(agent))
+        assert "first question about espresso" in _on_disk(agent)
+        assert backend.stored, "the backend was handed the turns"
+        _assert_clean(json.dumps(backend.stored, ensure_ascii=False))
+
+    async def test_a_mid_turn_inject_is_filed_whole_beside_a_clean_envelope(self, tmp_path: Path) -> None:
+        agent = _agent(tmp_path, script=[_tool_call(), LLMResponse(content="done", finish_reason="stop")])
+        drains = [[], [_request(_PASTED)]]
+
+        def _drain() -> list:
+            return drains.pop(0) if drains else []
+
+        await agent.run_turn(_request("start the job"), _collect, _drain, stream=False)
+
+        second = agent.provider.requests[1]
+        assert any(_PASTED in t for m in second if m.get("role") == "user" for t in _texts(m.get("content")))
+        on_disk = _on_disk(agent)
+        assert "RECALL<" not in on_disk
+        assert TURN_SCRATCH_KEY not in on_disk
+        users = [
+            json.loads(line) for line in on_disk.splitlines() if '"role": "user"' in line or '"role":"user"' in line
+        ]
+        contents = [u.get("content") for u in users]
+        assert "start the job" in contents
+        assert any(isinstance(c, str) and c.endswith(_PASTED) for c in contents), contents
+
+    async def test_a_broken_turn_files_its_work_without_the_scratch(self, tmp_path: Path) -> None:
+        import asyncio
+
+        agent = _agent(tmp_path, script=[_tool_call(), asyncio.CancelledError()])
+
+        with pytest.raises(asyncio.CancelledError):
+            await agent._process_message(_request("do the thing"))
+
+        on_disk = _on_disk(agent)
+        _assert_clean(on_disk)
+        assert "do the thing" in on_disk
+        assert "tool-ran" in on_disk
+
+    async def test_a_rerun_opens_on_the_marked_envelope_and_files_it_clean(self, tmp_path: Path) -> None:
+        from raven.agent.loop import TURN_BUDGETS_KEY
+        from raven.contracts.loop_hooks import AgentHook, HookDecision
+
+        class _Budgeted(AgentHook):
+            @property
+            def name(self) -> str:
+                return "Budgeted"
+
+            async def before_user_inbound(self, ctx) -> HookDecision:
+                ctx.metadata[TURN_BUDGETS_KEY] = {"dead_end_retries": 1}
+                return HookDecision()
+
+        dead = [LLMResponse(content="", finish_reason="stop")] * 3
+        agent = _agent(
+            tmp_path, script=[*dead, LLMResponse(content="Alice won.", finish_reason="stop")], hooks=[_Budgeted()]
+        )
+
+        out = await agent._process_message(_request("who won?"))
+
+        assert out[0] == "Alice won."
+        opening, rerun = agent.provider.requests[0], agent.provider.requests[3]
+        assert rerun[-1]["content"] == opening[-1]["content"]
+        assert _whole_prompt(rerun[-1:]).count(TURN_SCRATCH_TAG) == 1
+        _assert_clean(_on_disk(agent))
 
     async def test_turn_scratch_off_keeps_memory_in_system(self, tmp_path: Path) -> None:
         agent = _agent(tmp_path, turn_scratch=False)

@@ -51,10 +51,11 @@ content or tool arguments still counts as a real divergence:
 - prompt-cache breakpoints, removed from both sides via
   ``providers.prompt_cache.strip`` — cache placement is a transport
   optimization, not conversation semantics;
-- the turn scratch at the end of a user message
+- the turn scratch at the end of the live turn's user message
   (``context_engine.scratch``) — recalled memory and routed skills, the same
   environmental material as the system prompt below, only placed in the user
-  slot so the system prompt stays cacheable.
+  slot so the system prompt stays cacheable. It is cut where the assembler
+  marked it, and off the recorded twin of that message only.
 
 System-role message *content* is deliberately not compared: it is assembled
 from the live environment (workspace paths, current time, memory state) that
@@ -449,10 +450,6 @@ def _canonical_message(msg: Any) -> Any:
     out: dict[str, Any] = {"role": msg.get("role")}
     if msg.get("role") == "system":
         out["content"] = "<system prompt: not compared>"
-    elif msg.get("role") == "user":
-        from raven.context_engine.scratch import strip_turn_scratch
-
-        out["content"] = _canonical(strip_turn_scratch(msg.get("content")))
     else:
         out["content"] = _canonical(msg.get("content"))
     for key in ("name", "tool_call_id", "reasoning_content", "thinking_blocks"):
@@ -472,6 +469,26 @@ def _canonical_message(msg: Any) -> Any:
             rendered.append({"name": fn.get("name"), "arguments": _canonical(args)})
         out["tool_calls"] = rendered
     return out
+
+
+def _without_turn_scratch(recorded: Any, live: Any) -> tuple[Any, Any]:
+    """The pair with the turn scratch taken off, when the live one is the envelope.
+
+    Only the live message the assembler marked is cut, by the text the mark
+    records, and only its recorded twin with it: through the trace the recorded
+    one may have lost the mark, so it is cut at its last tag instead. Every
+    other message is compared as it is, so a tag a user pasted is just text.
+    """
+    from raven.context_engine.scratch import TURN_SCRATCH_KEY, strip_turn_scratch, strip_turn_scratch_by_tag
+
+    if not (isinstance(live, dict) and isinstance(recorded, dict) and live.get(TURN_SCRATCH_KEY)):
+        return recorded, live
+    recorded_content = (
+        strip_turn_scratch(recorded)
+        if recorded.get(TURN_SCRATCH_KEY)
+        else strip_turn_scratch_by_tag(recorded.get("content"))
+    )
+    return {**recorded, "content": recorded_content}, {**live, "content": strip_turn_scratch(live)}
 
 
 def _dump(value: Any) -> str:
@@ -518,7 +535,8 @@ def compare_llm_request(
             len(live_msgs),
         )
     for i, (rec, live) in enumerate(zip(recorded_msgs, live_msgs)):
-        rec_c, live_c = _dump(_canonical_message(rec)), _dump(_canonical_message(live))
+        rec_cut, live_cut = _without_turn_scratch(rec, live)
+        rec_c, live_c = _dump(_canonical_message(rec_cut)), _dump(_canonical_message(live_cut))
         if rec_c != live_c:
             return Mismatch(f"messages[{i}]", _first_diff_excerpt(rec_c, live_c), rec, live)
 
