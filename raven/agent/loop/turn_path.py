@@ -992,9 +992,13 @@ class TurnPathMixin:
                 # turn boundary (ask_user) needs to know the iteration number it
                 # sees is a re-sample, and only the loop knows that.
                 hook_ctx.metadata["hook_rollbacks"] = hook_rollbacks
+            log.drop(messages[iter_msg_base:])
             del messages[iter_msg_base:]
             for m in decision.rollback_inject or ():
                 entry = dict(m)
+                # A hook may hand back a copy of a message this turn already
+                # wrote; it is a new message, not a rewrite of that one.
+                entry.pop(TURN_LOG_KEY, None)
                 entry.setdefault("timestamp", self._now_fn().isoformat())
                 entry[_HOOK_INJECTED_KEY] = True
                 messages.append(entry)
@@ -2686,7 +2690,7 @@ class TurnPathMixin:
             # file the user attached is handing it over, one that names any other
             # .pptx is not, and only the turn knows which is which.
             with turn_tier(self.session_tier(key)), turn_attachments(req.media), spend.collecting():
-                final_content, _, all_msgs, outcome = await _attempt(initial_messages, attempt_no)
+                final_content, _, _, outcome = await _attempt(initial_messages, attempt_no)
                 # The conditional rerun. A dead turn has no answer to damage -- "empty
                 # implies wrong" is a scoring rule, so the count of right answers among
                 # dead turns starts at zero and a second attempt can only raise it. It
@@ -2712,7 +2716,7 @@ class TurnPathMixin:
                         # attempt this is: the loop serves every agent, and the
                         # budget allows more reruns than the one.
                         await on_progress("That attempt produced no answer; running the turn again.")
-                    final_content, _, all_msgs, outcome = await _attempt(
+                    final_content, _, _, outcome = await _attempt(
                         _seed_for_the_rerun(live["log"].messages()), attempt_no
                     )
                 # Session-level because this turn may persist no assistant row at

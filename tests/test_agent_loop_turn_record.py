@@ -205,7 +205,7 @@ async def test_an_elided_tool_body_is_filed_as_the_tool_said_it(workspace):
     _no_window_artifacts(filed)
     results = [m for m in filed if m["role"] == "tool"]
     assert len(results) == 5
-    assert all(r["content"] for r in results)
+    assert all("no_such_tool" in r["content"] for r in results), "each is the tool's own answer"
 
 
 @pytest.mark.asyncio
@@ -230,32 +230,67 @@ async def test_a_turn_cancelled_after_a_summary_keeps_what_came_after_it(workspa
     assert filed[-1].get("turn_ended", {}).get("status") == "cancelled"
 
 
+def _picture(call_id: str) -> dict[str, Any]:
+    return {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": [
+            {"type": "text", "text": f"render {call_id}"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ],
+    }
+
+
 def test_the_log_keeps_a_withdrawn_pictures_note_and_drops_what_the_window_made_up():
-    question = {"role": "user", "content": "q"}
-    base = [{"role": "system", "content": "s"}, question]
-    opening = list(base)
+    base = [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}]
     log = TurnLog(base, len(base))
-    # The loop appends to the list it opened the turn with, as here.
     window = base
-    picture = {"role": "tool", "tool_call_id": "a", "content": [{"type": "text", "text": "shot"}]}
-    elided = {"role": "tool", "tool_call_id": "b", "content": "the body"}
-    window.extend([picture, elided])
+    window.extend([_picture("a"), _picture("b"), {"role": "tool", "tool_call_id": "c", "content": "the body"}])
     log.follow(window)
 
-    noted = dict(picture, content=[{"type": "text", "text": "[picture withdrawn]"}])
-    stand_in = dict(elided, content=shrink.ELIDED_TOOL_OUTPUT)
+    # The standing image window, in place: "a" loses its picture to a note.
+    log.follow(window)
+    shrink.window_images(window, 1)
+    log.follow(window)
     made_up = {"role": "user", "content": f"{compaction.SUMMARY_MARKER}\n\nbrief"}
-    window = [opening[0], made_up, noted, stand_in]
+    window = [window[0], made_up, *window[2:]]
     log.follow(window)
     window.append({"role": "assistant", "content": "done"})
 
-    turn = log.messages()
-    assert turn[: len(opening)] == opening
-    assert [m["content"] for m in turn[len(opening) :]] == [
-        [{"type": "text", "text": "[picture withdrawn]"}],
-        "the body",
-        "done",
-    ]
+    turn = log.messages()[2:]
+    assert [m.get("tool_call_id") for m in turn] == ["a", "b", "c", None]
+    assert not any(p.get("type") == "image_url" for p in turn[0]["content"]), "a's note is what is kept"
+    assert any(p.get("type") == "image_url" for p in turn[1]["content"])
+    assert turn[3]["content"] == "done"
+    assert not any(TURN_LOG_KEY in m for m in log.messages())
+
+
+def test_an_elided_body_is_recorded_as_it_was():
+    base = [{"role": "user", "content": "q"}]
+    log = TurnLog(base, 1)
+    for i in range(5):
+        base.append({"role": "tool", "tool_call_id": f"t{i}", "content": f"body {i}"})
+    log.follow(base)
+    shrunk, elided = shrink.emergency_shrink(base)
+    log.follow(shrunk)
+
+    assert elided == 2
+    assert [m["content"] for m in log.messages()[1:]] == [f"body {i}" for i in range(5)]
+
+
+def test_a_rolled_back_message_leaves_the_record():
+    base = [{"role": "user", "content": "q"}]
+    log = TurnLog(base, 1)
+    base.append({"role": "assistant", "content": "kept"})
+    log.follow(base)
+    base.append({"role": "assistant", "content": "a draft the hook sent back"})
+    log.messages()
+
+    log.drop(base[2:])
+    del base[2:]
+    base.append({"role": "assistant", "content": "the re-sample"})
+
+    assert [m["content"] for m in log.messages()] == ["q", "kept", "the re-sample"]
 
 
 def test_a_rerun_seed_copied_from_another_attempt_is_recorded_afresh():

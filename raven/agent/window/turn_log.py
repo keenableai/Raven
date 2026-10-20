@@ -15,7 +15,9 @@ passes copy a message with ``dict(m)`` when they rewrite it, so the stamp rides
 along and the log can tell a rewrite of a turn message from a message the
 window made up. A rewrite replaces the logged version when it is still the
 message (a withdrawn picture's note is what the session keeps), and is ignored
-when it is a stand-in (an elided body). Messages the window made up -- the
+when the pass marked it a stand-in (``STAND_IN_KEY``, an elided body). Both
+halves rest on a convention every window pass keeps: a turn message is rewritten
+as a ``dict(m)`` copy, unknown keys and all. Messages the window made up -- the
 head summary, the user message carrying demoted pictures -- carry no stamp
 and never reach the log.
 
@@ -33,11 +35,15 @@ import uuid
 from collections.abc import Iterable
 from typing import Any
 
-from raven.agent.window.shrink import ELIDED_TOOL_OUTPUT
-
 TURN_LOG_KEY = "_turn_log_seq"
 """The stamp. Underscored so no provider payload carries it (every transport
-sends an allowlist of keys) and dropped by the loop before a message is filed."""
+sends an allowlist of keys); the copies :meth:`TurnLog.messages` hands out do
+not carry it."""
+
+STAND_IN_KEY = "_window_stand_in"
+"""Set by a window pass on a copy that replaces what a message said (an elided
+body) rather than restating it (a withdrawn picture's note). The record keeps
+the message the stand-in stood for."""
 
 
 class TurnLog:
@@ -58,10 +64,6 @@ class TurnLog:
         self._live: list[dict[str, Any]] = base
         self._mark = start
         self._sync(base)
-
-    @property
-    def start(self) -> int:
-        return len(self._head)
 
     def follow(self, messages: list[dict[str, Any]]) -> None:
         """Adopt ``messages`` as the list the loop works on from here.
@@ -86,15 +88,37 @@ class TurnLog:
         """
         self._sync(self._live)
         keys = tuple(transient_keys)
-        kept = [m for m in self._entries if not any(m.get(k) for k in keys)]
+        kept = [_unstamped(m) for m in self._entries if not any(m.get(k) for k in keys)]
         return [*self._head, *kept]
 
+    def drop(self, removed: Iterable[dict[str, Any]]) -> None:
+        """Forget messages the loop took back (a hook rollback), and anything
+        recorded after them, so the record matches a turn in which they never
+        happened."""
+        removed = list(removed)
+        # Pulled back to where the removal starts in the live list, so what is
+        # appended in place of the removed messages is read as new.
+        ids = {id(m) for m in removed}
+        at = next((i for i, m in enumerate(self._live) if id(m) in ids), None)
+        if at is not None:
+            self._mark = min(self._mark, at)
+        seqs = {m.get(TURN_LOG_KEY) for m in removed}
+        cut = min((self._index[s] for s in seqs if s in self._index), default=None)
+        if cut is None:
+            return
+        for gone in self._entries[cut:]:
+            self._index.pop(gone[TURN_LOG_KEY], None)
+        del self._entries[cut:]
+
     def _sync(self, messages: list[dict[str, Any]]) -> None:
+        # A list cut in place (a rollback) must not leave the mark past its end,
+        # or what is appended into the gap would be read as already seen.
+        self._mark = min(self._mark, len(messages))
         for i, m in enumerate(messages):
             seq = m.get(TURN_LOG_KEY)
             if isinstance(seq, str) and seq.startswith(self._token):
                 at = self._index.get(seq)
-                if at is not None and self._entries[at] is not m and not _stands_in(m):
+                if at is not None and self._entries[at] is not m and not m.get(STAND_IN_KEY):
                     self._entries[at] = m
                 continue
             if i < self._mark:
@@ -106,9 +130,8 @@ class TurnLog:
         self._mark = len(messages)
 
 
-def _stands_in(message: dict[str, Any]) -> bool:
-    """A rewrite that replaces what the message said rather than restating it."""
-    return message.get("role") == "tool" and message.get("content") == ELIDED_TOOL_OUTPUT
+def _unstamped(message: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in message.items() if k != TURN_LOG_KEY}
 
 
-__all__ = ["TURN_LOG_KEY", "TurnLog"]
+__all__ = ["STAND_IN_KEY", "TURN_LOG_KEY", "TurnLog"]

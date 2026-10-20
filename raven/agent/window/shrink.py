@@ -27,6 +27,7 @@ from raven.agent.window.images import (
     wire_image_bytes,
     withdrawn_image_note,
 )
+from raven.agent.window.turn_log import STAND_IN_KEY
 from raven.providers.capabilities import image_placeholder_text
 from raven.utils.images import is_image_part
 from raven.utils.tokens import estimate_prompt_tokens
@@ -70,8 +71,9 @@ IMAGE_WINDOW_RECENT_MESSAGES = 2
 # are elided (their bodies are the bulk of mid-turn context growth).
 SHRINK_KEEP_RECENT_TOOL_RESULTS = 3
 
-# What an elided tool body becomes. The turn's record keeps the body itself
-# (see ``turn_log``), so this text only ever lives in the window.
+# What an elided tool body becomes. The copy is marked a stand-in, so the turn's
+# record keeps the body itself (see ``turn_log``) and this text only ever lives
+# in the window.
 ELIDED_TOOL_OUTPUT = "[earlier tool output elided to fit the context window]"
 
 # Image-bearing messages kept intact when emergency-shrinking. Tighter than
@@ -107,6 +109,7 @@ def emergency_shrink(messages: list[dict]) -> tuple[list[dict], int]:
             if i in elide and m.get("content") and m.get("content") != placeholder:
                 clean = dict(m)
                 clean["content"] = placeholder
+                clean[STAND_IN_KEY] = True
                 shrunk.append(clean)
                 elided += 1
             else:
