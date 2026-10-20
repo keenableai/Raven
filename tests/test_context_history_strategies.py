@@ -98,7 +98,18 @@ from pathlib import Path
 sys.path.insert(0, {str(REPO / "tests")!r})
 import test_context_history_strategies as t
 from raven.config.raven import ContextConfig
-t._engine(Path({str(tmp_path)!r}), ContextConfig.model_validate({{"history": {{"strategy": {strategy!r}}}}}))
+from raven.memory_engine.skill_local.watcher import SkillFileWatcher
+
+# The builder starts a native SKILL.md watcher; one left running at interpreter
+# shutdown takes the child down with SIGSEGV after it has printed its answer.
+started = []
+real_start = SkillFileWatcher.start
+SkillFileWatcher.start = lambda self: (started.append(self) or True) if real_start(self) else False
+try:
+    t._engine(Path({str(tmp_path)!r}), ContextConfig.model_validate({{"history": {{"strategy": {strategy!r}}}}}))
+finally:
+    for watcher in started:
+        watcher.stop()
 print(" ".join(m for m in sys.modules if m.startswith("raven.context_engine")))
 """
     out = subprocess.run([sys.executable, "-c", script], cwd=REPO, capture_output=True, text=True, timeout=180)
