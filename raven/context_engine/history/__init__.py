@@ -81,9 +81,17 @@ def _build_curator(**kwargs: Any) -> "SegmentBuilder":
 
 
 def _build_compacting(**kwargs: Any) -> "SegmentBuilder":
-    from raven.context_engine.history.compacting import build_compacting_history
+    from raven.context_engine.history.compacting import CompactingHistoryBuilder
 
-    return build_compacting_history(**kwargs)
+    return CompactingHistoryBuilder(
+        workspace=kwargs["workspace"],
+        config=kwargs["config"],
+        provider=kwargs["provider"],
+        model=kwargs["model"],
+        context_window_tokens=kwargs["context_window_tokens"],
+        get_tool_definitions=kwargs["get_tool_definitions"],
+        now_fn=kwargs.get("now_fn"),
+    )
 
 
 # It takes the full log because it budgets history itself, and it

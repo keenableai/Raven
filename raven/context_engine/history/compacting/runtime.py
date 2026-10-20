@@ -238,6 +238,13 @@ class CompactingHistoryBuilder:
     # One turn
     # ------------------------------------------------------------------
 
+    def _reply_headroom(self, binding: Any, window: int) -> int:
+        return reply_headroom(
+            _wire_model(binding.provider, binding.model),
+            window=window,
+            minimum=self.config.headroom.min_tokens,
+        )
+
     async def build(self, ctx: AssemblyContext) -> Segment:
         if ctx.prefix is None:
             raise RuntimeError("CompactingHistoryBuilder requires ctx.prefix (phase B)")
@@ -252,7 +259,11 @@ class CompactingHistoryBuilder:
         state = self.store.load(ctx.session_key, revision, message_count=len(session))
         binding = resolve(None, self._fallback)
         window = self.context_window_tokens
-        headroom_tokens = ctx.budget.reserved_output
+        # This strategy's own rule rather than the budget's: the Memory role
+        # reserves the model's whole output ceiling, which is the Curator's
+        # arithmetic, while the trigger here is defined against the reply room
+        # the headroom policy has learned (see ``raven.context_engine.headroom``).
+        headroom_tokens = self._reply_headroom(binding, window)
 
         prefix = ctx.prefix
         system_message = {"role": "system", "content": prefix.system_prefix}
@@ -413,11 +424,7 @@ class CompactingHistoryBuilder:
         plan = self.trigger.evaluate(
             prompt_tokens=fixed + ledger.total_tokens,
             window=window,
-            reply_headroom=reply_headroom(
-                _wire_model(binding.provider, binding.model),
-                window=window,
-                minimum=self.config.headroom.min_tokens,
-            ),
+            reply_headroom=self._reply_headroom(binding, window),
             trigger=CompactionTrigger.OVERFLOW,
         )
         if plan.action == "pass":
@@ -756,7 +763,7 @@ class CompactingHistoryBuilder:
             session_messages=session,
             ids=list(range(len(session))),
             protected_ids=set(pinned),
-            reserved_output=ctx.budget.reserved_output,
+            reserved_output=self._reply_headroom(resolve(None, self._fallback), self.context_window_tokens),
             build_messages=lambda history: [system_message, *history, prefix.user_message],
         )
         return Segment(
