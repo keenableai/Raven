@@ -268,3 +268,35 @@ def test_a_rerun_seed_copied_from_another_attempt_is_recorded_afresh():
     second = TurnLog(seed, 1)
 
     assert [m["content"] for m in second.messages()] == ["q", "a correction"]
+
+
+def _saved_tool_result(workspace: Path, body: str, **context: Any) -> str:
+    from raven.config.raven import ContextConfig
+
+    agent = AgentLoop(
+        provider=_ScriptProvider([]),
+        workspace=workspace,
+        model="stub",
+        tools=ToolWiring(restrict_to_workspace=True),
+        engine=EngineWiring(context_config=ContextConfig(**context)),
+    )
+    session = agent.sessions.get_or_create(_KEY)
+    agent._save_turn(session, [{"role": "tool", "tool_call_id": "a", "name": "exec", "content": body}], 0)
+    return session.messages[-1]["content"]
+
+
+def test_a_tool_result_past_the_old_cap_is_filed_whole(workspace):
+    body = "x" * 40_000
+    assert _saved_tool_result(workspace, body) == body
+
+
+def test_the_cap_is_the_configured_one_and_says_it_cut(workspace):
+    from raven.session.refs import is_truncated
+
+    saved = _saved_tool_result(workspace, "y" * 40_000, tool_result_max_chars=16_000)
+    assert saved.startswith("y" * 16_000) and is_truncated(saved)
+
+
+def test_a_cap_of_zero_files_everything(workspace):
+    body = "z" * 1_200_000
+    assert _saved_tool_result(workspace, body, tool_result_max_chars=0) == body

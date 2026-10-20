@@ -104,6 +104,7 @@ from raven.providers import usage_record
 from raven.providers.base import bound_llm_detail, canonical_llm_error, llm_error_summary, parse_llm_error
 from raven.providers.first_byte import first_byte_budget
 from raven.providers.tool_calls import openai_tool_call
+from raven.session.refs import TOOL_RESULT_TRUNCATION_MARKER
 from raven.spine.events import bound_failure_text
 from raven.spine.turn import AnswerlessTurnError
 from raven.token_wise import usage_context
@@ -3253,8 +3254,11 @@ class TurnPathMixin:
                 # it either — it guards `str` content only.
                 content = _strip_inline_images(content)
                 entry["content"] = content
-            if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
-                entry["content"] = content[: self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            cap = self._TOOL_RESULT_MAX_CHARS
+            if role == "tool" and isinstance(content, str) and cap and len(content) > cap:
+                # The marker is what retrieval reads to say a span was cut on the
+                # way to disk rather than pass a prefix off as the whole.
+                entry["content"] = content[:cap] + TOOL_RESULT_TRUNCATION_MARKER
             elif role == "user":
                 # The turn scratch (recalled memory, routed skills) is rebuilt
                 # from the query every turn. Recording it would turn the log
