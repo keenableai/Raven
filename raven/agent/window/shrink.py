@@ -28,6 +28,7 @@ from raven.agent.window.images import (
     withdrawn_image_note,
 )
 from raven.agent.window.turn_log import STAND_IN_KEY
+from raven.context_engine.history.markers import HISTORY_PINNED_KEY
 from raven.providers.capabilities import image_placeholder_text
 from raven.utils.images import is_image_part
 from raven.utils.tokens import estimate_prompt_tokens
@@ -100,7 +101,9 @@ def emergency_shrink(messages: list[dict]) -> tuple[list[dict], int]:
     messages, elided = elide_older_images(messages)
 
     placeholder = ELIDED_TOOL_OUTPUT
-    tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    # A pinned result is held whatever its age: the history strategy kept it
+    # because a missing copy is silently wrong, and an elided one is missing.
+    tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool" and not m.get(HISTORY_PINNED_KEY)]
     shrunk = messages
     if len(tool_idxs) > SHRINK_KEEP_RECENT_TOOL_RESULTS:
         elide = set(tool_idxs[:-SHRINK_KEEP_RECENT_TOOL_RESULTS])

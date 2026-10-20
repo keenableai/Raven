@@ -185,3 +185,33 @@ def test_reset_forgets_everything(ceiling) -> None:
     reset()
 
     assert required_headroom("m") == 0
+
+
+# --------------------------------------------------------------------------- #
+# the request's own max_tokens                                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_request_with_room_for_the_whole_ceiling_goes_out_as_before() -> None:
+    from raven.context_engine.headroom import request_max_tokens
+
+    assert request_max_tokens(window=200_000, prompt_tokens=100_000, ceiling=64_000, floor=4_096) is None
+
+
+def test_a_request_near_the_window_is_sized_to_the_room_beside_its_prompt() -> None:
+    from raven.context_engine.headroom import request_max_tokens
+
+    # 200000 - 170000 * 1.05 = 21500, under the 64000 ceiling.
+    assert request_max_tokens(window=200_000, prompt_tokens=170_000, ceiling=64_000, floor=4_096) == 21_500
+
+
+def test_the_narrowed_request_never_asks_for_less_than_the_floor() -> None:
+    from raven.context_engine.headroom import request_max_tokens
+
+    assert request_max_tokens(window=200_000, prompt_tokens=199_000, ceiling=64_000, floor=4_096) == 4_096
+
+
+def test_an_unknown_window_leaves_the_request_alone() -> None:
+    from raven.context_engine.headroom import request_max_tokens
+
+    assert request_max_tokens(window=0, prompt_tokens=10, ceiling=64_000, floor=4_096) is None

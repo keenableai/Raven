@@ -44,6 +44,7 @@ from loguru import logger
 
 from raven.agent.harness.participants import Intake, compose_addendum, compose_intake, compose_record
 from raven.agent.window import compaction, shrink
+from raven.context_engine import headroom
 from raven.contracts.assembled import TokenBudget
 from raven.contracts.harness import MemoryModule, ShrinkResult, WindowPressure, WindowState
 from raven.contracts.participant import AgentParticipant, StepView
@@ -69,8 +70,11 @@ class DefaultMemory:
         system_prompt: Callable[[list[Any] | None], str],
         compaction: Callable[[], Any],
         output_ceiling: Callable[[str | None], int],
+        headroom: Callable[[], Any] | None = None,
     ) -> None:
         self._engine = engine
+        # ``context.headroom``: the step a refusal teaches the reply room by.
+        self._headroom = headroom
         # The two the window's mid-turn moves read: the compaction settings
         # (config-gated, factory-off) and the output ceiling a request for a
         # model will carry, which sizes what the window must keep in reserve.
@@ -282,12 +286,38 @@ class DefaultMemory:
         return ShrinkResult(messages, bool(windowed))
 
     async def _on_overflow(self, messages: list[dict[str, Any]], state: WindowState, model: str | None) -> ShrinkResult:
-        """The endpoint refused the request as too long: elide the bulk of
-        accumulated tool output (a smaller window would not help), and when
-        nothing is left to elide, summarize the head once per turn. Bounded by
-        the shared retry budget."""
+        """The endpoint refused the request as too long.
+
+        First the refusal is learned from, every time and outside the retry
+        budget: it says the room this request left the reply was not enough,
+        and the history strategy's trigger reads that on the next assembly.
+        Then the engine is asked, because a strategy that put the history
+        there knows what it can give back of it; when it declines, elide the
+        bulk of accumulated tool output (a smaller window would not help), and
+        when nothing is left to elide, summarize the head once per turn.
+        Bounded by the shared retry budget."""
+        window = self._window()
+        self._learn_from_overflow(messages, model, window)
         if state.compress_retries >= shrink.MAX_COMPRESS_RETRIES:
             return ShrinkResult(messages, False)
+        # Read with a default: an engine slotted in through the runtime door
+        # need not subclass the contract.
+        ask = getattr(self._engine, "on_context_overflow", None)
+        outcome = (
+            await ask(state.session_key, messages, attempt=state.compress_retries + 1, window=window)
+            if ask is not None
+            else None
+        )
+        if outcome is not None and outcome.advanced:
+            state.compress_retries += 1
+            state.last_context_used = 0
+            logger.warning(
+                "Context overflow; the history strategy reclaimed ~{} token(s), retrying ({}/{})",
+                outcome.reclaimed_tokens,
+                state.compress_retries,
+                shrink.MAX_COMPRESS_RETRIES,
+            )
+            return ShrinkResult(outcome.messages, True)
         shrunk, elided = shrink.emergency_shrink(messages)
         if elided > 0:
             state.compress_retries += 1
@@ -315,6 +345,16 @@ class DefaultMemory:
                 )
                 return ShrinkResult(summarized, True)
         return ShrinkResult(messages, False)
+
+    def _learn_from_overflow(self, messages: list[dict[str, Any]], model: str | None, window: int) -> None:
+        provider = self._provider()
+        chosen = model or self._model()
+        wire = getattr(provider, "wire_model_id", lambda m: m)(chosen)
+        cfg = self._headroom() if self._headroom is not None else None
+        step = cfg.overflow_backoff_tokens if cfg is not None else headroom.DEFAULT_OVERFLOW_BACKOFF_TOKENS
+        prompt = estimate_prompt_tokens(messages, self._tool_definitions())
+        learned = headroom.learn_from_overflow(wire, window=window, prompt_tokens=prompt, step=step)
+        logger.info("Context overflow on {}: the reply room it needs is now {} token(s)", wire, learned)
 
     @staticmethod
     def _on_tool_images_refused(messages: list[dict[str, Any]], state: WindowState) -> ShrinkResult:

@@ -288,6 +288,16 @@ class ContextEngine(ABC):
         """
         return None
 
+    def note_request(self, session_key: str, messages: list[dict[str, Any]], *, model: str) -> None:
+        """Hear about a request the loop actually sent for ``session_key``.
+
+        ``messages`` is the payload as it went out and ``model`` the id it went
+        out under. A history strategy that summarises by replaying the previous
+        request -- so the summarising call can reuse its cached prefix -- keeps
+        the last one here. Default is no-op.
+        """
+        return None
+
     async def on_context_overflow(
         self,
         session_key: str,

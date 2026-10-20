@@ -110,7 +110,7 @@ from raven.spine.turn import AnswerlessTurnError
 from raven.token_wise import usage_context
 from raven.token_wise.turn_spend import TurnSpend
 from raven.tracing import config as tracing_config
-from raven.utils.tokens import estimate_message_tokens
+from raven.utils.tokens import estimate_message_tokens, estimate_prompt_tokens
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -527,6 +527,21 @@ class TurnPathMixin:
         usage.pop("total_tokens")
         return UsageSnapshot(model=model, session_key=session_key or None, **usage)
 
+    def _reply_room(self, messages: list[dict], tools: list[dict] | None, model: str | None) -> int | None:
+        """The ``max_tokens`` this request carries, or None to send it as before.
+
+        None while the model's whole output ceiling still fits beside the
+        prompt; see ``headroom.request_max_tokens`` for the arithmetic.
+        """
+        from raven.context_engine.headroom import request_max_tokens
+
+        return request_max_tokens(
+            window=self.context_window_tokens,
+            prompt_tokens=estimate_prompt_tokens(messages, tools),
+            ceiling=self._wire_output_ceiling(model),
+            floor=self.context_config.headroom.min_tokens,
+        )
+
     @trace.instrument("llm.call", extract=semconv.llm_call_stream)
     async def _llm_call_stream(
         self,
@@ -832,6 +847,7 @@ class TurnPathMixin:
         window = WindowState(
             image_window=shrink.IMAGE_WINDOW_RECENT_MESSAGES,
             image_budget=self._recovery_limits.image_window_budget_bytes or None,
+            session_key=session_key or "",
         )
 
         async def _shrink(pressure: WindowPressure, at_model: str | None) -> ShrinkResult:
@@ -1185,6 +1201,15 @@ class TurnPathMixin:
             # the shape the messages arrived in, and the prompt-cache prefix
             # stays stable because the same arrivals always fold the same way.
             call_messages = merge_mid_turn(call_messages)
+            # Sized to the prompt it goes out beside, which is the room the
+            # history strategy's trigger holds back: near that line the model's
+            # whole ceiling no longer fits, and a provider that checks
+            # ``prompt + max_tokens <= window`` refuses the request outright. A
+            # hook's own ``max_tokens`` override stands.
+            if "max_tokens" not in gen_overrides and (
+                reply_room := self._reply_room(call_messages, call_tools, call_model)
+            ):
+                gen_overrides["max_tokens"] = reply_room
             # A hook can send this whole response back, and a rollback pops the
             # history the stream has already left -- so where hooks are installed
             # the deltas are held until something keeps the response. The draft
@@ -1235,6 +1260,10 @@ class TurnPathMixin:
                 )
                 # Read inside the bind: the count belongs to it and ends with it.
                 recorded_at_seam = usage_record.recorded_inbound()
+            if response.finish_reason != "error" and (note := getattr(self.context_engine, "note_request", None)):
+                # What went out and was answered, for a history strategy that
+                # summarises by replaying it (its prefix is what is cached).
+                note(session_key or "", call_messages, model=call_model or effective_model)
             # Assigned, not latched: the fact this carries is that the turn's
             # own last word was cut, so a call that recovers clears it. Latching
             # would report a cut to a reader whose question is what the turn

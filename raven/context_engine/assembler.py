@@ -277,6 +277,14 @@ class ContextAssembler(ContextEngine):
             if hook is not None:
                 await hook(session_key, outcome, usage)
 
+    def note_request(self, session_key: str, messages: list[dict[str, Any]], *, model: str) -> None:
+        # Duck-typed like ``set_provider``: only a history builder that replays
+        # requests keeps them.
+        for builder in self._phase_b:
+            hook = getattr(builder, "note_request", None)
+            if hook is not None:
+                hook(session_key, messages, model=model)
+
     async def on_context_overflow(
         self,
         session_key: str,

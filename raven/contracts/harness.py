@@ -113,6 +113,9 @@ class WindowState:
     """Bytes the standing pictures may occupy on the wire, or None for no standing pass."""
     image_demote_retries: int = 0
     image_strip_retries: int = 0
+    session_key: str = ""
+    """The conversation this turn belongs to, for an engine asked about a refused
+    prompt (``ContextEngine.on_context_overflow``); empty outside one."""
 
 
 @dataclass(frozen=True)

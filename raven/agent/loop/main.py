@@ -490,6 +490,7 @@ class AgentLoop(TurnPathMixin, WiringMixin, McpGlueMixin, OrganGlueMixin):
             # costs a lambda.
             compaction=lambda: self._compaction,
             output_ceiling=self._wire_output_ceiling,
+            headroom=lambda: self.context_config.headroom,
         )
 
         # Checkpointing is configured under ``runtime.checkpoint``;

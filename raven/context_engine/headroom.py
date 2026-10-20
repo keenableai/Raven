@@ -38,6 +38,9 @@ DEFAULT_MIN_REPLY_HEADROOM_TOKENS = 4_096
 DEFAULT_OVERFLOW_BACKOFF_TOKENS = 8_192
 """Extra room added per refusal that the model's own ceiling did not explain."""
 
+# The share of a local prompt estimate given up to the provider's tokenizer.
+_ESTIMATE_SLACK = 0.05
+
 _lock = threading.Lock()
 _required: dict[str, int] = {}
 
@@ -116,6 +119,25 @@ def learn_from_overflow(
         return learned
 
 
+def request_max_tokens(*, window: int, prompt_tokens: int, ceiling: int, floor: int) -> int | None:
+    """The ``max_tokens`` a request should carry so it fits beside its prompt.
+
+    ``None`` while the room left beside the prompt still covers ``ceiling`` --
+    the request goes out as it always did. Narrowed, it is that room, never
+    below ``floor``: the trigger keeps a prompt at least ``floor`` below the
+    window, so a request that needs less than the floor is one a provider
+    refuses either way and the overflow path is what answers it. The prompt
+    side is a local estimate against the provider's own count, so 5% of it is
+    given up to the disagreement.
+    """
+    if window <= 0 or ceiling <= 0:
+        return None
+    room = window - int(prompt_tokens * (1 + _ESTIMATE_SLACK))
+    if room >= ceiling:
+        return None
+    return max(floor, room)
+
+
 def reset() -> None:
     """Forget every learned value. For tests -- the table is process state."""
     with _lock:
@@ -128,6 +150,7 @@ __all__ = [
     "learn_from_overflow",
     "max_prompt_tokens",
     "reply_headroom",
+    "request_max_tokens",
     "required_headroom",
     "reset",
 ]
