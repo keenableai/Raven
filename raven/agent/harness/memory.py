@@ -303,11 +303,14 @@ class DefaultMemory:
         # Read with a default: an engine slotted in through the runtime door
         # need not subclass the contract.
         ask = getattr(self._engine, "on_context_overflow", None)
-        outcome = (
-            await ask(state.session_key, messages, attempt=state.compress_retries + 1, window=window)
-            if ask is not None
-            else None
-        )
+        outcome = None
+        if ask is not None:
+            try:
+                outcome = await ask(state.session_key, messages, attempt=state.compress_retries + 1, window=window)
+            except Exception:
+                # The engine loses its say on this refusal, never the turn: the
+                # elision below is what answers instead.
+                logger.opt(exception=True).error("the context engine failed on a refused prompt; eliding instead")
         if outcome is not None and outcome.advanced:
             state.compress_retries += 1
             state.last_context_used = 0
@@ -353,7 +356,16 @@ class DefaultMemory:
         cfg = self._headroom() if self._headroom is not None else None
         step = cfg.overflow_backoff_tokens if cfg is not None else headroom.DEFAULT_OVERFLOW_BACKOFF_TOKENS
         prompt = estimate_prompt_tokens(messages, self._tool_definitions())
-        learned = headroom.learn_from_overflow(wire, window=window, prompt_tokens=prompt, step=step)
+        floor = cfg.min_tokens if cfg is not None else headroom.DEFAULT_MIN_REPLY_HEADROOM_TOKENS
+        # Asked the way the loop sized the refused request, so the lesson is
+        # drawn from what that request actually asked for.
+        narrowed = (
+            headroom.request_max_tokens(
+                window=window, prompt_tokens=prompt, ceiling=self._output_ceiling(chosen), floor=floor
+            )
+            is not None
+        )
+        learned = headroom.learn_from_overflow(wire, window=window, prompt_tokens=prompt, step=step, narrowed=narrowed)
         logger.info("Context overflow on {}: the reply room it needs is now {} token(s)", wire, learned)
 
     @staticmethod

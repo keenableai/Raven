@@ -31,6 +31,7 @@ from raven.agent.window.turn_log import STAND_IN_KEY
 from raven.context_engine.history.markers import HISTORY_PINNED_KEY
 from raven.providers.capabilities import image_placeholder_text
 from raven.utils.images import is_image_part
+from raven.utils.refs import REF_PATTERN
 from raven.utils.tokens import estimate_prompt_tokens
 
 # Max emergency context shrinks per turn before a context overflow is fatal.
@@ -103,7 +104,13 @@ def emergency_shrink(messages: list[dict]) -> tuple[list[dict], int]:
     placeholder = ELIDED_TOOL_OUTPUT
     # A pinned result is held whatever its age: the history strategy kept it
     # because a missing copy is silently wrong, and an elided one is missing.
-    tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool" and not m.get(HISTORY_PINNED_KEY)]
+    # So is a result that already carries a ref: it is a one-line record of a
+    # pruned body, and eliding it saves a line and loses the way back.
+    tool_idxs = [
+        i
+        for i, m in enumerate(messages)
+        if m.get("role") == "tool" and not m.get(HISTORY_PINNED_KEY) and not _carries_ref(m.get("content"))
+    ]
     shrunk = messages
     if len(tool_idxs) > SHRINK_KEEP_RECENT_TOOL_RESULTS:
         elide = set(tool_idxs[:-SHRINK_KEEP_RECENT_TOOL_RESULTS])
@@ -126,6 +133,10 @@ def emergency_shrink(messages: list[dict]) -> tuple[list[dict], int]:
     out = list(shrunk)
     changed, _ = window_images(out, SHRINK_KEEP_RECENT_IMAGES, reason="context", any_role=True)
     return (out, changed) if changed else (shrunk, 0)
+
+
+def _carries_ref(content: Any) -> bool:
+    return isinstance(content, str) and REF_PATTERN.search(content) is not None
 
 
 def demote_tool_images(messages: list[dict]) -> tuple[list[dict], int]:

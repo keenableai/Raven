@@ -283,8 +283,14 @@ class ContextAssembler(ContextEngine):
         # requests keeps them.
         for builder in self._phase_b:
             hook = getattr(builder, "note_request", None)
-            if hook is not None:
+            if hook is None:
+                continue
+            try:
                 hook(session_key, messages, model=model)
+            except Exception:
+                # Bookkeeping for a later summary; a failure here must not undo
+                # a call that was already answered.
+                logger.opt(exception=True).error("{} failed to note a request", builder.name)
 
     async def on_context_overflow(
         self,

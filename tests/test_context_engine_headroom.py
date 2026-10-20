@@ -215,3 +215,21 @@ def test_an_unknown_window_leaves_the_request_alone() -> None:
     from raven.context_engine.headroom import request_max_tokens
 
     assert request_max_tokens(window=0, prompt_tokens=10, ceiling=64_000, floor=4_096) is None
+
+
+def test_a_configured_ceiling_below_the_floor_is_not_raised() -> None:
+    from raven.context_engine.headroom import request_max_tokens
+
+    assert request_max_tokens(window=16_000, prompt_tokens=15_000, ceiling=2_048, floor=4_096) == 2_048
+
+
+def test_a_refused_request_that_was_already_narrowed_moves_the_table_by_one_step() -> None:
+    reset()
+    learned = learn_from_overflow("m", window=200_000, prompt_tokens=170_000, step=8_192, narrowed=True)
+    assert learned == 8_192, "the room it asked for was the room left; the estimate ran short, not the ceiling"
+
+
+def test_a_prompt_that_alone_fills_the_window_teaches_nothing_about_the_reply() -> None:
+    reset()
+    assert learn_from_overflow("m", window=32_000, prompt_tokens=40_000, step=8_192) == 0
+    assert required_headroom("m") == 0

@@ -210,3 +210,64 @@ def test_the_overflow_elision_keeps_a_pinned_result():
     assert elided == 1
     assert shrunk[2]["content"] == "pinned body"
     assert shrunk[3]["content"] == shrink.ELIDED_TOOL_OUTPUT
+
+
+def test_the_overflow_elision_keeps_a_record_that_carries_a_ref():
+    messages: list[dict[str, Any]] = [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}]
+    messages.append({"role": "tool", "tool_call_id": "r", "content": "[tool:exec 40,000 chars] [[ref session/x@0#3]]"})
+    for i in range(4):
+        messages.append({"role": "tool", "tool_call_id": f"t{i}", "content": f"body {i}"})
+
+    shrunk, elided = shrink.emergency_shrink(messages)
+
+    assert elided == 1
+    assert "[[ref session/x@0#3]]" in shrunk[2]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_engine_hook_costs_its_say_not_the_turn(workspace, monkeypatch):
+    provider = _Recording(
+        [
+            *[
+                LLMResponse(content="", tool_calls=[ToolCallRequest(id=f"c{i}", name="no_such_tool", arguments={})])
+                for i in range(4)
+            ],
+            _overflow(),
+            LLMResponse(content="answered", finish_reason="stop"),
+        ]
+    )
+    agent = _agent(workspace, provider, monkeypatch, iterations=8)
+
+    async def broken(*a, **k):
+        raise RuntimeError("the strategy broke")
+
+    def broken_note(*a, **k):
+        raise RuntimeError("the strategy broke")
+
+    monkeypatch.setattr(agent.context_engine, "on_context_overflow", broken)
+    monkeypatch.setattr(agent.context_engine, "note_request", broken_note, raising=False)
+
+    final, _, _, _ = await agent._run_agent_loop(_prompt(10), session_key="s1")
+
+    assert final == "answered"
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_overflow_reaches_the_recovery_instead_of_ending_the_turn(workspace, monkeypatch):
+    from raven.providers.streaming import stream_llm_call
+
+    class _Streaming(_Recording):
+        async def chat_stream(self, messages, tools=None, model=None, **kw):
+            self.calls.append(
+                {"messages": [dict(m) for m in messages], "tools": tools, "max_tokens": kw.get("max_tokens")}
+            )
+            step = self._script.pop(0)
+            if isinstance(step, Exception):
+                raise step
+            yield {"type": "content", "delta": step.content}
+
+    provider = _Streaming([RuntimeError("This model's maximum context length (8192 tokens) was exceeded")])
+    response = await stream_llm_call(provider, messages=[{"role": "user", "content": "x"}], tools=None, model="stub")
+    assert isinstance(response, LLMResponse)
+    assert response.finish_reason == "error"
+    assert response.error_classification is not None and response.error_classification.should_compress

@@ -80,6 +80,7 @@ def learn_from_overflow(
     window: int,
     prompt_tokens: int,
     step: int = DEFAULT_OVERFLOW_BACKOFF_TOKENS,
+    narrowed: bool = False,
 ) -> int:
     """Record that ``model`` refused a prompt of ``prompt_tokens`` on ``window``.
 
@@ -95,7 +96,14 @@ def learn_from_overflow(
       tried: the room left, plus ``step``.
 
     Either way at least ``step`` more than last time, so a provider that
-    refuses twice cannot settle on the same number twice. Capped at half the
+    refuses twice cannot settle on the same number twice.
+
+    Both explanations assume the refused request asked for the model's whole
+    ceiling. One whose ``max_tokens`` was ``narrowed`` to the room beside its
+    prompt asked for exactly that room, so a refusal says the prompt estimate
+    ran short, not that the ceiling did; it moves the table by ``step`` and no
+    more. A prompt that alone fills the window teaches nothing about the reply
+    and moves nothing. Capped at half the
     window: past that the cure costs more history than the overflow did, and a
     model needing more than half its own window for a reply is one this loop
     cannot serve anyway.
@@ -110,10 +118,15 @@ def learn_from_overflow(
     room_left = window - prompt_tokens
     explained_by_ceiling = room_left < ceiling
     with _lock:
-        proposed = max(
-            _required.get(key, 0) + step,
-            ceiling if explained_by_ceiling else room_left + step,
-        )
+        if room_left <= 0:
+            return _required.get(key, 0)
+        if narrowed:
+            proposed = _required.get(key, 0) + step
+        else:
+            proposed = max(
+                _required.get(key, 0) + step,
+                ceiling if explained_by_ceiling else room_left + step,
+            )
         learned = max(0, min(proposed, max(0, window) // 2))
         _required[key] = learned
         return learned
@@ -135,7 +148,9 @@ def request_max_tokens(*, window: int, prompt_tokens: int, ceiling: int, floor: 
     room = window - int(prompt_tokens * (1 + _ESTIMATE_SLACK))
     if room >= ceiling:
         return None
-    return max(floor, room)
+    # Never above the ceiling: a configured ``maxTokens`` below the floor is an
+    # operator's choice this does not overrule.
+    return min(ceiling, max(floor, room))
 
 
 def reset() -> None:

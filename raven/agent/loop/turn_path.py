@@ -622,7 +622,11 @@ class TurnPathMixin:
         synth_messages = messages + [{"role": "user", "content": prompt}]
         # The wrap-up is a model call of the same turn, so it pays the turn's
         # effort; absent, the provider's configured default stands.
-        effort_kwargs: dict[str, str] = {} if reasoning_effort is None else {"reasoning_effort": reasoning_effort}
+        effort_kwargs: dict[str, Any] = {} if reasoning_effort is None else {"reasoning_effort": reasoning_effort}
+        # The wrap-up is asked for at the cliff edge, where the transcript is
+        # longest, so it is sized to the room beside it like any other call.
+        if reply_room := self._reply_room(synth_messages, None, model):
+            effort_kwargs["max_tokens"] = reply_room
         if synthesis_policy is not None:
 
             async def _call(rows: list[dict]) -> str:
@@ -1263,7 +1267,10 @@ class TurnPathMixin:
             if response.finish_reason != "error" and (note := getattr(self.context_engine, "note_request", None)):
                 # What went out and was answered, for a history strategy that
                 # summarises by replaying it (its prefix is what is cached).
-                note(session_key or "", call_messages, model=call_model or effective_model)
+                try:
+                    note(session_key or "", call_messages, model=call_model or effective_model)
+                except Exception:
+                    logger.opt(exception=True).error("the context engine failed to note a request")
             # Assigned, not latched: the fact this carries is that the turn's
             # own last word was cut, so a call that recovers clears it. Latching
             # would report a cut to a reader whose question is what the turn
