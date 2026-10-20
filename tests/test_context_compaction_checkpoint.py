@@ -1688,7 +1688,7 @@ class TestTheSummaryInTheWindow:
 
 class TestTheStoredState:
     def _state(self, tmp_path: Path) -> Path:
-        return tmp_path / CHECKPOINT_DIR / "s1" / "state.json"
+        return CheckpointStore(tmp_path / CHECKPOINT_DIR).folder("s1") / "state.json"
 
     async def _compacted(self, tmp_path: Path):
         session = _session(OVER)

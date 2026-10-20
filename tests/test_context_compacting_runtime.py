@@ -528,7 +528,7 @@ class TestStickyHistory:
         session = _tool_heavy(tokens=60_000)
         segment = await _builder(tmp_path, config=_fold_only()).build(_ctx(session))
 
-        state = json.loads((tmp_path / CHECKPOINT_DIR / "s1" / STATE_FILE).read_text())
+        state = json.loads((CheckpointStore(tmp_path / CHECKPOINT_DIR).folder("s1") / STATE_FILE).read_text())
         assert state["scope"] == _revision(session).scope
         assert state["generation"] == 1
         assert state["checkpoint_id"] == segment.meta["checkpoint_id"]
@@ -738,3 +738,259 @@ class TestOverflow:
             assert outcome is not None and outcome.advanced is True
             assert len(outcome.messages) < len(messages)
             assert any(m.get("content") == standing["content"] for m in outcome.messages)
+
+
+# ---------------------------------------------------------------------------
+# What is retired is what the planner removed, and nothing the trimmer dropped
+# ---------------------------------------------------------------------------
+
+
+def _big_tail() -> list[dict]:
+    """A session whose tail holds one result larger than the window, so the
+    trimmer has to drop more than the planner removed."""
+    session = _session(40)
+    session.append({"role": "user", "content": "QUESTION-IN-TAIL please run the big thing"})
+    session += _tool_exchange("big", "exec", "".join(f"Y{i} " for i in range(14_000)), '{"command": "dump"}')
+    session.append({"role": "assistant", "content": "ANSWER-IN-TAIL it was big"})
+    return session
+
+
+class TestRetirementFollowsThePlanner:
+    async def test_nothing_past_the_covered_span_is_retired(self, tmp_path: Path) -> None:
+        segment = await _builder(tmp_path, config=_fold_only()).build(_ctx(_big_tail()))
+        assert segment.meta["budget_trimmed"] > 0, "the fixture must make the trimmer drop something"
+
+        (checkpoint,) = CheckpointStore(tmp_path / CHECKPOINT_DIR).chain("s1")
+        assert checkpoint.retired
+        assert checkpoint.covers.lo == checkpoint.retired[0]
+        assert checkpoint.covers.hi == checkpoint.retired[-1]
+
+    async def test_what_the_trimmer_dropped_is_decided_again_next_turn(self, tmp_path: Path) -> None:
+        """Retired with no ref pointing at it, the tail question would never
+        come back; re-decided, it is back as soon as there is room."""
+        builder = _builder(tmp_path, config=_fold_only())
+        session = _big_tail()
+        first = await builder.build(_ctx(session))
+        assert "QUESTION-IN-TAIL" not in json.dumps(first.history)
+
+        for turn in range(5):
+            session = _grow(session, turn)
+        later = await builder.build(_ctx(session))
+
+        assert "QUESTION-IN-TAIL" in json.dumps(later.history)
+        assert HistoryTrimmer.structural_errors(_request(later.history)) == []
+
+    async def test_the_checkpoint_keeps_its_place_when_the_head_is_trimmed(self, tmp_path: Path) -> None:
+        """Placed by its own first retired ordinal, which every later turn reads
+        back unchanged, rather than by whatever this turn happened to drop: the
+        history up to and including it is the same bytes turn after turn."""
+        config = _config(head_keep_decays=False, summary=ContextSummaryConfig(mode="off"))
+        builder = _builder(tmp_path, config=config)
+        session = _big_tail()
+        first = await builder.build(_ctx(session))
+        assert first.meta["budget_trimmed"] > 0
+
+        def through_checkpoint(history: list[dict]) -> str:
+            at = next(i for i, m in enumerate(history) if m.get(HISTORY_CHECKPOINT_KEY))
+            return json.dumps(history[: at + 1])
+
+        (checkpoint,) = CheckpointStore(tmp_path / CHECKPOINT_DIR).chain("s1")
+        assert {0, 1}.isdisjoint(checkpoint.retired), "the protected head is trimmed, not retired"
+        for _turn in range(3):
+            segment = await builder.build(_ctx(session))
+            assert segment.meta["checkpoint_id"] == first.meta["checkpoint_id"]
+            assert through_checkpoint(segment.history) == through_checkpoint(first.history)
+
+    async def test_a_turn_that_writes_no_checkpoint_retires_nothing_new(self, tmp_path: Path) -> None:
+        """A deliberate departure from the strategy this was ported from, which
+        extended the standing checkpoint's retired set whenever it removed
+        anything: with folds and summaries off nothing speaks for this turn's
+        removal, so it is re-decided every turn instead."""
+        session = _session(80)
+        await _builder(tmp_path, config=_fold_only()).build(_ctx(session))
+        (standing,) = CheckpointStore(tmp_path / CHECKPOINT_DIR).chain("s1")
+
+        nothing = _config(summary=ContextSummaryConfig(mode="off", fold=False))
+        grown = [*session, *_session(60, start=300)]
+        segment = await _builder(tmp_path, config=nothing).build(_ctx(grown))
+
+        assert segment.meta["compacted_away"] > len(standing.retired)
+        assert segment.meta["checkpoint_id"] == standing.checkpoint_id
+        (still,) = CheckpointStore(tmp_path / CHECKPOINT_DIR).chain("s1")
+        assert still.retired == standing.retired
+
+
+# ---------------------------------------------------------------------------
+# A reader that is behind another process writes nothing
+# ---------------------------------------------------------------------------
+
+
+class TestALaggingReader:
+    async def test_a_shorter_log_of_the_same_revision_reads_but_never_writes(self, tmp_path: Path) -> None:
+        session = _tool_heavy(tokens=60_000)
+        writer = _builder(tmp_path, config=_fold_only())
+        first = await writer.build(_ctx(session))
+        folder = CheckpointStore(tmp_path / CHECKPOINT_DIR).folder("s1")
+        files = {path.name: path.read_bytes() for path in folder.glob("*.json")}
+
+        covers = SourceRef.parse(first.meta["checkpoint_covers"])
+        assert covers is not None
+        # Short enough that the standing checkpoint names ordinals this reader
+        # does not have, and still over the trigger: a reader that decided
+        # anything here would recompact and overwrite the writer's state.
+        behind = session[: covers.hi]
+        assert estimate_prompt_tokens(behind) > first.meta["trigger_tokens"]
+        lagging = await _builder(tmp_path, config=_fold_only()).build(_ctx(behind, revision=_revision(session)))
+
+        assert {path.name: path.read_bytes() for path in folder.glob("*.json")} == files
+        assert lagging.meta["compaction_action"] == "pass"
+        assert BIG_RESULT not in json.dumps(lagging.history), "the sticky prune still applies"
+        assert HistoryTrimmer.structural_errors(_request(lagging.history)) == []
+
+        again = await writer.build(_ctx(session))
+        assert json.dumps(again.history) == json.dumps(first.history)
+        assert again.meta["compaction_action"] == "pass"
+
+    async def test_two_writers_add_to_each_others_pruned_set(self, tmp_path: Path) -> None:
+        store = CheckpointStore(tmp_path / CHECKPOINT_DIR)
+        revision = _revision(_session(10))
+        from raven.context_engine.history.compacting.store import CompactingState
+
+        store.save("s1", CompactingState(scope=revision.scope, message_count=20, pruned=frozenset({3})))
+        store.save("s1", CompactingState(scope=revision.scope, message_count=20, pruned=frozenset({7})))
+
+        loaded = store.load("s1", revision, message_count=20)
+        assert loaded.pruned == frozenset({3, 7})
+
+
+# ---------------------------------------------------------------------------
+# The store against corrupt and crowded folders
+# ---------------------------------------------------------------------------
+
+
+class TestTheStoreUnderStress:
+    async def test_a_huge_pruned_run_is_clipped_before_it_is_expanded(self, tmp_path: Path) -> None:
+        import time
+
+        session = _tool_heavy()
+        await _builder(tmp_path).build(_ctx(session))
+        path = CheckpointStore(tmp_path / CHECKPOINT_DIR).folder("s1") / STATE_FILE
+        state = json.loads(path.read_text())
+        state["pruned"] = [[0, 10**12]]
+        path.write_text(json.dumps(state))
+
+        started = time.perf_counter()
+        loaded = CheckpointStore(tmp_path / CHECKPOINT_DIR).load("s1", _revision(session), message_count=len(session))
+
+        assert time.perf_counter() - started < 1.0
+        assert loaded.pruned == frozenset(range(len(session)))
+
+    async def test_a_huge_retired_run_makes_the_checkpoint_unreadable(self, tmp_path: Path) -> None:
+        import time
+
+        session = _session(80)
+        await _builder(tmp_path, config=_fold_only()).build(_ctx(session))
+        store = CheckpointStore(tmp_path / CHECKPOINT_DIR)
+        (path,) = [p for p in store.folder("s1").glob("*.json") if p.name != STATE_FILE]
+        data = json.loads(path.read_text())
+        data["retired"] = [[0, 10**12]]
+        path.write_text(json.dumps(data))
+
+        started = time.perf_counter()
+        assert store.chain("s1") == []
+        assert store.load("s1", _revision(session), message_count=len(session)).checkpoint is None
+        assert time.perf_counter() - started < 1.0
+
+    async def test_of_two_files_of_one_generation_the_newest_written_stands(self, tmp_path: Path) -> None:
+        from dataclasses import replace
+
+        session = _session(80)
+        await _builder(tmp_path, config=_fold_only()).build(_ctx(session))
+        store = CheckpointStore(tmp_path / CHECKPOINT_DIR)
+        (original,) = store.chain("s1")
+        for suffix in ("zzzz0000", "0000aaaa"):
+            store.write(replace(original, checkpoint_id=f"cp-001-{suffix}"))
+        path = store.folder("s1") / STATE_FILE
+        state = json.loads(path.read_text())
+        state["checkpoint_id"] = "cp-001-missing"
+        path.write_text(json.dumps(state))
+
+        loaded = store.load("s1", _revision(session), message_count=len(session))
+
+        assert loaded.checkpoint is not None
+        assert loaded.checkpoint.checkpoint_id == "cp-001-0000aaaa"
+
+    async def test_without_a_named_checkpoint_the_folder_is_not_read(self, tmp_path: Path, monkeypatch) -> None:
+        session = _tool_heavy()
+        await _builder(tmp_path).build(_ctx(session))
+        store = CheckpointStore(tmp_path / CHECKPOINT_DIR)
+        reads: list[Path] = []
+        monkeypatch.setattr(CheckpointStore, "_read", staticmethod(lambda path, **_: reads.append(path)))
+
+        loaded = store.load("s1", _revision(session), message_count=len(session))
+
+        assert loaded.checkpoint is None and loaded.pruned
+        assert reads == []
+
+    async def test_a_new_revision_clears_the_files_of_the_old_one(self, tmp_path: Path) -> None:
+        session = _session(80)
+        await _builder(tmp_path, config=_fold_only()).build(_ctx(session))
+        renewed = _revision(session, log_id="f" * 32)
+        await _builder(tmp_path, config=_fold_only()).build(_ctx(session, revision=renewed))
+
+        chain = CheckpointStore(tmp_path / CHECKPOINT_DIR).chain("s1")
+        assert [cp.scope for cp in chain] == [renewed.scope]
+
+    async def test_keys_that_sanitise_alike_keep_separate_state(self, tmp_path: Path) -> None:
+        store = CheckpointStore(tmp_path / CHECKPOINT_DIR)
+        assert store.folder("cli:a") != store.folder("cli_a")
+
+        session = _tool_heavy()
+        await _builder(tmp_path).build(_ctx(session, session_key="cli:a"))
+        loaded = store.load("cli_a", _revision(session), message_count=len(session))
+
+        assert loaded.pruned == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Cost of a long session, and what the overflow path hands back
+# ---------------------------------------------------------------------------
+
+
+class TestCostAndShape:
+    async def test_a_pass_turn_prices_only_what_is_new(self, tmp_path: Path, monkeypatch) -> None:
+        from raven.context_engine.history.compacting import ledger as ledger_module
+        from raven.context_engine.history.compacting import runtime as runtime_module
+
+        builder = _builder(tmp_path)
+        session = _tool_heavy()
+        await builder.build(_ctx(session))
+
+        calls: list[int] = []
+        real = runtime_module.estimate_message_tokens
+
+        def counted(message):
+            calls.append(1)
+            return real(message)
+
+        monkeypatch.setattr(runtime_module, "estimate_message_tokens", counted)
+        monkeypatch.setattr(ledger_module, "estimate_message_tokens", counted)
+        await builder.build(_ctx(_grow(session, 0)))
+
+        assert len(calls) <= 2, "two new messages; everything else is already priced"
+
+    async def test_an_overflow_reclaim_keeps_every_key_the_loop_put_on_a_message(self, tmp_path: Path) -> None:
+        builder = _builder(tmp_path)
+        history = [
+            {**message, "_turn_log_seq": index, "timestamp": f"t{index}", "_turn_scratch": True}
+            for index, message in enumerate(_session(60))
+        ]
+        messages = [{"role": "system", "content": "system prompt"}, *history]
+        headroom.learn_from_overflow("stub", window=WINDOW, prompt_tokens=estimate_prompt_tokens(messages), step=8_192)
+
+        outcome = await builder.on_context_overflow("s1", messages, attempt=1, window=WINDOW)
+
+        assert outcome is not None and outcome.advanced
+        for message in outcome.messages[1:]:
+            seq = message["_turn_log_seq"]
+            assert message == history[seq]

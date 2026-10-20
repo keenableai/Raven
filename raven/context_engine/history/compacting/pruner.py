@@ -49,7 +49,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 from raven.config.raven import PRUNE_LINE_MAX_CHARS
 from raven.context_engine.history_trimmer import _group_index, _tool_parents
@@ -114,6 +114,7 @@ class ToolResultPruner:
         revision: "SessionRevision",
         protect_from: int | None = None,
         protected_ids: "frozenset[int] | set[int]" = frozenset(),
+        prices: "Sequence[int] | None" = None,
     ) -> PruneOutcome:
         """Prune everything eligible below the protected suffix.
 
@@ -141,7 +142,7 @@ class ToolResultPruner:
         arg_targets = self._call_arg_targets(messages, floor, protected)
         if not targets and not arg_targets:
             return replace(_NOTHING, messages=messages)
-        return self._rewrite(messages, revision, targets, arg_targets)
+        return self._rewrite(messages, revision, targets, arg_targets, prices=prices)
 
     def reapply(
         self,
@@ -162,6 +163,10 @@ class ToolResultPruner:
         ``protected_ids`` still wins. A body that has become pinned since it was
         rewritten is held whole, because a missing pinned body is the failure
         pinning exists to prevent.
+
+        Nothing is priced: what a re-application reclaims was reported on the
+        turn that chose it, and pricing every body again each turn is the cost
+        of a long session. ``reclaimed_tokens`` is ``0``.
         """
         if not self.cfg.enabled or not messages or not ordinals:
             return replace(_NOTHING, messages=messages)
@@ -181,7 +186,7 @@ class ToolResultPruner:
         )
         if not targets and not arg_targets:
             return replace(_NOTHING, messages=messages)
-        return self._rewrite(messages, revision, targets, arg_targets)
+        return self._rewrite(messages, revision, targets, arg_targets, account=False)
 
     def _rewrite(
         self,
@@ -189,6 +194,9 @@ class ToolResultPruner:
         revision: "SessionRevision",
         targets: frozenset[int],
         arg_targets: frozenset[int],
+        *,
+        account: bool = True,
+        prices: "Sequence[int] | None" = None,
     ) -> PruneOutcome:
         call_by_result = self._calls_by_result(messages)
         out: list[dict[str, Any]] = []
@@ -211,7 +219,9 @@ class ToolResultPruner:
                 continue
             refs.append(ref)
             ordinals.add(index)
-            reclaimed += estimate_message_tokens(message) - estimate_message_tokens(replaced)
+            if account:
+                before = prices[index] if prices is not None and index < len(prices) else None
+                reclaimed += (before or estimate_message_tokens(message)) - estimate_message_tokens(replaced)
             out.append(replaced)
 
         return PruneOutcome(

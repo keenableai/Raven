@@ -56,7 +56,7 @@ hosts it has to answer both with ``True``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from datetime import datetime
 from pathlib import Path
@@ -111,8 +111,9 @@ class _Memo:
     """What this process remembers about a session between turns.
 
     A cache, never the authority: the history is decided from the state on
-    disk. What lives only here is what losing costs at most one prefix reuse --
-    the last request as it was sent, and the key list that names its messages.
+    disk. What lives only here costs at most one prefix reuse and one pricing
+    pass to lose -- the last request as it was sent, the key list that names
+    its messages, and each message's token estimate.
     """
 
     scope: str = ""
@@ -129,6 +130,11 @@ class _Memo:
 
     record: RequestRecord | None = None
     warned: bool = False
+    prices: dict[int, tuple[dict[str, Any], int]] = field(default_factory=dict)
+    """Each ordinal's estimated tokens, with the message they were taken from."""
+
+    rewritten_prices: dict[int, tuple[dict[str, Any], int]] = field(default_factory=dict)
+    """The same for the pruner's rewrite of an ordinal, which is a different message."""
 
 
 class CompactingHistoryBuilder:
@@ -230,8 +236,9 @@ class CompactingHistoryBuilder:
         head = [dict(message) for message in messages[:count]]
         if head[0].get("role") != "system" or head[-1].get("role") != "user":
             return
-        if tuple(_comparable(message) for message in head[1:-1]) != memo.view:
-            return
+        for sent, built in zip(head[1:-1], memo.view):
+            if sent != built and _comparable(sent) != built:
+                return
         memo.record = RequestRecord(messages=tuple(head), keys=memo.keys, model=model or "")
 
     # ------------------------------------------------------------------
@@ -269,12 +276,13 @@ class CompactingHistoryBuilder:
         system_message = {"role": "system", "content": prefix.system_prefix}
         fixed = estimate_prompt_tokens([system_message, prefix.user_message], prefix.tool_defs)
 
-        ledger = MessageLedger(session)
+        ledger = MessageLedger(session, self._prices(memo, session, frozenset()))
         pinned = self.planner.pinned_ids(ledger)
         sticky = self.pruner.reapply(session, revision=revision, ordinals=state.pruned, protected_ids=pinned)
-        if sticky.ordinals:
+        rewritten = sticky.ordinals
+        if rewritten:
             session = sticky.messages
-            ledger = MessageLedger(session)
+            ledger = MessageLedger(session, self._prices(memo, session, rewritten))
 
         retired = state.retired
         checkpoint = state.checkpoint
@@ -283,12 +291,21 @@ class CompactingHistoryBuilder:
         generation = state.generation
 
         plan = self._evaluate(ledger, retired, fixed + standing, headroom_tokens, window)
+        if state.lagging:
+            # Within one revision the log only grows, so a log shorter than the
+            # one the state was decided on means this reader is behind another
+            # process. Whatever it decided here it would decide on less than
+            # the writer already saw, so it decides nothing: the standing state
+            # is applied as it is, and the trimmer alone keeps the turn inside
+            # the window.
+            plan = dataclass_replace(plan, action="pass")
         ranges = self.planner.split(ledger, plan, generation=generation)
 
-        pruned = self._prune(revision, session, ranges, plan, pinned | retired)
+        pruned = self._prune(revision, session, ranges, plan, pinned | retired, [e.tokens for e in ledger.entries])
         if pruned.changed:
             session = pruned.messages
-            ledger = MessageLedger(session)
+            rewritten = rewritten | pruned.ordinals
+            ledger = MessageLedger(session, self._prices(memo, session, rewritten))
             plan = self._evaluate(ledger, retired, fixed + standing, headroom_tokens, window)
             ranges = self.planner.split(ledger, plan, generation=generation)
             self._report_prune(ctx.session_key, pruned, plan)
@@ -323,7 +340,8 @@ class CompactingHistoryBuilder:
             self._report(ctx.session_key, plan, selection, removed, first=not memo.warned)
             memo.warned = True
 
-        estimate_at = _checkpoint_position(selection.kept, selection, checkpoint_message)
+        anchor = min(selection.dropped) if written is not None else _anchor(checkpoint)
+        estimate_at = _checkpoint_position(selection.kept, anchor, checkpoint_message)
         _messages, outcome = self.trimmer.trim(
             session_messages=session,
             ids=list(selection.kept),
@@ -339,28 +357,37 @@ class CompactingHistoryBuilder:
                 prefix.user_message,
             ],
         )
-        checkpoint_at = _checkpoint_position(outcome.included_ids, selection, checkpoint_message)
-        if written is not None and checkpoint is written:
+        checkpoint_at = _checkpoint_position(outcome.included_ids, anchor, checkpoint_message)
+        if written is not None:
             # Retirement is what a checkpoint buys: these messages are spoken
             # for, so later turns select around them instead of removing them
-            # again. With nothing standing in for them there is nothing to
-            # justify it, and re-deciding every turn is the honest behaviour --
-            # which is also what makes turning summaries and folds both off a
-            # true rollback rather than a different scheme.
-            retiring = frozenset(range(len(session))) - frozenset(outcome.included_ids)
-            checkpoint = dataclass_replace(written, retired=tuple(sorted(retiring)))
+            # again. Exactly the planner's decision -- this turn's removal and
+            # every earlier one, which is the span ``covers`` names -- and
+            # nothing the trimmer dropped on top to fit the budget: no ref
+            # points at those, so retiring them would lose them for good, and
+            # they are decided again next turn instead.
+            #
+            # Only a checkpoint written this turn retires anything. A turn that
+            # removed messages and wrote none (folds and summaries both off)
+            # leaves an older checkpoint standing with its own retired set,
+            # because that checkpoint does not speak for what this turn took
+            # out; re-deciding every turn is the honest behaviour, and it is
+            # what makes turning both off a true rollback.
+            checkpoint = dataclass_replace(written, retired=tuple(selection.dropped))
             self.store.write(checkpoint)
 
-        self._persist(
-            ctx.session_key,
-            state,
-            CompactingState(
-                scope=revision.scope,
-                generation=generation,
-                pruned=state.pruned | pruned.ordinals,
-                checkpoint=checkpoint,
-            ),
-        )
+        if not state.lagging:
+            self._persist(
+                ctx.session_key,
+                state,
+                CompactingState(
+                    scope=revision.scope,
+                    message_count=max(state.message_count, len(session)),
+                    generation=generation,
+                    pruned=state.pruned | pruned.ordinals,
+                    checkpoint=checkpoint,
+                ),
+            )
 
         plain = _splice(outcome.history, checkpoint_message, checkpoint_at)
         memo.generation = generation
@@ -436,7 +463,11 @@ class CompactingHistoryBuilder:
         # the planner chose: closure can pull a parent back in, and reporting a
         # reclaim the caller did not get is how a retry loop stops converging.
         ids = HistoryTrimmer.canonical_ids(history, list(selection.kept))
-        kept_history = _carry_private_keys(history, ids, HistoryTrimmer.history_from_ids(history, ids))
+        # The messages themselves, not their provider-safe projection: the loop
+        # keeps its own keys on turn messages (the turn record's sequence, the
+        # markers its window passes read) and strips them on the way out, so a
+        # reclaim that dropped them would blind every later pass in the turn.
+        kept_history = [dict(history[index]) for index in ids if history[index].get("role")]
         if not kept_history:
             # The closure found no user message to anchor on and discarded
             # everything. That reads as a total reclaim and is really a lost
@@ -477,6 +508,30 @@ class CompactingHistoryBuilder:
         if checkpoint is None:
             return None
         return checkpoint.message(inline_refs=self.cfg.summary.refs_inline)
+
+    @staticmethod
+    def _prices(memo: _Memo, session: list[dict[str, Any]], rewritten: frozenset[int]) -> list[int]:
+        """Each message's estimated tokens, from the memo where it already has them.
+
+        Within one revision an ordinal names one message forever, and the
+        pruner's rewrite of it is a function of that message, so a price is
+        worth keeping across turns. It is kept with the message it was taken
+        from and used only while that message is still the one at the ordinal,
+        which is a pointer comparison when the loop hands the same dict back
+        and a byte comparison when it does not -- either far cheaper than the
+        tokenizer.
+        """
+        out: list[int] = []
+        for index, message in enumerate(session):
+            cache = memo.rewritten_prices if index in rewritten else memo.prices
+            known = cache.get(index)
+            if known is not None and (known[0] is message or known[0] == message):
+                out.append(known[1])
+                continue
+            price = estimate_message_tokens(message)
+            cache[index] = (message, price)
+            out.append(price)
+        return out
 
     def _persist(self, session_key: str, before: CompactingState, after: CompactingState) -> None:
         """Write the state when this turn changed it, and only then.
@@ -519,6 +574,7 @@ class CompactingHistoryBuilder:
         ranges: Ranges,
         plan: CompactionPlan,
         protected: frozenset[int],
+        prices: Sequence[int],
     ) -> PruneOutcome:
         """Shorten what can be shortened, before anything is removed.
 
@@ -542,6 +598,7 @@ class CompactingHistoryBuilder:
             revision=revision,
             protect_from=ranges.tail.start,
             protected_ids=protected,
+            prices=prices,
         )
 
     def _report_prune(self, session_key: str, pruned: PruneOutcome, plan: CompactionPlan) -> None:
@@ -676,7 +733,8 @@ class CompactingHistoryBuilder:
             return ((), ())
         keys: list[MessageKey] = [session_message_key(index) for index in ordinals]
         if previous is not None and previous_message is not None and retired:
-            at = sum(1 for index in ordinals if index < min(retired))
+            first_retired = min(retired)
+            at = sum(1 for index in ordinals if index < first_retired)
             keys = _splice(keys, checkpoint_key(previous.checkpoint_id), at)
             messages = _splice(messages, previous_message, at)
         leading = [{"role": "system", "content": prefix.system_prefix}, *messages]
@@ -855,9 +913,16 @@ class CompactingHistoryBuilder:
             )
 
 
+def _anchor(checkpoint: CompactionCheckpoint | None) -> int | None:
+    """The first ordinal a checkpoint stands in for -- where it goes in the history."""
+    if checkpoint is None or not checkpoint.retired:
+        return None
+    return checkpoint.retired[0]
+
+
 def _checkpoint_position(
     included: Sequence[int],
-    selection: Selection,
+    anchor: int | None,
     checkpoint_message: dict[str, Any] | None,
 ) -> int:
     """Where in the history the checkpoint goes: where its messages were.
@@ -865,10 +930,14 @@ def _checkpoint_position(
     Between the protected head and the tail, which is also what puts it at
     the front of the range the next compaction removes -- so folding the
     last summary into the next one needs no record of where it went.
+
+    Counted from the checkpoint's own first retired ordinal, which every
+    later turn reads back unchanged, so the checkpoint lands in the same
+    place relative to the messages around it on every turn.
     """
-    if checkpoint_message is None or not selection.dropped:
+    if checkpoint_message is None or anchor is None:
         return 0
-    return sum(1 for index in included if index < min(selection.dropped))
+    return sum(1 for index in included if index < anchor)
 
 
 def _splice(items: Sequence[Any], item: Any, at: int) -> list[Any]:
@@ -888,25 +957,6 @@ def _comparable(message: dict[str, Any]) -> dict[str, Any]:
     """
     stripped, _tools = prompt_cache.strip([message], None)
     return {key: value for key, value in stripped[0].items() if key not in HISTORY_PRIVATE_KEYS}
-
-
-def _carry_private_keys(
-    source: list[dict[str, Any]],
-    ids: list[int],
-    projected: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """``projected`` with the history markers of the messages it came from.
-
-    Projection keeps provider-safe keys only, and a reclaimed prompt still has
-    to tell in-turn window management which messages are not its to touch.
-    """
-    if len(projected) != len(ids):
-        return projected
-    out: list[dict[str, Any]] = []
-    for index, message in zip(ids, projected):
-        marks = {key: source[index][key] for key in HISTORY_PRIVATE_KEYS if source[index].get(key)}
-        out.append({**message, **marks} if marks else message)
-    return out
 
 
 def _wire_model(provider: Any, model: str) -> str:

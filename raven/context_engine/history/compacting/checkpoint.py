@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Literal, Mapping, Sequence
 
@@ -158,11 +158,18 @@ class CompactionCheckpoint:
     retired: tuple[int, ...] = ()
     """The session ordinals this checkpoint stands in for, in order.
 
-    Wider than ``covers`` can say on its own: a pinned exchange inside the
-    covered span stays in the window and is not retired, and the trimmer may
-    have retired a message outside it. Later turns select around exactly this
-    set, which is what keeps the history they send byte-stable.
+    Exactly what the retention planner removed, this turn and every earlier
+    one -- never what the trimmer additionally dropped to fit the budget,
+    which is re-decided every turn because nothing here points at it. Narrower
+    than ``covers`` can say on its own: a pinned exchange inside the covered
+    span stays in the window and is not retired. Later turns select around
+    exactly this set, which is what keeps the history they send byte-stable.
     """
+
+    written_at_ns: int = field(default=0, compare=False)
+    """When the store wrote this checkpoint. Orders two files of one
+    generation -- a crash between writing one and naming it, or two writers
+    -- so the newest written is the one that stands, whatever its id."""
 
     cache_status: Literal["hit", "miss", "unobservable"] = "unobservable"
     """What the provider said about serving this request from its cache.
@@ -243,6 +250,7 @@ class CompactionCheckpoint:
             "folded_messages": self.folded_messages,
             "folded_tokens": self.folded_tokens,
             "retired": ordinal_runs(self.retired),
+            "written_at_ns": self.written_at_ns,
         }
 
     @classmethod
@@ -280,7 +288,8 @@ class CompactionCheckpoint:
             kind="fold" if data.get("kind") == "fold" else "summary",
             folded_messages=int(data.get("folded_messages", 0)),
             folded_tokens=int(data.get("folded_tokens", 0)),
-            retired=tuple(sorted(ordinals_from_runs(data.get("retired")))),
+            retired=tuple(sorted(_retired_from_runs(data.get("retired")))),
+            written_at_ns=int(data.get("written_at_ns", 0) or 0),
         )
 
 
@@ -300,9 +309,14 @@ def ordinal_runs(ordinals: "Sequence[int] | set[int] | frozenset[int]") -> list[
     return runs
 
 
-def ordinals_from_runs(raw: Any) -> frozenset[int]:
-    """The inverse of :func:`ordinal_runs`; anything malformed reads as empty."""
-    found: set[int] = set()
+ORDINAL_CEILING = 1_000_000
+"""No session log holds this many messages; a stored ordinal past it is
+corruption, refused before anything is expanded."""
+
+
+def valid_runs(raw: Any) -> list[tuple[int, int]]:
+    """The well-formed ``[lo, hi]`` runs of ``raw``, unexpanded."""
+    runs: list[tuple[int, int]] = []
     for run in raw if isinstance(raw, list) else []:
         if (
             isinstance(run, list)
@@ -310,8 +324,39 @@ def ordinals_from_runs(raw: Any) -> frozenset[int]:
             and all(isinstance(edge, int) and not isinstance(edge, bool) for edge in run)
             and 0 <= run[0] <= run[1]
         ):
-            found.update(range(run[0], run[1] + 1))
+            runs.append((run[0], run[1]))
+    return runs
+
+
+def ordinals_from_runs(raw: Any, *, limit: int = ORDINAL_CEILING) -> frozenset[int]:
+    """The inverse of :func:`ordinal_runs`, below ``limit``.
+
+    Clipped before it is expanded, so a corrupt ``[0, 10**12]`` costs what the
+    log is long rather than what the number says. Anything malformed reads as
+    empty.
+    """
+    bound = min(limit, ORDINAL_CEILING)
+    found: set[int] = set()
+    for lo, hi in valid_runs(raw):
+        if lo < bound:
+            found.update(range(lo, min(hi, bound - 1) + 1))
     return frozenset(found)
+
+
+def runs_end(raw: Any) -> int:
+    """One past the highest ordinal ``raw`` names, ``0`` for none -- without expanding it."""
+    return max((hi + 1 for _lo, hi in valid_runs(raw)), default=0)
+
+
+def _retired_from_runs(raw: Any) -> frozenset[int]:
+    """A checkpoint's retired set; a run past :data:`ORDINAL_CEILING` makes the file unreadable.
+
+    Refused rather than clipped: a checkpoint that silently stood for fewer
+    messages than it claims would put retired messages back in the window.
+    """
+    if runs_end(raw) > ORDINAL_CEILING:
+        raise ValueError("checkpoint retires ordinals past any real session log")
+    return ordinals_from_runs(raw)
 
 
 def empty_sections() -> dict[str, tuple[SummaryEntry, ...]]:
@@ -576,6 +621,7 @@ def _overlaps(a: SourceRef, b: SourceRef) -> bool:
 
 __all__ = [
     "EMPTY_SECTION",
+    "ORDINAL_CEILING",
     "FOLD_TAG",
     "SECTIONS",
     "SECTION_GUIDE",
@@ -589,6 +635,8 @@ __all__ = [
     "new_checkpoint_id",
     "ordinal_runs",
     "ordinals_from_runs",
+    "runs_end",
+    "valid_runs",
     "parse_sections",
     "section_template",
     "seen_headings",

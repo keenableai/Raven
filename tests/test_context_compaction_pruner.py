@@ -413,3 +413,18 @@ class TestReusedToolCallIds:
         assert out.messages[2]["content"].startswith("[tool:exec")
         assert out.messages[4]["content"].startswith("[tool:grep")
         assert HistoryTrimmer.structural_errors(out.messages) == []
+
+
+class TestReusedIdsWithDifferentArguments:
+    def test_each_record_names_the_argument_of_its_own_call(self) -> None:
+        """Same id, same tool, different command: only positional pairing can
+        tell the two results apart, because the tool name alone is identical."""
+        messages: list[dict] = [{"role": "user", "content": "run both"}]
+        messages += _exchange("call_0", "exec", BIG, {"command": "pytest -x"})
+        messages += _exchange("call_0", "exec", BIG + " ", {"command": "make all"})
+        messages.append({"role": "assistant", "content": "done"})
+
+        out = _prune(messages)
+
+        assert "command=pytest -x" in out.messages[2]["content"]
+        assert "command=make all" in out.messages[4]["content"]

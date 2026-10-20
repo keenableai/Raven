@@ -26,7 +26,7 @@ the bound on the result.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from raven.context_engine.history_trimmer import _group_index
 from raven.utils.tokens import estimate_message_tokens
@@ -46,10 +46,18 @@ class LedgerEntry:
 class MessageLedger:
     """Stable indices, per-message token costs, and legal cut points."""
 
-    def __init__(self, messages: list[dict[str, Any]]) -> None:
+    def __init__(self, messages: list[dict[str, Any]], tokens: "Sequence[int] | None" = None) -> None:
+        """``tokens``, when given, are the per-message prices already known --
+        one per message, in order -- so a caller that keeps them across turns
+        does not pay the estimator again for messages that did not change."""
         self.messages = messages
+        prices = list(tokens) if tokens is not None and len(tokens) == len(messages) else None
         self.entries = [
-            LedgerEntry(index=idx, role=str(msg.get("role", "")), tokens=estimate_message_tokens(msg))
+            LedgerEntry(
+                index=idx,
+                role=str(msg.get("role", "")),
+                tokens=prices[idx] if prices is not None else estimate_message_tokens(msg),
+            )
             for idx, msg in enumerate(messages)
         ]
         self.groups = _group_index(messages)
