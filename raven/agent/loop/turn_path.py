@@ -2586,9 +2586,11 @@ class TurnPathMixin:
         # A session whose first turn is still running had nothing on disk at
         # all, so it was absent from every listing, and a reader who left the
         # page could not find their way back to the turn still running in it.
-        # Read prev_len first: everything below that slices "what this turn
-        # added" off the session counts from before this write.
-        prev_len = len(session.messages)
+        # Everything below that slices "what this turn added" off the session
+        # counts from this turn's own first entry. Counted after the save, not
+        # before it: a save can merge another writer's messages in ahead of the
+        # question, which it leaves last.
+        question_at = len(session.messages)
         self._save_turn(
             session,
             initial_messages,
@@ -2597,7 +2599,18 @@ class TurnPathMixin:
             inbound_original=inbound_original,
             trace_id=turn_trace_id,
         )
+        question = session.messages[question_at:]
         self.sessions.save(session)
+        prev_len = len(session.messages) - len(question)
+
+        def _turn_start() -> int:
+            """Where this turn's entries start now; a later save may have merged more in ahead of them."""
+            if question:
+                for index in range(len(session.messages) - 1, -1, -1):
+                    if session.messages[index] is question[0]:
+                        return index
+            return min(prev_len, len(session.messages))
+
         # Where the three writes that close the turn start from. The question is
         # already filed, and filing it again would both double it and stamp the
         # turn's arrival clock onto the first message injected mid-turn.
@@ -2667,7 +2680,7 @@ class TurnPathMixin:
                 usage_sink=usage_sink,
                 drain=drain,
                 hook_metadata=turn_hook_meta,
-                session_history=session.messages[:prev_len],
+                session_history=session.messages[: _turn_start()],
                 origin=req.origin,
                 turn_started_at=turn_t0,
                 attempt=attempt,
@@ -2790,7 +2803,7 @@ class TurnPathMixin:
                 # standing -- which is exactly the reading ACP's ``max_tokens``
                 # refinement makes.
                 if turn_hook_meta.get("output_limited"):
-                    session.metadata["output_limit_turn_at"] = prev_len
+                    session.metadata["output_limit_turn_at"] = _turn_start()
                 else:
                     # None rather than dropping the key: a save merges its
                     # metadata over the record on disk, so a key left unsaid is
@@ -2877,7 +2890,7 @@ class TurnPathMixin:
             _send_ctx = AgentHookContext(
                 session_key=key,
                 outbound_content=final_content,
-                session_history=session.messages[:prev_len],
+                session_history=session.messages[: _turn_start()],
                 metadata=turn_hook_meta,
             )
             _send_decision = await self.hooks.after_send(_send_ctx)
@@ -2898,6 +2911,8 @@ class TurnPathMixin:
             _stamp_turn_observers(turn_msgs, turn_hook_meta, turn_start_idx)
 
         self._save_turn(session, turn_msgs, persist_from)
+        # Taken before the save, which may merge another writer's messages in.
+        turn_entries = session.messages[_turn_start() :]
         self.sessions.save(session)
         await self.harness.memory.after_turn(
             key,
@@ -2907,7 +2922,7 @@ class TurnPathMixin:
             },
         )
         # Plugin-side indexing (third peer step in the after-turn pipeline).
-        self._dispatch_backend_store(key, session.messages[prev_len:])
+        self._dispatch_backend_store(key, turn_entries)
         # Forward source-qualified skill-usage feedback. Only
         # ``everos/`` prefix is forwarded to the plugin; static-library
         # sources (``local`` / ``mass``) have no feedback channel.
@@ -2935,7 +2950,7 @@ class TurnPathMixin:
         # ── End Step 4 ──────────────────────────────────────────────────────
 
         if origin is Origin.USER:
-            self._maybe_annotate_tail(session, prev_len)
+            self._maybe_annotate_tail(session, _turn_start())
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt.sent_in_turn:
             # Defensive fingerprint. A silent return None would leave no
@@ -3492,8 +3507,9 @@ class TurnPathMixin:
             msg = {"role": "assistant", "content": req.deliver_text}
             prev_len = len(session.messages)
             self._save_turn(session, [msg], 0)
+            added = session.messages[prev_len:]
             self.sessions.save(session)
-            self._dispatch_backend_store(cid, session.messages[prev_len:])
+            self._dispatch_backend_store(cid, added)
             await emit(Text(content=req.deliver_text))
             return TurnOutcome(
                 usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),

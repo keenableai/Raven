@@ -1052,14 +1052,25 @@ class SessionManager:
             ):
                 # Somebody else changed the messages since this copy last saw
                 # the file. The append lands after theirs, so the live list is
-                # re-read to match the file, and a scope this copy minted refs
-                # under that no longer names the same messages is retired.
+                # re-read to match the file. Refs are minted only into history
+                # already persisted, so the scope survives as long as every
+                # persisted ordinal still names the same message, and is retired
+                # otherwise. Where the persisted part agrees, this copy's own
+                # entries are kept by identity, which is what lets a turn find
+                # its own messages again after the merge.
                 on_disk = read_session_file(path, session.key)
-                merged = None if on_disk is None else on_disk.messages + session.messages[session._persisted_count :]
-                live = _normalized(session.messages)
-                if merged is None or live != _normalized(merged[: len(live)]):
-                    if (session.log_id, session.log_generation) == before:
-                        _move_past(session, before, disk_scope)
+                count = session._persisted_count
+                kept = on_disk is not None and len(on_disk.messages) >= count
+                kept = kept and _normalized(session.messages[:count]) == _normalized(on_disk.messages[:count])
+                if on_disk is not None:
+                    head = session.messages[:count] if kept else on_disk.messages[:count]
+                    merged = head + on_disk.messages[count:] + session.messages[count:]
+                if not kept and (session.log_id, session.log_generation) == before:
+                    _move_past(session, before, disk_scope)
+                # Indices into this copy's unsaved tail move when the other
+                # writer's messages land ahead of it.
+                moved = on_disk is not None and len(on_disk.messages) > count and len(session.messages) > count
+                if merged is None or not kept or moved:
                     session.truncations += 1
             metadata_line = json.dumps(
                 {

@@ -482,9 +482,12 @@ class TestLiveCopyMatchesTheFileAfterAMerge:
         undoer.add_message("user", "the undoer's next turn")
         other.save(undoer)
 
+        # Every ordinal the undoer had persisted still names the same message,
+        # so it keeps the scope; the appender's view is a prefix of the file.
         await _assert_live_and_disk_agree(other, appender.key)
-        assert undoer.revision.scope != appender.revision.scope
+        assert undoer.revision.scope == appender.revision.scope
         assert _contents(undoer.messages) == ["one", "first", "after the merge", "the undoer's next turn"]
+        assert _contents(undoer.messages)[: len(appender.messages)] == _contents(appender.messages)
 
     async def test_an_append_after_another_writers_clear(self, tmp_path: Path) -> None:
         seed = SessionManager(tmp_path)
@@ -520,12 +523,53 @@ class TestLiveCopyMatchesTheFileAfterAMerge:
         second_manager.save(second)
 
         assert _contents(second.messages) == ["u0", "A1", "B1"]
+        assert second.truncations > 0, "the unsaved tail moved, and a reader holding its index has to notice"
         await _assert_live_and_disk_agree(second_manager, first.key)
-        # The second copy minted refs under a scope whose ordinal 1 it held as
-        # B1 while the file says A1; that scope is retired, not shared.
-        assert second.revision.scope != minted_by_second.scope
-        out = await _retrieve(second_manager, first.key, session_ref(minted_by_second, 1).render())
-        assert "B1" not in out and "A1" not in out
+        # Refs are minted only into persisted history, and ordinal 0 still
+        # names u0, so the scope is kept and a ref from before the save holds.
+        assert second.revision.scope == minted_by_second.scope
+        out = await _retrieve(second_manager, first.key, session_ref(minted_by_second, 0).render())
+        assert out.split("\n", 1)[1] == "u0"
+
+    async def test_a_ref_into_persisted_history_survives_a_concurrent_question(self, tmp_path: Path) -> None:
+        mine = SessionManager(tmp_path)
+        session = mine.get_or_create("tui:keep-refs")
+        for index in range(4):
+            session.add_message("user" if index % 2 == 0 else "assistant", f"m{index}")
+        mine.save(session)
+        theirs_manager = SessionManager(tmp_path)
+        theirs = theirs_manager.get_or_create(session.key)
+        theirs.add_message("user", "their question")
+        theirs_manager.save(theirs)
+        ref = session_ref(session.revision, 1).render()
+
+        session.add_message("user", "my question")
+        mine.save(session)
+
+        assert _contents(session.messages) == ["m0", "m1", "m2", "m3", "their question", "my question"]
+        assert (await _retrieve(mine, session.key, ref)).split("\n", 1)[1] == "m1"
+        await _assert_live_and_disk_agree(mine, session.key)
+
+    async def test_a_persisted_ordinal_that_changed_under_the_same_scope_retires_it(self, tmp_path: Path) -> None:
+        """Nothing in this store rewrites the file without moving the revision,
+        but a hand edit or an older writer can, and then the scope must go."""
+        manager = SessionManager(tmp_path)
+        session = manager.get_or_create("tui:hand-edit")
+        _three_messages(session)
+        manager.save(session)
+        before = session.revision
+        path = manager.session_path(session.key)
+        rows = _records(manager, session.key)
+        rows[2]["content"] = "edited by hand"
+        del rows[3]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        session.add_message("assistant", "reply")
+        manager.save(session)
+
+        assert session.revision.scope != before.scope
+        assert _contents(session.messages) == ["one", "edited by hand", "reply"]
+        await _assert_live_and_disk_agree(manager, session.key)
 
     async def test_an_append_that_only_extends_keeps_its_scope(self, tmp_path: Path) -> None:
         first_manager = SessionManager(tmp_path)
@@ -562,7 +606,8 @@ class TestLiveCopyMatchesTheFileAfterAMerge:
         second.add_message("assistant", "second's reply")
         second_manager.save(second)
 
-        assert second.revision.scope != first.revision.scope
+        assert second.revision.scope == first.revision.scope
+        assert _contents(second.messages) == ["old", "first's reply", "second's reply"]
         await _assert_live_and_disk_agree(second_manager, "tui:old")
 
     def test_a_metadata_patch_alone_neither_reloads_nor_retires_the_scope(self, tmp_path: Path) -> None:
