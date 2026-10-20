@@ -1,0 +1,133 @@
+"""Reply headroom -- how much of the window a turn holds back for the answer.
+
+Every prompt bound in the tree is ``window - reply_headroom(...)``: the
+per-turn :class:`~raven.contracts.assembled.TokenBudget` (its
+``reserved_output``), and through it
+:class:`~raven.context_engine.history_trimmer.HistoryTrimmer` under whichever
+history strategy fills the history slot. The policy is one number for the
+whole process, not a strategy's private tuning, which is why this module sits
+beside ``history_trimmer`` rather than inside a strategy package: with
+compaction off it still runs.
+
+The number it answers with is a **floor plus what refusals taught it**, not
+the model's output ceiling. Reserving the ceiling is arithmetically safe and
+practically ruinous on a small window -- a 16384-token ceiling on a 32768
+window is half the window held back from a reply that almost never arrives,
+and the share it costs grows as the window shrinks, which is the wrong
+direction. So the floor is a fixed 4096 and providers that really do validate
+``prompt + ceiling <= window`` teach the rest, once, from a real refusal.
+
+That trade only holds because the refusal is recoverable: the loop's
+context-overflow path retries the iteration, and calls :func:`learn_from_overflow`
+so the next turn's budget already carries what this one had to discover.
+Learning is per process and per wire model id -- it is a cache of an
+observation, not state anyone persists.
+
+Precedent for learning from one refusal rather than guessing statically:
+``providers.prompt_cache.suppress`` and the loop's vision / image-in-tool-result
+verdicts do the same thing.
+"""
+
+from __future__ import annotations
+
+import threading
+
+DEFAULT_MIN_REPLY_HEADROOM_TOKENS = 4_096
+"""The floor, before anything has been learned."""
+
+DEFAULT_OVERFLOW_BACKOFF_TOKENS = 8_192
+"""Extra room added per refusal that the model's own ceiling did not explain."""
+
+_lock = threading.Lock()
+_required: dict[str, int] = {}
+
+
+def required_headroom(model: str) -> int:
+    """What refusals have taught us this model needs. ``0`` until one lands."""
+    return _required.get(model or "", 0)
+
+
+def reply_headroom(
+    model: str,
+    *,
+    window: int,
+    minimum: int = DEFAULT_MIN_REPLY_HEADROOM_TOKENS,
+) -> int:
+    """Tokens of ``window`` that this turn must not fill with prompt.
+
+    Clamped to the window itself: a hand-configured window smaller than the
+    floor would otherwise hand out a negative prompt bound.
+    """
+    return max(0, min(max(minimum, required_headroom(model)), max(0, window)))
+
+
+def max_prompt_tokens(
+    model: str,
+    *,
+    window: int,
+    minimum: int = DEFAULT_MIN_REPLY_HEADROOM_TOKENS,
+) -> int:
+    """The prompt bound this policy implies. Never below 1."""
+    return max(1, window - reply_headroom(model, window=window, minimum=minimum))
+
+
+def learn_from_overflow(
+    model: str,
+    *,
+    window: int,
+    prompt_tokens: int,
+    step: int = DEFAULT_OVERFLOW_BACKOFF_TOKENS,
+) -> int:
+    """Record that ``model`` refused a prompt of ``prompt_tokens`` on ``window``.
+
+    The refusal says the room that request left -- ``window - prompt_tokens``
+    -- was not enough. Which of two explanations to believe turns on whether
+    that room already covered the model's output ceiling:
+
+    - it did not, so a provider validating ``prompt + ceiling <= window``
+      explains the refusal completely and the ceiling is the answer. One
+      refusal, converged, which is the case worth optimising for;
+    - it did, and the request was refused anyway, so the real bound is
+      something else and the only honest move is to go past what was just
+      tried: the room left, plus ``step``.
+
+    Either way at least ``step`` more than last time, so a provider that
+    refuses twice cannot settle on the same number twice. Capped at half the
+    window: past that the cure costs more history than the overflow did, and a
+    model needing more than half its own window for a reply is one this loop
+    cannot serve anyway.
+    """
+    from raven.providers.rates import resolve_max_output_tokens
+
+    key = model or ""
+    # allow_fetch=False: this runs on the loop's thread, in the recovery path
+    # of a request that just failed, and the catalogue's importing tier costs
+    # seconds. An under-estimate here is corrected by the next refusal.
+    ceiling = resolve_max_output_tokens(key, allow_fetch=False)
+    room_left = window - prompt_tokens
+    explained_by_ceiling = room_left < ceiling
+    with _lock:
+        proposed = max(
+            _required.get(key, 0) + step,
+            ceiling if explained_by_ceiling else room_left + step,
+        )
+        learned = max(0, min(proposed, max(0, window) // 2))
+        _required[key] = learned
+        return learned
+
+
+def reset() -> None:
+    """Forget every learned value. For tests -- the table is process state."""
+    with _lock:
+        _required.clear()
+
+
+__all__ = [
+    "DEFAULT_MIN_REPLY_HEADROOM_TOKENS",
+    "DEFAULT_OVERFLOW_BACKOFF_TOKENS",
+    "learn_from_overflow",
+    "max_prompt_tokens",
+    "reply_headroom",
+    "required_headroom",
+    "reset",
+]
