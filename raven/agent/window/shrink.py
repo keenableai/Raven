@@ -70,6 +70,10 @@ IMAGE_WINDOW_RECENT_MESSAGES = 2
 # are elided (their bodies are the bulk of mid-turn context growth).
 SHRINK_KEEP_RECENT_TOOL_RESULTS = 3
 
+# What an elided tool body becomes. The turn's record keeps the body itself
+# (see ``turn_log``), so this text only ever lives in the window.
+ELIDED_TOOL_OUTPUT = "[earlier tool output elided to fit the context window]"
+
 # Image-bearing messages kept intact when emergency-shrinking. Tighter than
 # the tool-result count because one image can cost 1568 tokens: the picture
 # the model is currently reasoning about is worth keeping, older ones are the
@@ -93,7 +97,7 @@ def emergency_shrink(messages: list[dict]) -> tuple[list[dict], int]:
     """
     messages, elided = elide_older_images(messages)
 
-    placeholder = "[earlier tool output elided to fit the context window]"
+    placeholder = ELIDED_TOOL_OUTPUT
     tool_idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
     shrunk = messages
     if len(tool_idxs) > SHRINK_KEEP_RECENT_TOOL_RESULTS:

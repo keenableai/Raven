@@ -88,7 +88,15 @@ from raven.agent.tools.registry import call_failed
 from raven.agent.tools.removals import RemovalWatch
 from raven.agent.window import shrink
 from raven.agent.window.images import ATTACHED_IMAGE_KEY, IMAGE_SOURCES_KEY, filed_image_note, image_sources
-from raven.contracts.harness import ActionRequest, CapabilityRequest, PlanningRequest, WindowPressure, WindowState
+from raven.agent.window.turn_log import TURN_LOG_KEY, TurnLog
+from raven.contracts.harness import (
+    ActionRequest,
+    CapabilityRequest,
+    PlanningRequest,
+    ShrinkResult,
+    WindowPressure,
+    WindowState,
+)
 from raven.contracts.loop_hooks import HookDecision
 from raven.observability.purpose import purpose as _llm_purpose
 from raven.permissions.turn import set_current_tool_call_id
@@ -743,6 +751,7 @@ class TurnPathMixin:
         attempt: int = 1,
         rerun_pending: "Callable[[str | None, list[dict], str], bool] | None" = None,
         spend: TurnSpend | None = None,
+        turn_log: TurnLog | None = None,
     ) -> tuple[str | None, list[str], list[dict], LoopOutcome]:
         """Run the agent iteration loop.
 
@@ -786,9 +795,17 @@ class TurnPathMixin:
         clock above does: a rerun is a second attempt at one turn and bills
         into the same scope. A caller that opened no scope gets one for this
         loop alone, which bills its own calls and takes no delegated ones.
+
+        ``turn_log`` is the record the caller persists this attempt from. The
+        returned list is the window as the last call saw it, which the window
+        passes may have summarised or elided; the log follows every list they
+        hand back and keeps what the turn actually said. A caller that passes
+        none gets one opened here, so the rerun question below is still asked of
+        the turn rather than of the window.
         """
         spend = spend if spend is not None else TurnSpend(session_key)
         messages = initial_messages
+        log = turn_log if turn_log is not None else TurnLog(initial_messages, len(initial_messages))
         iteration = 0
         final_content = None
         tools_used: list[str] = []
@@ -815,6 +832,16 @@ class TurnPathMixin:
             image_window=shrink.IMAGE_WINDOW_RECENT_MESSAGES,
             image_budget=self._recovery_limits.image_window_budget_bytes or None,
         )
+
+        async def _shrink(pressure: WindowPressure, at_model: str | None) -> ShrinkResult:
+            # The log reads the list on both sides of the pass: before, so the
+            # pass's copies of this turn's messages carry the log's stamp; after,
+            # so the list it hands back is the one the log follows.
+            log.follow(messages)
+            result = await self.harness.memory.shrink(messages, pressure=pressure, state=window, model=at_model)
+            log.follow(result.messages)
+            return result
+
         # Retryable model errors that outlasted the provider's own ladder: how many
         # of the loop's longer waits this turn has spent.
         error_waits = 0
@@ -1057,15 +1084,11 @@ class TurnPathMixin:
             # Compaction rebinds ``messages``, which is why it sits above the
             # autofill publish: a snapshot published before the rebind would go
             # quietly stale.
-            ahead = await self.harness.memory.shrink(
-                messages, pressure=WindowPressure.PROACTIVE, state=window, model=effective_model
-            )
+            ahead = await _shrink(WindowPressure.PROACTIVE, effective_model)
             messages = ahead.messages
             # The standing image window: the notes it writes are the transcript
             # from here on rather than a per-request rewrite.
-            standing = await self.harness.memory.shrink(
-                messages, pressure=WindowPressure.STANDING, state=window, model=effective_model
-            )
+            standing = await _shrink(WindowPressure.STANDING, effective_model)
             messages = standing.messages
 
             # Same seam and the same reason as the drain above: only the loop's
@@ -1310,17 +1333,13 @@ class TurnPathMixin:
             refused = response.finish_reason == "error" and cls_ is not None
             retry_model = call_model or effective_model
             if refused and cls_.should_compress:
-                shrunk = await self.harness.memory.shrink(
-                    messages, pressure=WindowPressure.OVERFLOW, state=window, model=retry_model
-                )
+                shrunk = await _shrink(WindowPressure.OVERFLOW, retry_model)
                 messages = shrunk.messages
                 if shrunk.changed:
                     iteration -= 1
                     continue
             if refused and cls_.should_drop_tool_images:
-                demoted = await self.harness.memory.shrink(
-                    messages, pressure=WindowPressure.TOOL_IMAGES_REFUSED, state=window, model=retry_model
-                )
+                demoted = await _shrink(WindowPressure.TOOL_IMAGES_REFUSED, retry_model)
                 messages = demoted.messages
                 if demoted.changed:
                     # Cached so the rest of the process stops paying for the
@@ -1330,9 +1349,7 @@ class TurnPathMixin:
                     iteration -= 1
                     continue
             if refused and cls_.strip_images:
-                withdrawn = await self.harness.memory.shrink(
-                    messages, pressure=WindowPressure.IMAGES_TOO_LARGE, state=window, model=retry_model
-                )
+                withdrawn = await _shrink(WindowPressure.IMAGES_TOO_LARGE, retry_model)
                 messages = withdrawn.messages
                 if withdrawn.changed:
                     iteration -= 1
@@ -2117,7 +2134,7 @@ class TurnPathMixin:
         # can come back differently the second time -- the checkpoint and the persist
         # between here and there are seconds a clock can cross. A loop nobody
         # budgeted a rerun for asks no one and salvages as it always did.
-        rerun_coming = rerun_pending is not None and rerun_pending(final_content, messages, status)
+        rerun_coming = rerun_pending is not None and rerun_pending(final_content, log.messages(), status)
         if hook_ctx is not None and answerless and not rerun_coming:
             hook_ctx.messages = messages
             hook_ctx.response = None
@@ -2574,11 +2591,13 @@ class TurnPathMixin:
 
         async def _attempt(seed: list[dict], attempt: int):
             pending.update(rerun=False, reasons=[])
-            # The list this attempt appends to, for the rescue paths below. A rerun
-            # runs on a list of its own, and a turn cancelled during one used to be
-            # saved from the first attempt's -- so a tool the reader watched run in
-            # the rerun, and its result, were not in what the cancel filed.
-            live["messages"] = seed
+            # The record this attempt persists from, for the rescue paths below as
+            # well as the healthy one. A rerun keeps a record of its own, and a turn
+            # cancelled during one used to be saved from the first attempt's -- so a
+            # tool the reader watched run in the rerun, and its result, were not in
+            # what the cancel filed. A record rather than the list the attempt
+            # appends to, because the window passes replace that list mid-turn.
+            live["log"] = TurnLog(seed, persist_from)
             return await self._run_agent_loop(
                 seed,
                 on_progress=on_progress,
@@ -2600,6 +2619,7 @@ class TurnPathMixin:
                 attempt=attempt,
                 rerun_pending=_rerun_pending,
                 spend=spend,
+                turn_log=live["log"],
             )
 
         # Taken BEFORE the first attempt, because the loop appends to the list it is
@@ -2612,7 +2632,7 @@ class TurnPathMixin:
         retry_seed = [dict(m) for m in initial_messages] if retries_left else None
         turn_t0 = monotonic()
         pending: dict[str, Any] = {"rerun": False, "reasons": []}
-        live: dict[str, list[dict]] = {"messages": initial_messages}
+        live: dict[str, TurnLog] = {"log": TurnLog(initial_messages, persist_from)}
 
         def _seed_for_the_rerun(msgs: list[dict]) -> list[dict]:
             """The question again, plus whatever the reader said while the attempt ran.
@@ -2620,9 +2640,9 @@ class TurnPathMixin:
             The rerun exists to discard an attempt's research, and a correction typed
             mid-turn is not research: the loop took it off the inject queue, which will
             not offer it twice, so a seed rebuilt from the question alone silently
-            un-asks it. Read off the whole finished list rather than its tail, because
-            compaction may have moved the tail, and rebuilt from the untouched snapshot
-            each time, so carrying one forward twice cannot double it.
+            un-asks it. Read off the attempt's record rather than its window, because
+            compaction may have summarised the correction away, and rebuilt from the
+            untouched snapshot each time, so carrying one forward twice cannot double it.
             """
             return [dict(m) for m in retry_seed] + [dict(m) for m in msgs if m.get(_MID_TURN_USER_KEY)]
 
@@ -2691,7 +2711,9 @@ class TurnPathMixin:
                         # attempt this is: the loop serves every agent, and the
                         # budget allows more reruns than the one.
                         await on_progress("That attempt produced no answer; running the turn again.")
-                    final_content, _, all_msgs, outcome = await _attempt(_seed_for_the_rerun(all_msgs), attempt_no)
+                    final_content, _, all_msgs, outcome = await _attempt(
+                        _seed_for_the_rerun(live["log"].messages()), attempt_no
+                    )
                 # Session-level because this turn may persist no assistant row at
                 # all -- a turn whose whole budget went to reasoning has no
                 # message to hang a record on. Stamped with the index this turn's
@@ -2743,7 +2765,7 @@ class TurnPathMixin:
             # note saying a person ended the turn. Then the cancel proceeds.
             self._save_broken_turn(
                 session,
-                live["messages"],
+                live["log"].messages(),
                 persist_from,
                 None,
                 streamed,
@@ -2751,13 +2773,12 @@ class TurnPathMixin:
             )
             raise
         except AnswerlessTurnError as exc:
-            # The attempt's own list rather than `live["messages"]`: a window pass
-            # that rebound `messages` mid-turn leaves `live` on the seed, and the
-            # marker would then be filed with none of this turn's work between the
-            # question and itself. `all_msgs` is what the healthy path persists.
+            # The attempt's record, which follows every list a window pass rebound
+            # `messages` to, so the marker is filed after this turn's work rather
+            # than straight after the question.
             self._save_broken_turn(
                 session,
-                all_msgs,
+                live["log"].messages(),
                 persist_from,
                 None,
                 streamed,
@@ -2769,7 +2790,7 @@ class TurnPathMixin:
         except Exception as exc:
             self._save_broken_turn(
                 session,
-                live["messages"],
+                live["log"].messages(),
                 persist_from,
                 None,
                 streamed,
@@ -2815,16 +2836,20 @@ class TurnPathMixin:
         # substantive assistant message at persist time -- after the send fire,
         # so a stash from any phase, ``after_send`` included, reaches the filed
         # record. Per turn, on the turn -- not a session-wide last write.
+        # The record, not the window the last call saw: a summary, an elided
+        # body or a dropped stretch of the turn is the window's business, and
+        # filing it would replay it to every later turn as what happened.
+        turn_msgs = live["log"].messages(_TURN_TRANSIENT_KEYS)
         if len(self.hooks) > 0:
-            _stamp_turn_observers(all_msgs, turn_hook_meta, turn_start_idx)
+            _stamp_turn_observers(turn_msgs, turn_hook_meta, turn_start_idx)
 
-        self._save_turn(session, all_msgs, persist_from)
+        self._save_turn(session, turn_msgs, persist_from)
         self.sessions.save(session)
         await self.harness.memory.after_turn(
             key,
             {
                 "final_content": final_content,
-                "messages": all_msgs[turn_start_idx:],
+                "messages": turn_msgs[turn_start_idx:],
             },
         )
         # Plugin-side indexing (third peer step in the after-turn pipeline).
@@ -3148,6 +3173,7 @@ class TurnPathMixin:
                 if trace_id:
                     entry["trace_id"] = trace_id
                 first_user_pending = False
+            entry.pop(TURN_LOG_KEY, None)
             if entry.get("_recovery_synthetic"):
                 continue  # #1a synthetic recovery nudge — never persist scaffolding
             if entry.get(ATTACHED_IMAGE_KEY):
