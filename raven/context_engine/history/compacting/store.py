@@ -20,11 +20,15 @@ revision and every ordinal it names still exists; otherwise the newest written
 one that qualifies stands, or none does. The retired ordinals are read off the
 standing checkpoint rather than kept beside it, so the two cannot disagree.
 
-Within one revision the log only grows. A reader whose log is shorter than the
-one the state was written against is therefore behind -- another process has
-appended since -- and is told so (:attr:`CompactingState.lagging`): it may read
-the state, never write it, since anything it decided would be decided on less
-than the writer already saw.
+Within one revision the log only grows, and within one log the revision's
+generation only rises. A reader is therefore behind another process when its
+log is shorter than the one the state was written against, or when the state
+or a checkpoint on disk belongs to a later generation of the same log -- an
+undo another process has merged and this one has not -- and is told so
+(:attr:`CompactingState.lagging`). It may read, never write: no state, no
+checkpoint, and no clean-up, since anything it decided would be decided on less
+than the writer already saw. A different log id is a different log, ``/new``
+having started one, and its files are what a writer clears.
 
 Best-effort on purpose. A write that fails is logged and the turn continues --
 the history is already decided, and a read-only workspace is not a reason to
@@ -95,8 +99,9 @@ class CompactingState:
     so the next save is worth making even if the turn changes nothing."""
 
     lagging: bool = field(default=False, compare=False)
-    """True when the state was written against a longer log than this reader
-    holds: the reader is behind, and must not write what it decides."""
+    """True when the disk holds a later view of this log than this reader --
+    a longer log under the same revision, or a later generation of the same
+    log id: the reader is behind, and must not write what it decides."""
 
     @property
     def retired(self) -> frozenset[int]:
@@ -120,10 +125,29 @@ class CheckpointStore:
     def write(self, checkpoint: CompactionCheckpoint) -> "Path | None":
         """Store ``checkpoint``, and drop the files of revisions it supersedes.
 
-        A checkpoint written under another scope can never stand again --
-        ``/new`` and an undo only ever move the scope forward -- so the folder
-        keeps the chain of the current revision and nothing older.
+        Refused, writing and deleting nothing, when the disk already holds a
+        later generation of the same log: the writer is behind, and its
+        checkpoint speaks for a view of the log another process has moved past.
+
+        What is cleared is what can never stand again for whoever is current:
+        files of another log id (``/new`` started a new one), and files of an
+        earlier generation of this log that no state of this generation or
+        later names. A later generation is never touched.
         """
+        session_key = checkpoint.session_key
+        mine = _split_scope(checkpoint.scope)
+        stored = [(path, self._read(path)) for path in self._checkpoint_files(session_key)]
+        raw = self._read_state(session_key)
+        if mine is not None and (
+            _is_later(raw.get("scope") if raw is not None else None, mine)
+            or any(other is not None and _is_later(other.scope, mine) for _path, other in stored)
+        ):
+            logger.info(
+                "Not storing compaction checkpoint {} for {}: a later generation of this log is on disk",
+                checkpoint.checkpoint_id,
+                session_key,
+            )
+            return None
         path = self.path_for(checkpoint)
         stamped = dataclass_replace(checkpoint, written_at_ns=time.time_ns())
         try:
@@ -131,12 +155,18 @@ class CheckpointStore:
         except OSError as exc:
             logger.warning("Could not store compaction checkpoint at {}: {}", path, exc)
             return None
-        for other in self._checkpoint_files(checkpoint.session_key):
-            if other == path:
+        # Only a state of this generation can name a file this writer must
+        # keep; a later one would have refused the write above.
+        current = raw is not None and mine is not None and _split_scope(raw.get("scope")) == mine
+        named = str(raw.get("checkpoint_id") or "") if current and raw is not None else ""
+        for other_path, other in stored:
+            if other_path == path or other is None or mine is None:
                 continue
-            stored = self._read(other)
-            if stored is not None and stored.scope != checkpoint.scope:
-                other.unlink(missing_ok=True)
+            theirs = _split_scope(other.scope)
+            if theirs is None:
+                continue
+            if theirs[0] != mine[0] or (theirs[1] < mine[1] and other.checkpoint_id != named):
+                other_path.unlink(missing_ok=True)
         return path
 
     def chain(self, session_key: str, *, scope: str | None = None) -> list[CompactionCheckpoint]:
@@ -157,7 +187,15 @@ class CheckpointStore:
         is the bound every stored ordinal has to fall under.
         """
         fresh = CompactingState(scope=revision.scope)
+        mine = (revision.log_id, revision.generation)
         raw = self._read_state(session_key)
+        if raw is not None and raw.get("session_key") == session_key and _is_later(raw.get("scope"), mine):
+            return dataclass_replace(fresh, lagging=True)
+        if raw is None and any(
+            cp is not None and _is_later(cp.scope, mine)
+            for cp in (self._read(path) for path in self._checkpoint_files(session_key))
+        ):
+            return dataclass_replace(fresh, lagging=True)
         if raw is None or raw.get("scope") != revision.scope or raw.get("session_key") != session_key:
             return fresh
         stored_count = raw.get("message_count")
@@ -196,6 +234,12 @@ class CheckpointStore:
                 pruned = set(state.pruned)
                 message_count = state.message_count
                 raw = self._read_state(session_key)
+                mine = _split_scope(state.scope)
+                if raw is not None and mine is not None and _is_later(raw.get("scope"), mine):
+                    logger.info(
+                        "Not storing compaction state for {}: a later generation of this log is on disk", session_key
+                    )
+                    return False
                 if raw is not None and raw.get("scope") == state.scope and raw.get("session_key") == session_key:
                     stored_count = raw.get("message_count")
                     if isinstance(stored_count, int) and stored_count > message_count:
@@ -290,6 +334,22 @@ class CheckpointStore:
         except (OSError, ValueError, TypeError) as exc:
             logger.warning("Skipping unreadable compaction checkpoint {}: {}", path, exc)
             return None
+
+
+def _split_scope(scope: Any) -> tuple[str, int] | None:
+    """``(log_id, generation)`` of a revision scope, or ``None`` for anything else."""
+    if not isinstance(scope, str):
+        return None
+    log_id, sep, generation = scope.rpartition("@")
+    if not sep or not log_id or not generation.isdigit():
+        return None
+    return log_id, int(generation)
+
+
+def _is_later(scope: Any, mine: tuple[str, int]) -> bool:
+    """Whether ``scope`` is a later generation of the same log as ``mine``."""
+    theirs = _split_scope(scope)
+    return theirs is not None and theirs[0] == mine[0] and theirs[1] > mine[1]
 
 
 __all__ = ["CHECKPOINT_DIR", "STATE_FILE", "CheckpointStore", "CompactingState"]

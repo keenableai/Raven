@@ -994,3 +994,117 @@ class TestCostAndShape:
         for message in outcome.messages[1:]:
             seq = message["_turn_log_seq"]
             assert message == history[seq]
+
+
+# ---------------------------------------------------------------------------
+# Two processes one log generation apart
+# ---------------------------------------------------------------------------
+
+
+def _store_checkpoint(checkpoint_id: str, scope: str, *, generation: int = 1):
+    from raven.context_engine.history.compacting.checkpoint import CompactionCheckpoint, empty_sections
+
+    return CompactionCheckpoint(
+        checkpoint_id=checkpoint_id,
+        session_key="tui:k",
+        created_at="2026-10-20T00:00:00",
+        generation=generation,
+        covers=SourceRef("session", scope, 1, 10),
+        supersedes=None,
+        sections=empty_sections(),
+        model="m",
+        byte_prefix_reused=False,
+        retired=tuple(range(1, 11)),
+    )
+
+
+class TestGenerationsOfOneLog:
+    """An undo another process merged and this one has not yet makes the two
+    disagree about the revision only by its generation. The one behind must
+    neither delete the other's checkpoint nor overwrite its state."""
+
+    LOG = "ab" * 16
+
+    def _names(self, store: CheckpointStore) -> list[str]:
+        return sorted(path.name for path in store.folder("tui:k").glob("*.json"))
+
+    def test_the_process_behind_cannot_ping_pong_the_one_ahead(self, tmp_path: Path) -> None:
+        from raven.context_engine.history.compacting.store import CompactingState
+
+        store = CheckpointStore(tmp_path)
+        ahead = _store_checkpoint("aaaa", f"{self.LOG}@1")
+        store.write(ahead)
+        store.save(
+            "tui:k",
+            CompactingState(
+                scope=f"{self.LOG}@1", message_count=40, generation=1, pruned=frozenset({3, 4}), checkpoint=ahead
+            ),
+        )
+        before = self._names(store)
+
+        behind = _store_checkpoint("bbbb", f"{self.LOG}@0")
+        assert store.write(behind) is None
+        assert not store.save(
+            "tui:k", CompactingState(scope=f"{self.LOG}@0", message_count=38, generation=1, checkpoint=behind)
+        )
+
+        assert self._names(store) == before
+        reloaded = store.load(
+            "tui:k", SessionRevision(log_id=self.LOG, generation=1, message_count=41), message_count=41
+        )
+        assert reloaded.checkpoint is not None and reloaded.checkpoint.checkpoint_id == "aaaa"
+        assert reloaded.pruned == frozenset({3, 4})
+
+    def test_the_process_behind_reads_its_state_as_lagging(self, tmp_path: Path) -> None:
+        from raven.context_engine.history.compacting.store import CompactingState
+
+        store = CheckpointStore(tmp_path)
+        store.write(_store_checkpoint("aaaa", f"{self.LOG}@1"))
+        store.save("tui:k", CompactingState(scope=f"{self.LOG}@1", message_count=40, generation=1))
+
+        loaded = store.load("tui:k", SessionRevision(log_id=self.LOG, generation=0, message_count=45), message_count=45)
+        assert loaded.lagging is True
+        assert (loaded.checkpoint, loaded.pruned) == (None, frozenset())
+
+    def test_a_later_checkpoint_file_alone_marks_the_reader_behind(self, tmp_path: Path) -> None:
+        """A crash between writing a checkpoint and naming it leaves no state;
+        the file itself is evidence enough."""
+        store = CheckpointStore(tmp_path)
+        store.write(_store_checkpoint("aaaa", f"{self.LOG}@2"))
+
+        loaded = store.load("tui:k", SessionRevision(log_id=self.LOG, generation=1, message_count=45), message_count=45)
+        assert loaded.lagging is True
+
+    def test_a_newer_generation_is_never_deleted_by_an_older_one(self, tmp_path: Path) -> None:
+        store = CheckpointStore(tmp_path)
+        store.write(_store_checkpoint("aaaa", f"{self.LOG}@3"))
+        for generation in (0, 1, 2):
+            store.write(_store_checkpoint(f"old{generation}", f"{self.LOG}@{generation}"))
+
+        assert [cp.checkpoint_id for cp in store.chain("tui:k")] == ["aaaa"]
+
+    def test_the_writer_ahead_clears_earlier_generations_and_other_logs(self, tmp_path: Path) -> None:
+        store = CheckpointStore(tmp_path)
+        store.write(_store_checkpoint("gen0", f"{self.LOG}@0"))
+        store.write(_store_checkpoint("other", f"{'cd' * 16}@5"))
+        store.write(_store_checkpoint("gen1", f"{self.LOG}@1"))
+
+        assert [cp.checkpoint_id for cp in store.chain("tui:k")] == ["gen1"]
+
+    async def test_a_builder_behind_by_a_generation_trims_and_writes_nothing(self, tmp_path: Path) -> None:
+        session = _session(80)
+        ahead = _revision(session, generation=1)
+        first = await _builder(tmp_path, config=_fold_only()).build(_ctx(session, revision=ahead))
+        assert first.meta["compaction_action"] == "compact"
+        folder = CheckpointStore(tmp_path / CHECKPOINT_DIR).folder("s1")
+        files = {path.name: path.read_bytes() for path in folder.glob("*.json")}
+
+        behind = await _builder(tmp_path, config=_fold_only()).build(
+            _ctx([*session, *_session(4, start=900)], revision=_revision(session, generation=0))
+        )
+
+        assert behind.meta["compaction_action"] == "pass"
+        assert {path.name: path.read_bytes() for path in folder.glob("*.json")} == files
+        assert HistoryTrimmer.structural_errors(_request(behind.history)) == []
+        again = await _builder(tmp_path, config=_fold_only()).build(_ctx(session, revision=ahead))
+        assert json.dumps(again.history) == json.dumps(first.history)

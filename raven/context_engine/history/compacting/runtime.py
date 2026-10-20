@@ -292,12 +292,13 @@ class CompactingHistoryBuilder:
 
         plan = self._evaluate(ledger, retired, fixed + standing, headroom_tokens, window)
         if state.lagging:
-            # Within one revision the log only grows, so a log shorter than the
-            # one the state was decided on means this reader is behind another
-            # process. Whatever it decided here it would decide on less than
-            # the writer already saw, so it decides nothing: the standing state
-            # is applied as it is, and the trimmer alone keeps the turn inside
-            # the window.
+            # Within one revision the log only grows, and within one log the
+            # generation only rises, so a shorter log than the state was decided
+            # on, or a later generation of this log on disk, means this reader
+            # is behind another process. Whatever it decided here it would
+            # decide on less than the writer already saw, so it decides
+            # nothing: what it may still use of the state is applied as it is,
+            # and the trimmer alone keeps the turn inside the window.
             plan = dataclass_replace(plan, action="pass")
         ranges = self.planner.split(ledger, plan, generation=generation)
 
