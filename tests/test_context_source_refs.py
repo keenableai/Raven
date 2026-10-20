@@ -13,12 +13,16 @@ says ``truncated=true`` rather than passing off a prefix as the whole.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from raven.agent.tools.context_retrieve import ContextRetrieveTool
 from raven.session.manager import Session, SessionManager
 from raven.session.refs import TOOL_RESULT_TRUNCATION_MARKER, session_ref
 from raven.utils.refs import SourceRef
+from raven.utils.tokens import estimate_message_tokens
 
 HUGE = ("Traceback (most recent call last):\n  File auth.ts, line 214, in refresh\n" * 600)[:40_000]
 FILLER = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod " * 20
@@ -130,8 +134,52 @@ class TestRetrieval:
 
         out = await _retriever(manager, session).execute(refs=[stale])
 
-        assert "before an undo" in out
+        assert "was rewritten" in out
         assert "a different message at the same index" not in out
+
+    async def test_a_ref_from_a_later_generation_says_so(self, tmp_path: Path) -> None:
+        manager, session = _saved(tmp_path, "small")
+        ahead = SourceRef("session", f"{session.log_id}@{session.log_generation + 3}", 0, 0)
+
+        out = await _retriever(manager, session).execute(refs=[ahead.render()])
+
+        assert "names generation 3" in out and "at generation 0 here" in out
+        assert "rewritten" not in out
+
+    async def test_every_ref_in_one_string_is_read(self, tmp_path: Path) -> None:
+        manager, session = _saved(tmp_path, "small result")
+
+        out = await _retriever(manager, session).execute(
+            refs=[f"see {_ref(session, 0).render()} and {_ref(session, 2).render()}"]
+        )
+
+        assert "run the tests" in out and "small result" in out
+
+    async def test_a_legacy_log_not_in_memory_names_the_same_scope_on_every_read(self, tmp_path: Path) -> None:
+        path = tmp_path / "sessions" / "cli" / "direct.jsonl"
+        path.parent.mkdir(parents=True)
+        records = [
+            {"_type": "metadata", "key": "cli:direct", "created_at": "2026-01-01T10:00:00", "metadata": {}},
+            *_tool_turn("legacy result"),
+        ]
+        path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        minted = SessionManager(tmp_path).peek("cli:direct")
+        tool = ContextRetrieveTool(SessionManager(tmp_path))
+        tool.set_context("cli", "direct", "cli:direct")
+
+        out = await tool.execute(refs=[_ref(minted, 2).render()])
+
+        assert out.split("\n", 1)[1] == "legacy result"
+        assert path.read_text(encoding="utf-8") == "".join(json.dumps(record) + "\n" for record in records)
+
+    @pytest.mark.parametrize("max_tokens", [256, 1_000, 4_000])
+    async def test_a_cut_entry_stays_inside_the_budget(self, tmp_path: Path, max_tokens: int) -> None:
+        manager, session = _saved(tmp_path, HUGE)
+
+        out = await _retriever(manager, session).execute(refs=[_ref(session, 2).render()], max_tokens=max_tokens)
+
+        assert "shown=" in out.split("\n", 1)[0]
+        assert estimate_message_tokens({"role": "tool", "content": out}) <= max_tokens
 
     async def test_an_index_past_the_end_says_so(self, tmp_path: Path) -> None:
         manager, session = _saved(tmp_path, "small")

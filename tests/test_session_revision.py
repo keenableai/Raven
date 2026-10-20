@@ -11,6 +11,7 @@ resolving.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,25 @@ def _last_metadata(manager: SessionManager, key: str) -> dict:
 def _three_messages(session: Session) -> None:
     for role, content in (("user", "one"), ("assistant", "first"), ("user", "two")):
         session.add_message(role, content)
+
+
+def _contents(messages: list[dict]) -> list:
+    return [message.get("content") for message in messages]
+
+
+def _disk_contents(manager: SessionManager, key: str) -> list:
+    return [row.get("content") for row in _records(manager, key) if row.get("_type") != "metadata"]
+
+
+async def _assert_live_and_disk_agree(manager: SessionManager, key: str) -> None:
+    """Every ordinal of the live copy's scope names the same message in memory and on disk."""
+    live = manager.get_or_create(key)
+    disk = SessionManager(manager.workspace)
+    assert _contents(live.messages) == _disk_contents(manager, key)
+    assert disk.peek(key).revision.scope == live.revision.scope
+    for index in range(len(live.messages)):
+        ref = session_ref(live.revision, index).render()
+        assert await _retrieve(manager, key, ref) == await _retrieve(disk, key, ref)
 
 
 async def _retrieve(manager: SessionManager, key: str, ref: str) -> str:
@@ -287,8 +307,15 @@ class TestTwoWriters:
         stale_manager.save(stale)
 
         assert stale.log_id == clearer.log_id != seeded.log_id
-        assert stale.revision.scope == clearer.revision.scope
         assert SessionManager(tmp_path).get_or_create(seeded.key).log_id == clearer.log_id
+        # Sharing the scope is right only because the stale copy now holds the
+        # file's list, of which the clearer's is a prefix.
+        assert stale.revision.scope == clearer.revision.scope
+        assert (
+            _contents(stale.messages)
+            == _disk_contents(stale_manager, seeded.key)
+            == ["fresh start", "late reply to the old log"]
+        )
 
     def test_a_later_clear_wins_over_an_earlier_one(self, tmp_path: Path) -> None:
         seeded = self._seeded(tmp_path, "tui:clear-race")
@@ -387,7 +414,7 @@ class TestStaleRefsAcrossWriters:
 
         out = await _retrieve(reader, session.key, stale)
 
-        assert "before an undo" in out
+        assert "was rewritten" in out
         assert "a different message" not in out
 
     async def test_a_ref_minted_before_another_writers_clear_is_refused(self, tmp_path: Path) -> None:
@@ -424,11 +451,190 @@ class TestStaleRefsAcrossWriters:
 
         session.add_message("assistant", "after the merge")
         seed.save(session)
-        fresh = session_ref(session.revision, 0).render()
 
-        out = await _retrieve(SessionManager(tmp_path), session.key, fresh)
+        await _assert_live_and_disk_agree(seed, session.key)
+        assert _contents(session.messages) == ["one", "first", "after the merge"]
 
-        assert out.split("\n", 1)[1] == "one"
+
+class TestLiveCopyMatchesTheFileAfterAMerge:
+    """After any save, the copy that saved and the file agree on every ordinal of
+    its scope, and no scope names two different messages."""
+
+    async def test_an_append_after_another_writers_undo(self, tmp_path: Path) -> None:
+        seed = SessionManager(tmp_path)
+        appender = seed.get_or_create("tui:undo-append")
+        _three_messages(appender)
+        seed.save(appender)
+        other = SessionManager(tmp_path)
+        undoer = other.get_or_create(appender.key)
+        undoer.undo_last_turn()
+        other.save(undoer)
+        before = appender.revision
+
+        appender.add_message("assistant", "after the merge")
+        seed.save(appender)
+
+        assert _contents(appender.messages) == ["one", "first", "after the merge"]
+        assert appender.truncations > 0, "a reader holding indices into the old list has to notice"
+        await _assert_live_and_disk_agree(seed, appender.key)
+        assert before.scope != appender.revision.scope
+
+        undoer.add_message("user", "the undoer's next turn")
+        other.save(undoer)
+
+        await _assert_live_and_disk_agree(other, appender.key)
+        assert undoer.revision.scope != appender.revision.scope
+        assert _contents(undoer.messages) == ["one", "first", "after the merge", "the undoer's next turn"]
+
+    async def test_an_append_after_another_writers_clear(self, tmp_path: Path) -> None:
+        seed = SessionManager(tmp_path)
+        stale = seed.get_or_create("tui:clear-append")
+        _three_messages(stale)
+        seed.save(stale)
+        clearer_manager = SessionManager(tmp_path)
+        clearer = clearer_manager.get_or_create(stale.key)
+        clearer.clear()
+        clearer.add_message("user", "fresh start")
+        clearer_manager.save(clearer)
+
+        stale.add_message("assistant", "late")
+        seed.save(stale)
+
+        assert _contents(stale.messages) == ["fresh start", "late"]
+        await _assert_live_and_disk_agree(seed, stale.key)
+        out = await _retrieve(clearer_manager, stale.key, session_ref(stale.revision, 0).render())
+        assert out.split("\n", 1)[1] == "fresh start"
+
+    async def test_two_plain_appenders(self, tmp_path: Path) -> None:
+        first_manager = SessionManager(tmp_path)
+        first = first_manager.get_or_create("tui:appenders")
+        first.add_message("user", "u0")
+        first_manager.save(first)
+        second_manager = SessionManager(tmp_path)
+        second = second_manager.get_or_create(first.key)
+        first.add_message("assistant", "A1")
+        first_manager.save(first)
+        minted_by_second = second.revision
+
+        second.add_message("assistant", "B1")
+        second_manager.save(second)
+
+        assert _contents(second.messages) == ["u0", "A1", "B1"]
+        await _assert_live_and_disk_agree(second_manager, first.key)
+        # The second copy minted refs under a scope whose ordinal 1 it held as
+        # B1 while the file says A1; that scope is retired, not shared.
+        assert second.revision.scope != minted_by_second.scope
+        out = await _retrieve(second_manager, first.key, session_ref(minted_by_second, 1).render())
+        assert "B1" not in out and "A1" not in out
+
+    async def test_an_append_that_only_extends_keeps_its_scope(self, tmp_path: Path) -> None:
+        first_manager = SessionManager(tmp_path)
+        first = first_manager.get_or_create("tui:extend")
+        first.add_message("user", "u0")
+        first_manager.save(first)
+        reader_manager = SessionManager(tmp_path)
+        reader = reader_manager.get_or_create(first.key)
+        first.add_message("assistant", "A1")
+        first_manager.save(first)
+        scope = reader.revision.scope
+
+        reader_manager.save(reader)
+
+        assert reader.revision.scope == scope
+        assert _contents(reader.messages) == ["u0", "A1"]
+        await _assert_live_and_disk_agree(reader_manager, first.key)
+
+    async def test_two_loaders_of_a_legacy_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "sessions" / "tui" / "old.jsonl"
+        path.parent.mkdir(parents=True)
+        records = [
+            {"_type": "metadata", "key": "tui:old", "created_at": "2026-01-01T10:00:00", "metadata": {}},
+            {"role": "user", "content": "old"},
+        ]
+        path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        first_manager, second_manager = SessionManager(tmp_path), SessionManager(tmp_path)
+        first = first_manager.get_or_create("tui:old")
+        second = second_manager.get_or_create("tui:old")
+        assert first.log_id == second.log_id
+
+        first.add_message("assistant", "first's reply")
+        first_manager.save(first)
+        second.add_message("assistant", "second's reply")
+        second_manager.save(second)
+
+        assert second.revision.scope != first.revision.scope
+        await _assert_live_and_disk_agree(second_manager, "tui:old")
+
+    def test_a_metadata_patch_alone_neither_reloads_nor_retires_the_scope(self, tmp_path: Path) -> None:
+        manager = SessionManager(tmp_path)
+        session = manager.get_or_create("tui:patch-only")
+        session.add_message("user", "one")
+        manager.save(session)
+        scope, truncations = session.revision.scope, session.truncations
+
+        SessionManager(tmp_path).append_metadata_patch(session.key, {"archived": True})
+        session.add_message("assistant", "two")
+        manager.save(session)
+
+        assert session.revision.scope == scope
+        assert session.truncations == truncations
+
+
+class TestLoadRace:
+    def test_a_rewrite_landing_while_a_copy_loads_is_merged_on_its_next_save(self, tmp_path: Path, monkeypatch) -> None:
+        """The stamp is the file this copy read, not whatever replaced it a moment
+        later: otherwise the next save skips the merge and writes the old
+        generation back over the newer one."""
+        import builtins
+
+        import raven.session.manager as manager_module
+
+        seed = SessionManager(tmp_path)
+        session = seed.get_or_create("tui:load-race")
+        for role, content in (("user", "one"), ("assistant", "first"), ("user", "two"), ("assistant", "second")):
+            session.add_message(role, content)
+        seed.save(session)
+        writer = SessionManager(tmp_path)
+        rewriting = writer.get_or_create(session.key)
+        fired: list[bool] = []
+
+        def racing_open(file, *args, **kwargs):
+            handle = builtins.open(file, *args, **kwargs)
+            if not fired:
+                fired.append(True)
+                rewriting.undo_last_turn()
+                rewriting.add_message("user", "replaced")
+                writer.save(rewriting)
+            return handle
+
+        monkeypatch.setattr(manager_module, "open", racing_open, raising=False)
+        loader = SessionManager(tmp_path)
+        loaded = loader.get_or_create(session.key)
+        monkeypatch.undo()
+        assert fired and loaded.log_generation == 0
+
+        loaded.add_message("assistant", "late")
+        loader.save(loaded)
+
+        generations = [row["log_generation"] for row in _records(loader, session.key) if row.get("_type") == "metadata"]
+        assert generations == sorted(generations)
+        assert loaded.log_generation >= rewriting.log_generation
+        assert _contents(loaded.messages) == _disk_contents(loader, session.key)
+
+
+def test_a_clear_stamps_its_start_in_utc() -> None:
+    session = Session(key="tui:utc")
+    session.clear()
+
+    assert datetime.fromisoformat(session.log_started_at).utcoffset() == timedelta(0)
+
+
+def test_a_naive_start_from_an_earlier_write_still_compares() -> None:
+    from raven.session.manager import _started
+
+    assert _started("2026-10-20T10:00:00") < _started(datetime.now(timezone.utc).isoformat())
+    assert _started(None) < _started("2026-10-20T10:00:00+00:00")
+    assert _started("not a time") == _started(None)
 
 
 @pytest.mark.parametrize(

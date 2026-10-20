@@ -42,9 +42,6 @@ _MIN_MAX_TOKENS = 256
 _MAX_MAX_TOKENS = 32_000
 _SNIPPET_HEAD_CHARS = 800
 _SNIPPET_TAIL_CHARS = 400
-_HEADER_ALLOWANCE_CHARS = 80
-"""Room left for an entry's header when its body has to be cut to the budget,
-so the line that says how much was shown is not itself what overruns."""
 _MAX_REFS = 20
 """Refs answered in one call. A span already carries many messages, and the
 budget is shared, so a longer list only splits the same allowance further."""
@@ -129,28 +126,38 @@ class ContextRetrieveTool(Tool):
         messages = session.messages
         revision = session.revision
 
+        # Every tag in every string: a model that pastes a line holding two refs
+        # asked for both.
+        wanted: list[SourceRef | str] = []
+        for raw in refs:
+            found = SourceRef.find_all(str(raw))
+            wanted.extend(found or [str(raw)])
+        answered = wanted[:_MAX_REFS]
+
         sections: list[str] = []
-        for raw in refs[:_MAX_REFS]:
-            section, spent = self._resolve(str(raw), messages, revision, mode=mode, budget=budget)
+        for item in answered:
+            section, spent = self._resolve(item, messages, revision, mode=mode, budget=budget)
             sections.append(section)
             budget -= spent
             if budget <= 0:
-                remaining = len(refs[:_MAX_REFS]) - len(sections)
+                remaining = len(answered) - len(sections)
                 if remaining > 0:
                     sections.append(
                         f"[{remaining} more ref(s) not read: the token budget for this call is spent. "
                         "Ask again for them, or raise max_tokens.]"
                     )
                 break
-        if len(refs) > _MAX_REFS:
-            sections.append(f"[{len(refs) - _MAX_REFS} ref(s) beyond the {_MAX_REFS} this call answers were ignored.]")
+        if len(wanted) > _MAX_REFS:
+            sections.append(
+                f"[{len(wanted) - _MAX_REFS} ref(s) beyond the {_MAX_REFS} this call answers were ignored.]"
+            )
         return "\n\n".join(sections)
 
     # ------------------------------------------------------------------
 
     def _resolve(
         self,
-        raw: str,
+        item: SourceRef | str,
         messages: Sequence[Mapping[str, Any]],
         revision: SessionRevision,
         *,
@@ -158,16 +165,25 @@ class ContextRetrieveTool(Tool):
         budget: int,
     ) -> tuple[str, int]:
         """One ref: its entries and what reading them cost."""
-        ref = SourceRef.parse(raw)
-        if ref is None:
-            return (f"[{raw!r} is not a ref; expected the [[ref store/scope#n]] form]", 0)
+        if isinstance(item, str):
+            return (f"[{item!r} is not a ref; expected the [[ref store/scope#n]] form]", 0)
+        ref = item
         if ref.store != SESSION_REF_STORE:
             return (f"[{ref.render()}: the {ref.store!r} store is not retrievable here]", 0)
         if not belongs_to(ref, revision):
-            if ref.scope.partition("@")[0] == revision.log_id:
+            log_id, _, generation = ref.scope.partition("@")
+            if log_id == revision.log_id and generation.isdigit():
+                if int(generation) < revision.generation:
+                    return (
+                        f"[{ref.render()}: minted before this conversation's log was rewritten (an undo, "
+                        "or another copy of the session saving over it); the entries it named may now "
+                        "hold other messages, so it is not read back]",
+                        0,
+                    )
                 return (
-                    f"[{ref.render()}: minted before an undo rewrote this conversation's log; the "
-                    "entries it named may now hold other messages, so it is not read back]",
+                    f"[{ref.render()}: names generation {generation} of this conversation's log, which is "
+                    f"at generation {revision.generation} here; no stored copy of that generation can "
+                    "be read back]",
                     0,
                 )
             return (
@@ -222,11 +238,20 @@ def _render_entry(
         header.append("truncated=true")
 
     shown = body if mode == "exact" else _snippet(body)
-    shown, clipped = _fit(shown, budget)
-    if clipped or shown != body:
-        header.append(f"shown={len(shown):,}/{len(body):,} chars")
-    text = f"{' '.join(header)}\n{shown}"
-    return text, estimate_message_tokens({"role": "tool", "content": text})
+    whole = f"{' '.join(header)}\n{shown}"
+    cost = _tokens(whole)
+    if cost <= budget and shown == body:
+        return whole, cost
+    # The header that will head a cut body, at its longest, is what the body
+    # has to leave room for.
+    widest = [*header, f"shown={len(body):,}/{len(body):,} chars"]
+    shown = _fit(shown, budget - _tokens(f"{' '.join(widest)}\n"))
+    text = f"{' '.join([*header, f'shown={len(shown):,}/{len(body):,} chars'])}\n{shown}"
+    return text, _tokens(text)
+
+
+def _tokens(text: str) -> int:
+    return estimate_message_tokens({"role": "tool", "content": text})
 
 
 def _body(content: Any) -> str:
@@ -244,21 +269,24 @@ def _snippet(body: str) -> str:
     return f"{body[:_SNIPPET_HEAD_CHARS]}\n\n[... {elided:,} chars, ask again with mode=exact ...]\n\n{body[-_SNIPPET_TAIL_CHARS:]}"
 
 
-def _fit(body: str, budget: int) -> tuple[str, bool]:
-    """``body`` cut to ``budget`` tokens, and whether it had to be.
+def _fit(body: str, budget: int) -> str:
+    """``body`` cut to at most ``budget`` tokens.
 
     The characters-per-token ratio is taken from this body rather than assumed,
     so a Chinese stack trace and an English one are both cut where they
-    actually reach the budget.
+    actually reach the budget; the estimate is then checked, because a cut can
+    land the count a little over.
     """
-    if not body:
-        return body, False
-    cost = estimate_message_tokens({"role": "tool", "content": body})
+    if budget <= 0 or not body:
+        return ""
+    cost = _tokens(body)
     if cost <= budget:
-        return body, False
+        return body
     per_token = max(1.0, len(body) / max(1, cost))
-    keep = max(0, int(budget * per_token) - _HEADER_ALLOWANCE_CHARS)
-    return body[:keep], True
+    keep = int(budget * per_token)
+    while keep > 0 and (over := _tokens(body[:keep]) - budget) > 0:
+        keep -= max(1, int(over * per_token))
+    return body[: max(0, keep)]
 
 
 __all__ = ["ContextRetrieveTool"]

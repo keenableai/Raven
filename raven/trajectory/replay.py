@@ -1054,6 +1054,20 @@ def _pre_attempt_messages(recording: Recording) -> list[dict[str, Any]]:
     return records[:cut] if cut is not None else []
 
 
+def _adopt_recorded_revision(session: Any, session_path: Path) -> None:
+    """Give the replay's session the log revision the recorded one had.
+
+    A ref the recorded requests carry is scoped by that revision; a fresh log id
+    would spell every one of them differently and read as a divergence.
+    """
+    from raven.session.manager import read_session_file
+
+    recorded = read_session_file(session_path, session.key)
+    if recorded is not None:
+        session.log_id, session.log_generation = recorded.log_id, recorded.log_generation
+        session.log_started_at = recorded.log_started_at
+
+
 async def run_replay(bundle_dir: Path, mode: str = "warn") -> ReplayReport:
     """Drive an ``AgentLoop`` through a bundle's recorded turns.
 
@@ -1108,6 +1122,7 @@ async def run_replay(bundle_dir: Path, mode: str = "warn") -> ReplayReport:
             pre_attempt = _pre_attempt_messages(recording)
             if session_key and pre_attempt:
                 session = sessions.get_or_create(session_key)
+                _adopt_recorded_revision(session, recording.bundle_dir / "session.jsonl")
                 for msg in pre_attempt:
                     session.record(dict(msg))
                 sessions.save(session)
