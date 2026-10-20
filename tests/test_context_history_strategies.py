@@ -91,17 +91,91 @@ def test_the_flat_curator_keys_still_reach_the_curator(tmp_path: Path) -> None:
     assert engine._phase_b[0].config.fast_path_threshold == 0.33
 
 
+def _imported_after_building(tmp_path: Path, strategy: str) -> set[str]:
+    script = f"""
+import sys
+from pathlib import Path
+sys.path.insert(0, {str(REPO / "tests")!r})
+import test_context_history_strategies as t
+from raven.config.raven import ContextConfig
+t._engine(Path({str(tmp_path)!r}), ContextConfig.model_validate({{"history": {{"strategy": {strategy!r}}}}}))
+print(" ".join(m for m in sys.modules if m.startswith("raven.context_engine")))
+"""
+    out = subprocess.run([sys.executable, "-c", script], cwd=REPO, capture_output=True, text=True, timeout=180)
+    assert out.returncode == 0, out.stderr[-2000:]
+    return set(out.stdout.split())
+
+
 def test_a_strategy_that_is_not_selected_is_never_imported(tmp_path: Path) -> None:
-    script = (
-        "import sys\n"
-        "from raven.context_engine import history\n"
-        "history.resolve('curator')\n"
-        "print('raven.context_engine.history.compacting' in sys.modules)\n"
+    modules = _imported_after_building(tmp_path, "curator")
+    assert "raven.context_engine.segments.curator" in modules
+    assert not any(m.startswith("raven.context_engine.history.compacting") for m in modules)
+
+
+@pytest.mark.asyncio
+async def test_the_curator_strategy_assembles_byte_for_byte_what_a_hand_built_curator_engine_does(
+    tmp_path: Path,
+) -> None:
+    from raven.context_engine.segments.curator import CuratorSegmentBuilder
+    from raven.contracts.assembled import TokenBudget
+    from raven.contracts.context import TurnContext
+
+    config = ContextConfig.model_validate({"history": {"strategy": "curator"}})
+    built = _engine(tmp_path / "a", config)
+    by_hand_builders = [b for b in built._builders if not b.needs_prefix]
+    curator = built._phase_b[0]
+    by_hand_builders.append(
+        CuratorSegmentBuilder(
+            pin_resolver=curator._pin_resolver,
+            workspace=tmp_path / "a",
+            config=config,
+            provider=curator._fallback.provider,
+            model=curator._fallback.model,
+            context_window_tokens=8192,
+            get_tool_definitions=list,
+        )
     )
-    out = subprocess.run(
-        [sys.executable, "-c", script], cwd=REPO, capture_output=True, text=True, timeout=120, check=True
+    by_hand = ContextAssembler(by_hand_builders, list, turn_scratch=config.cache.turn_scratch)
+    by_hand._now_fn = built._now_fn = lambda: __import__("datetime").datetime(2026, 10, 20, 12, 0)
+    history = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "answer"}]
+    budget = TokenBudget(
+        context_length=8192, reserved_output=1024, reserved_tools=0, reserved_system=0, available_history=6000
     )
-    assert out.stdout.strip() == "False"
+    turn = TurnContext(current_message="now")
+    one = await built.assemble("k", list(history), budget, turn=turn)
+    two = await by_hand.assemble("k", list(history), budget, turn=turn)
+    assert one.messages == two.messages
+
+
+class _Hooked:
+    def __init__(self, name: str, answer, *, needs_prefix: bool = True, raises: bool = False) -> None:
+        self.name, self.order, self.needs_prefix, self.stable = name, 9, needs_prefix, False
+        self._answer, self._raises, self.asked = answer, raises, 0
+
+    async def build(self, ctx):
+        return None
+
+    async def on_context_overflow(self, session_key, messages, *, attempt, window):
+        self.asked += 1
+        if self._raises:
+            raise RuntimeError("the strategy broke")
+        return self._answer
+
+
+@pytest.mark.asyncio
+async def test_the_first_history_builder_with_an_answer_decides_an_overflow() -> None:
+    from raven.contracts.context import OverflowOutcome
+
+    answer = OverflowOutcome(messages=[], reclaimed_tokens=10, advanced=True)
+    broken = _Hooked("broken", None, raises=True)
+    silent = _Hooked("silent", None)
+    first = _Hooked("first", answer)
+    later = _Hooked("later", OverflowOutcome(messages=[], reclaimed_tokens=1, advanced=True))
+    phase_a = _Hooked("phase_a", answer, needs_prefix=False)
+    engine = ContextAssembler([phase_a, broken, silent, first, later], list)
+
+    assert await engine.on_context_overflow("k", [], attempt=1, window=8192) is answer
+    assert (broken.asked, silent.asked, first.asked, later.asked, phase_a.asked) == (1, 1, 1, 0, 0)
 
 
 @pytest.mark.asyncio

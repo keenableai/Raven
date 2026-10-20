@@ -131,6 +131,41 @@ def test_an_engine_that_does_not_budget_its_history_is_offered_the_post_consolid
     assert memory.candidate_messages(session) == slice_
 
 
+@pytest.mark.parametrize(("owns", "wants", "full"), [(True, False, False), (False, True, True)])
+def test_the_view_follows_wants_full_history_not_owns_compaction(owns, wants, full):
+    memory = _modules(engine=_Engine(owns_compaction=owns, wants_full_history=wants)).memory
+    slice_ = [{"role": "user", "content": "kept"}]
+    everything = [{"role": "user", "content": "all"}]
+    session = SimpleNamespace(messages=everything, get_history=lambda **k: slice_)
+    assert memory.candidate_messages(session) == (everything if full else slice_)
+
+
+@pytest.mark.parametrize("owns", [True, False])
+def test_an_engine_without_the_property_keeps_the_view_owns_compaction_gave_it(owns):
+    class _Older:
+        owns_compaction = owns
+
+        async def assemble(self, *a, **k):
+            return None
+
+    memory = _modules(engine=_Older()).memory
+    session = SimpleNamespace(messages=[{"role": "user", "content": "all"}], get_history=lambda **k: [])
+    assert memory.candidate_messages(session) == ([{"role": "user", "content": "all"}] if owns else [])
+
+
+def test_a_contract_subclass_that_predates_the_property_keeps_its_view():
+    from raven.contracts.context import ContextEngine
+
+    class _Subclass(ContextEngine):
+        name = "older"
+        owns_compaction = True
+
+        async def assemble(self, *a, **k):
+            return None
+
+    assert _Subclass().wants_full_history is True
+
+
 def test_the_candidate_view_is_a_copy_the_engine_may_not_mutate_back():
     memory = _modules(engine=_Engine(wants_full_history=True)).memory
     messages = [{"role": "user", "content": "a"}]

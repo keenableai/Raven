@@ -88,8 +88,9 @@ class DefaultMemory:
 
     def candidate_messages(self, session: Any) -> list[dict[str, Any]]:
         # An engine slotted in through the runtime door need not subclass the
-        # contract, and one written before the property existed answered this
-        # question with ``owns_compaction``; it keeps the view it always had.
+        # contract; one that predates the property answered this question with
+        # ``owns_compaction`` and keeps the view it always had (the contract's
+        # own default does the same for a subclass).
         if getattr(self._engine, "wants_full_history", self._engine.owns_compaction):
             return list(session.messages)
         return session.get_history(max_messages=0)

@@ -86,7 +86,7 @@ def _build_compacting(**kwargs: Any) -> "SegmentBuilder":
     return build_compacting_history(**kwargs)
 
 
-# The default. It takes the full log because it budgets history itself, and it
+# It takes the full log because it budgets history itself, and it
 # owns compaction in the strong sense: the loop must keep MemoryConsolidator out
 # of the way, since a lossy pass that advances ``last_consolidated`` would remove
 # the very messages this strategy is deciding about.

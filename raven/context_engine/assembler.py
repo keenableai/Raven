@@ -293,7 +293,13 @@ class ContextAssembler(ContextEngine):
             hook = getattr(builder, "on_context_overflow", None)
             if hook is None:
                 continue
-            outcome = await hook(session_key, messages, attempt=attempt, window=window)
+            try:
+                outcome = await hook(session_key, messages, attempt=attempt, window=window)
+            except Exception:
+                # The assemble rule: a failing builder loses its say, never the
+                # turn. The loop's own shrink is what answers instead.
+                logger.opt(exception=True).error("{} failed on a refused prompt; leaving it to the loop", builder.name)
+                continue
             if outcome is not None:
                 return outcome
         return None

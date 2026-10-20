@@ -9,8 +9,8 @@ system prompt:
 - **Skills** — a :class:`SkillForgeRouter` over 1-3 sources (segment 5,
   ``# Skills``), built only under pull discovery.
 - **History** — the strategy ``context.history.strategy`` names (see
-  :mod:`raven.context_engine.history`): ``compacting`` by default, or the
-  Curator. Owns ``*history``.
+  :mod:`raven.context_engine.history`): ``compacting`` or the Curator.
+  Owns ``*history``.
 
 With ``context.cache.turn_scratch`` on (the default), the two sections that
 move with the query -- ``# Memory`` and ``# Skills`` -- are appended to the

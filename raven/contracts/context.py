@@ -231,11 +231,11 @@ class ContextEngine(ABC):
         """If True, the Memory role hands over ``session.messages`` -- the whole
         append-only log -- instead of the post-consolidation slice.
 
-        Defaults False because the full log is the more dangerous input: an
-        engine that does not budget it will overflow the window. Claiming it is
-        a statement that the engine budgets history itself.
+        Defaults to ``owns_compaction``, which is how the question was answered
+        before this property existed: an engine that archives for itself was
+        handed the whole log, and one written against that rule keeps it.
         """
-        return False
+        return self.owns_compaction
 
     @property
     def mints_source_refs(self) -> bool:
@@ -274,7 +274,7 @@ class ContextEngine(ABC):
         ``session_messages`` is what the engine should consider as candidate
         history. Whether it's ``session.messages`` (full append-only log) or
         ``session.get_history()`` (post-consolidation slice) is decided by
-        AgentLoop based on :attr:`owns_compaction`.
+        the Memory role based on :attr:`wants_full_history`.
         """
 
     async def after_turn(
