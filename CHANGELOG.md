@@ -20,7 +20,7 @@ All notable changes to Raven are documented here.
   Sessions carry a revision (`log_id` and generation) so a ref minted before an
   undo or `/new` never names another message. A turn is now filed from its own
   record, so an in-turn summary or an elided tool body no longer reaches the
-  session file. `CONTRACTS_VERSION` moves to 38.
+  session file. `CONTRACTS_VERSION` moves to 39.
 
 - The Agent Hub has a **Machines** tab: the registered machines with the state
   of each one's link and Raven node, a form that registers one (it reaches the
