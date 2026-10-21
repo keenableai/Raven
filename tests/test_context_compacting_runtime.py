@@ -1128,6 +1128,16 @@ def _working_list(*, rounds: int = 24, inject_at: int | None = None, picture_at:
 
 
 class TestTheTurnsOwnWords:
+    def test_the_marks_are_spelled_as_the_loop_spells_them(self) -> None:
+        from raven.agent.loop import _shared, turn_path
+        from raven.agent.window.images import ATTACHED_IMAGE_KEY
+        from raven.context_engine.history.compacting.runtime import _NOT_THE_QUESTION_KEYS
+
+        assert _shared._MID_TURN_USER_KEY in _NOT_THE_QUESTION_KEYS
+        assert _shared._HOOK_INJECTED_KEY in _NOT_THE_QUESTION_KEYS
+        assert ATTACHED_IMAGE_KEY in _NOT_THE_QUESTION_KEYS
+        assert set(turn_path._TURN_TRANSIENT_KEYS) <= set(_NOT_THE_QUESTION_KEYS)
+
     def test_the_question_is_the_last_plain_user_message(self) -> None:
         from raven.context_engine.history.compacting.runtime import _turn_held
 
