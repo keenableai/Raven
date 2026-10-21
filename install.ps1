@@ -159,11 +159,12 @@ function Ensure-Uv {
     # In a PowerShell of its own: uv's installer ends a failed download with
     # `exit 1`, which run inside this script would end the install too -- and,
     # under `irm | iex`, the reader's whole session -- before the mirror below
-    # is tried.
+    # is tried. What it prints goes to the console: left in this function's
+    # output it would come back beside uv's path.
     $shell = (Get-Process -Id $PID).Path
     if (-not $shell) { $shell = "powershell.exe" }
     try {
-        & $shell -NoProfile -ExecutionPolicy Bypass -Command $UvInstallCommand
+        & $shell -NoProfile -ExecutionPolicy Bypass -Command $UvInstallCommand | Out-Host
         if ($LASTEXITCODE -ne 0) { Write-Warn "uv's installer did not finish (exit code $LASTEXITCODE)." }
     } catch {
         Write-Warn "uv's installer did not start ($_)."
@@ -814,16 +815,17 @@ function Install-Browser([string]$UvPath) {
 
 # Playwright tries its own hosts in turn and reports only that none of them
 # delivered, so the mirror gets one retry after the whole download failed --
-# unless the user named a download host. True when chromium is in place.
+# unless the user named a download host. True when chromium is in place; what
+# playwright prints goes to the console rather than into that answer.
 function Install-Chromium([string]$Py) {
-    & $Py -m playwright install chromium
+    & $Py -m playwright install chromium | Out-Host
     if ($LASTEXITCODE -eq 0) { return $true }
     if (-not (Test-MirrorsAllowed) -or $env:PLAYWRIGHT_DOWNLOAD_HOST -or $env:PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST) {
         return $false
     }
     Write-Warn "Chromium could not be downloaded; trying $PlaywrightMirror instead (RAVEN_NO_MIRROR=1 turns this off)."
     Set-MirrorEnv "PLAYWRIGHT_DOWNLOAD_HOST" $PlaywrightMirror
-    & $Py -m playwright install chromium
+    & $Py -m playwright install chromium | Out-Host
     return ($LASTEXITCODE -eq 0)
 }
 

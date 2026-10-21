@@ -1945,6 +1945,43 @@ def test_a_windows_uv_installer_that_exits_still_leaves_the_mirror_to_try(tmp_pa
     assert "FOUND C:\\fake\\uv.exe" in result.stdout
 
 
+_PS1_ENSURE_UV_WORKS_STEP = r"""
+foreach ($text in (Get-Install @("Ensure-Uv", "Test-MirrorsAllowed"))) { Invoke-Expression $text }
+function Write-Info([string]$Message) { }
+function Write-Ok([string]$Message) { }
+function Write-Warn([string]$Message) { [Console]::Out.WriteLine("WARN $Message") }
+function Fail([string]$Message) { [Console]::Out.WriteLine("FAIL $Message"); exit 3 }
+function Add-ProcessPath([string]$PathToAdd) { }
+function Find-Uv { if (Test-Path $Marker) { "C:\fake\uv.exe" } }
+function Install-UvFromMirror { [Console]::Out.WriteLine("MIRROR"); Find-Uv }
+# uv's own installer, the way it ends when it worked: what it did, on stdout.
+$UvInstallCommand = "Write-Output 'downloading uv 0.13.4'; Write-Output 'everything is installed!'; New-Item -ItemType File -Path '$Marker' | Out-Null"
+$uv = Ensure-Uv
+[Console]::Out.WriteLine("FOUND $uv")
+[Console]::Out.WriteLine("COUNT $(@($uv).Count)")
+"""
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+def test_a_windows_uv_installer_that_works_hands_back_only_where_uv_is(tmp_path: Path) -> None:
+    """uv's installer, run in a PowerShell of its own, prints what it did on
+    that process's stdout. Left in this function's output it comes back
+    beside the path, and the caller runs the lot as the uv command. It still
+    reaches the reader's console."""
+    result = _run_ps1(
+        tmp_path,
+        "ensure-uv-works-step",
+        _ps1_settings("ErrorActionPreference") + _PS1_ENSURE_UV_WORKS_STEP,
+        Marker=str(tmp_path / "uv-installed"),
+    )
+
+    lines = result.stdout.splitlines()
+    assert "FOUND C:\\fake\\uv.exe" in lines and "COUNT 1" in lines, result.stdout + result.stderr
+    assert "downloading uv 0.13.4" in lines, "the installer's own report still reaches the reader"
+    assert "MIRROR" not in lines
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
 def test_the_windows_opt_out_leaves_uv_to_its_own_installer(tmp_path: Path) -> None:
@@ -2542,6 +2579,36 @@ def test_a_windows_chromium_is_retried_from_the_mirror_when_playwrights_hosts_fa
 
     assert "OK=True" in result.stdout, result.stdout + result.stderr
     assert log.read_text(encoding="utf-8").split() == ["default", "https://cdn.npmmirror.com/binaries/playwright"]
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+@pytest.mark.parametrize(("mirror_works", "said"), [(True, "OK=True"), (False, "OK=False")])
+def test_a_windows_chromium_download_shows_its_progress_and_still_reports_how_it_went(
+    tmp_path: Path, mirror_works: bool, said: str
+) -> None:
+    """playwright reports its download on stdout. Left in the function's output
+    it comes back beside the true or false, which then reads as true either
+    way, so a failed download would never be reported."""
+    python = tmp_path / "python.ps1"
+    python.write_text(
+        "$asked = if ($env:PLAYWRIGHT_DOWNLOAD_HOST) { $env:PLAYWRIGHT_DOWNLOAD_HOST } else { 'default' }\n"
+        'Write-Output "Downloading Chromium from $asked"\n'
+        + ("if ($env:PLAYWRIGHT_DOWNLOAD_HOST) { exit 0 } else { exit 1 }\n" if mirror_works else "exit 1\n"),
+        encoding="utf-8",
+    )
+
+    result = _run_ps1(
+        tmp_path,
+        "browser-step",
+        _ps1_settings("ErrorActionPreference", "PlaywrightMirror") + "$script:MirrorSaved = @{}\n" + _PS1_BROWSER_STEP,
+        env={"PLAYWRIGHT_DOWNLOAD_HOST": "", "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST": ""},
+        Python=str(python),
+    )
+
+    lines = result.stdout.splitlines()
+    assert said in lines, result.stdout + result.stderr
+    assert "Downloading Chromium from default" in lines, "playwright's own report still reaches the reader"
 
 
 # --- What the page starts with ---------------------------------------------------
