@@ -783,7 +783,8 @@ class CompactingHistoryBuilder:
 
     @staticmethod
     def _hold_marked(ranges: Ranges, history: list[dict[str, Any]], memo: _Memo) -> Ranges:
-        """Make the standing checkpoint, and anything marked pinned, holes on the overflow path.
+        """Make the standing checkpoint, anything marked pinned, and the turn's
+        own words holes on the overflow path.
 
         Positions there are positions in an assembled prompt, so the planner
         cannot recognise the checkpoint by ordinal. It is found by its private
@@ -791,15 +792,24 @@ class CompactingHistoryBuilder:
         the only thing standing for everything the session has already
         compacted away, and dropping it would lose that outright rather than
         move it.
+
+        The turn's question is held for a plainer reason. The list handed in is
+        the loop's working list, so the question sits in the middle of it once
+        the tool loop has run past the tail floor -- exactly the range removal
+        empties from the front -- and every retry after the reclaim would go
+        out answering nothing. See :func:`_turn_held`.
         """
         wanted = (memo.checkpoint_message or {}).get("content")
-        found = [
-            index
-            for index, message in enumerate(history)
-            if message.get(HISTORY_CHECKPOINT_KEY)
-            or message.get(HISTORY_PINNED_KEY)
-            or (wanted is not None and message.get("content") == wanted)
-        ]
+        found = sorted(
+            {
+                index
+                for index, message in enumerate(history)
+                if message.get(HISTORY_CHECKPOINT_KEY)
+                or message.get(HISTORY_PINNED_KEY)
+                or (wanted is not None and message.get("content") == wanted)
+            }
+            | _turn_held(history)
+        )
         if not found:
             return ranges
         return dataclass_replace(ranges, holes=(*ranges.holes, *(range(index, index + 1) for index in found)))
@@ -939,6 +949,54 @@ def _checkpoint_position(
     if checkpoint_message is None or anchor is None:
         return 0
     return sum(1 for index in included if index < anchor)
+
+
+# The loop's own marks on user messages that are not the reader's question. The
+# loop owns these names (``raven.agent.loop._shared`` and
+# ``raven.agent.window.images``); they are spelled here rather than imported
+# because a history strategy must not load the loop.
+_MID_TURN_USER_KEY = "_mid_turn_user"
+_ATTACHED_IMAGE_KEY = "_attached_image"
+_NOT_THE_QUESTION_KEYS = (
+    _MID_TURN_USER_KEY,
+    _ATTACHED_IMAGE_KEY,
+    "_recovery_synthetic",
+    "_hook_injected",
+    HISTORY_CHECKPOINT_KEY,
+)
+
+
+def _turn_held(history: Sequence[dict[str, Any]]) -> frozenset[int]:
+    """The turn's own user message and every user message after it.
+
+    The question is the last plain user message: not a correction typed while
+    the turn ran, not the carrier of a picture a tool returned, not runtime
+    scaffolding (a recovery nudge, a hook's re-prompt), and not a checkpoint.
+    What follows it is held too -- a mid-turn correction is the reader's
+    instruction as much as the question is, and the runtime's own prompts are
+    what the turn is currently answering -- except a picture carrier, which
+    belongs to the tool exchange it illustrates and goes with it.
+
+    Holding these never orphans a tool result: each is a single message
+    outside any exchange, and the exchanges between them are still removed
+    whole, oldest first.
+    """
+    question = next(
+        (
+            index
+            for index in range(len(history) - 1, -1, -1)
+            if history[index].get("role") == "user"
+            and not any(history[index].get(key) for key in _NOT_THE_QUESTION_KEYS)
+        ),
+        None,
+    )
+    if question is None:
+        return frozenset()
+    return frozenset(
+        index
+        for index in range(question, len(history))
+        if history[index].get("role") == "user" and not history[index].get(_ATTACHED_IMAGE_KEY)
+    )
 
 
 def _splice(items: Sequence[Any], item: Any, at: int) -> list[Any]:

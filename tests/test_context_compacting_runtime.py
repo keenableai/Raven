@@ -1106,3 +1106,67 @@ class TestGenerationsOfOneLog:
         assert HistoryTrimmer.structural_errors(_request(behind.history)) == []
         again = await _builder(tmp_path, config=_fold_only()).build(_ctx(session, revision=ahead))
         assert json.dumps(again.history) == json.dumps(first.history)
+
+
+# ---------------------------------------------------------------------------
+# The overflow path holds the turn's own words
+# ---------------------------------------------------------------------------
+
+
+def _working_list(*, rounds: int = 24, inject_at: int | None = None, picture_at: int | None = None) -> list[dict]:
+    """What the loop hands the overflow path mid-turn: the session's history,
+    the turn's question, then its tool loop."""
+    messages: list[dict] = [{"role": "system", "content": "system prompt"}, *_session(3)]
+    messages.append({"role": "user", "content": "TURN-QUESTION what failed?"})
+    for index in range(rounds):
+        messages += _tool_exchange(f"c{index}", "exec", f"{index} {FILLER * 12}", '{"command": "make"}')
+        if index == inject_at:
+            messages.append({"role": "user", "content": "MID-TURN only the auth module", "_mid_turn_user": True})
+        if index == picture_at:
+            messages.append({"role": "user", "content": "[image]", "_attached_image": True})
+    return messages
+
+
+class TestTheTurnsOwnWords:
+    def test_the_question_is_the_last_plain_user_message(self) -> None:
+        from raven.context_engine.history.compacting.runtime import _turn_held
+
+        history = _working_list(rounds=4, inject_at=1, picture_at=2)[1:]
+        held = _turn_held(history)
+        contents = [history[index]["content"] for index in sorted(held)]
+        assert contents == ["TURN-QUESTION what failed?", "MID-TURN only the auth module"]
+
+    def test_a_picture_carrier_is_neither_the_question_nor_held(self) -> None:
+        from raven.context_engine.history.compacting.runtime import _turn_held
+
+        history = _working_list(rounds=4, picture_at=3)[1:]
+        held = _turn_held(history)
+        assert [history[index]["content"] for index in sorted(held)] == ["TURN-QUESTION what failed?"]
+
+    def test_runtime_scaffolding_is_not_the_question_but_is_held_after_it(self) -> None:
+        from raven.context_engine.history.compacting.runtime import _turn_held
+
+        history = _working_list(rounds=2)[1:]
+        history.append({"role": "user", "content": "nudge", "_recovery_synthetic": True})
+        history.append({"role": "user", "content": "hook", "_hook_injected": True})
+        held = _turn_held(history)
+        assert [history[index]["content"] for index in sorted(held)] == ["TURN-QUESTION what failed?", "nudge", "hook"]
+
+    def test_with_no_plain_user_message_nothing_is_held(self) -> None:
+        from raven.context_engine.history.compacting.runtime import _turn_held
+
+        assert _turn_held([{"role": "user", "content": "[image]", "_attached_image": True}]) == frozenset()
+
+    async def test_a_reclaim_keeps_the_question_and_the_correction(self, tmp_path: Path) -> None:
+        builder = _builder(tmp_path)
+        messages = _working_list(inject_at=10, picture_at=14)
+        headroom.learn_from_overflow("stub", window=WINDOW, prompt_tokens=estimate_prompt_tokens(messages), step=8_192)
+
+        outcome = await builder.on_context_overflow("s1", messages, attempt=1, window=WINDOW)
+
+        assert outcome is not None
+        contents = [str(m.get("content")) for m in outcome.messages]
+        assert "TURN-QUESTION what failed?" in contents
+        assert "MID-TURN only the auth module" in contents
+        assert len(outcome.messages) < len(messages), "tool exchanges between them still go"
+        assert HistoryTrimmer.structural_errors(outcome.messages) == []
