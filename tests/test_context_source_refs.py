@@ -20,7 +20,7 @@ import pytest
 
 from raven.agent.tools.context_retrieve import ContextRetrieveTool
 from raven.session.manager import Session, SessionManager
-from raven.session.refs import TOOL_RESULT_TRUNCATION_MARKER, session_ref
+from raven.session.refs import TOOL_RESULT_TRUNCATION_MARKER, TOOL_RESULT_VIEW_MAX_CHARS, session_ref, tool_result_view
 from raven.utils.refs import SourceRef
 from raven.utils.tokens import estimate_message_tokens
 
@@ -424,3 +424,24 @@ class TestScopeNaming:
 
     def test_an_empty_log_still_names_a_scope(self) -> None:
         assert Session(key="cli:direct").revision.scope.endswith("@0")
+
+
+def test_a_tool_result_view_cuts_long_text_and_says_how_much() -> None:
+    assert tool_result_view("short") == "short"
+    exact = "x" * TOOL_RESULT_VIEW_MAX_CHARS
+    assert tool_result_view(exact) == exact
+
+    cut = tool_result_view("y" * 40_000)
+
+    assert cut.startswith("y" * TOOL_RESULT_VIEW_MAX_CHARS + "\n")
+    assert "24,000 more characters of the stored result not shown here" in cut
+    assert len(cut) < TOOL_RESULT_VIEW_MAX_CHARS + 200
+
+
+def test_a_result_cut_at_filing_within_the_view_goes_out_as_stored() -> None:
+    filed = "z" * TOOL_RESULT_VIEW_MAX_CHARS + TOOL_RESULT_TRUNCATION_MARKER
+
+    assert tool_result_view(filed) == filed
+
+    longer = "z" * (TOOL_RESULT_VIEW_MAX_CHARS + 500) + TOOL_RESULT_TRUNCATION_MARKER
+    assert "500 more characters of the stored result" in tool_result_view(longer)

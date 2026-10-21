@@ -50,10 +50,36 @@ def is_truncated(content: Any) -> bool:
     return isinstance(content, str) and content.endswith(TOOL_RESULT_TRUNCATION_MARKER)
 
 
+TOOL_RESULT_VIEW_MAX_CHARS = 16_000
+"""How much of one stored tool result leaves the session as a copy.
+
+The session files tool results whole (``context.toolResultMaxChars``) so that
+``context_retrieve`` can hand the original back. Everything else that is sent
+a copy -- a transcript drawn by a client, a turn indexed by a memory backend --
+gets at most this much of each, which is the cap results were filed under
+before: a client drops frames over 1 MiB, and a memory backend may refuse a
+single message larger than it accepts.
+"""
+
+
+def tool_result_view(text: str, limit: int = TOOL_RESULT_VIEW_MAX_CHARS) -> str:
+    """``text`` cut to ``limit`` characters, saying how much of the stored result was left out.
+
+    A result already cut on the way to disk counts by its body, so one filed
+    under a cap at or below ``limit`` goes out as stored, marker included.
+    """
+    body = text[: -len(TOOL_RESULT_TRUNCATION_MARKER)] if is_truncated(text) else text
+    if len(body) <= limit:
+        return text
+    return f"{text[:limit]}\n... ({len(body) - limit:,} more characters of the stored result not shown here)"
+
+
 __all__ = [
     "SESSION_REF_STORE",
     "TOOL_RESULT_TRUNCATION_MARKER",
+    "TOOL_RESULT_VIEW_MAX_CHARS",
     "belongs_to",
     "is_truncated",
     "session_ref",
+    "tool_result_view",
 ]

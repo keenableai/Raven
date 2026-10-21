@@ -30,8 +30,6 @@ from raven.rpc.errors import TurnInProgressError
 from raven.rpc.methods import session as session_module
 from raven.rpc.methods import turn as turn_module
 from raven.rpc.methods.session import (
-    _WIRE_TOOL_TEXT_MAX_CHARS,
-    _bounded_display_text,
     _map_to_wire,
     register_session_methods,
     session_archive,
@@ -50,6 +48,7 @@ from raven.rpc.methods.session import (
     session_usage,
 )
 from raven.session.manager import SessionManager
+from raven.session.refs import tool_result_view
 
 _SESSION_ID_RE = re.compile(r"^tui:\d{8}_\d{6}_[0-9a-f]{6}$")
 
@@ -518,18 +517,6 @@ async def test_session_resume_maps_tool_role_with_name_and_context(
     assert tool_msg["context"] == "ls -la"
 
 
-def test_bounded_display_text_cuts_long_text_and_says_how_much() -> None:
-    assert _bounded_display_text("short") == "short"
-    exact = "x" * _WIRE_TOOL_TEXT_MAX_CHARS
-    assert _bounded_display_text(exact) == exact
-
-    cut = _bounded_display_text("y" * 40_000)
-
-    assert cut.startswith("y" * _WIRE_TOOL_TEXT_MAX_CHARS + "\n")
-    assert "24,000 more characters not shown" in cut
-    assert len(cut) < _WIRE_TOOL_TEXT_MAX_CHARS + 200
-
-
 def test_map_to_wire_bounds_tool_results_only() -> None:
     big = "z" * 50_000
     wire = _map_to_wire(
@@ -544,7 +531,7 @@ def test_map_to_wire_bounds_tool_results_only() -> None:
 
     assert [m["text"] for m in (wire[0], wire[3])] == [big, big]
     for tool in (wire[1], wire[2]):
-        assert tool["text"] == _bounded_display_text(big)
+        assert tool["text"] == tool_result_view(big)
         assert tool["name"] == "read_file"
 
 
