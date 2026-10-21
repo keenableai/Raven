@@ -472,6 +472,51 @@ async def test_cli_backend_uses_login_env_and_per_agent_env_wins(
     assert out == "yes/agent"
 
 
+async def test_cli_backend_starts_the_way_the_mirror_fallback_says(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _clear_login_env_cache: None
+) -> None:
+    """A CLI agent started through ``npx`` or ``uvx`` fetches itself first, like an
+    ACP shim. The launch asks with the argv it starts and the directory it runs
+    in, starts the argv it is answered with, and the entry's own ``env`` still
+    wins over the variables."""
+    from raven.utils import mirrors
+
+    captured = f"PATH={os.environ['PATH']}\0SYSTEMROOT={os.environ.get('SYSTEMROOT', '')}\0".encode()
+    monkeypatch.setattr(
+        env_mod.subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, captured, b"")
+    )
+    asked: list[tuple[list[str], str | None]] = []
+
+    def package_launch(argv: list[str], env: dict[str, str], cwd: str | None = None):
+        asked.append((list(argv), cwd))
+        return [*argv, "--as-the-answer-says"], {
+            "npm_config_registry": mirrors.NPM_REGISTRY,
+            "UV_PYTHON_INSTALL_MIRROR": mirrors.PYTHON_DOWNLOADS,
+        }
+
+    monkeypatch.setattr(mirrors, "package_launch", package_launch)
+    script = tmp_path / "show_env.py"
+    script.write_text(
+        "import os, sys\n"
+        "seen = [os.environ.get(name, '<missing>') for name in ('npm_config_registry', 'UV_PYTHON_INSTALL_MIRROR')]\n"
+        "print('|'.join([*seen, ' '.join(sys.argv[1:])]), end='')\n",
+        encoding="utf-8",
+    )
+    be = CliAgentBackend(
+        name="envcheck",
+        command=f"{command_quote(sys.executable)} {command_quote(str(script))}",
+        env={"UV_PYTHON_INSTALL_MIRROR": "https://python.example.internal"},
+        registry=InstanceRegistry(path=tmp_path / "inst.json"),
+    )
+
+    out = await be.run("task", task_id="t1", workspace=tmp_path, executor=None)
+
+    assert out == f"{mirrors.NPM_REGISTRY}|https://python.example.internal|--as-the-answer-says"
+    (argv, cwd), *_ = asked
+    assert argv[0] == sys.executable
+    assert cwd == str(tmp_path), "asked where the agent runs"
+
+
 async def test_cli_backend_on_windows_starts_a_bare_program_from_the_childs_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

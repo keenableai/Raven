@@ -529,7 +529,13 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
     if method == "env":
-        result = {"login": os.environ.get("FROM_LOGIN"), "entry": os.environ.get("FROM_ENTRY"), "cwd": os.getcwd()}
+        result = {
+            "login": os.environ.get("FROM_LOGIN"),
+            "entry": os.environ.get("FROM_ENTRY"),
+            "registry": os.environ.get("npm_config_registry"),
+            "args": sys.argv[1:],
+            "cwd": os.getcwd(),
+        }
     elif method == "spawn":
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
         result = {"pid": child.pid}
@@ -624,6 +630,62 @@ async def test_an_agent_starts_in_its_root_in_the_login_environment_plus_the_ent
     await host.until(lambda: host.notified(protocol.AGENT_EXIT))
     assert host.notified(protocol.AGENT_EXIT) == [{"channel": 1, "rc": 0}]
     assert host.node.agents == {}
+
+
+async def _what_the_agent_saw(host: "_Host", cwd: str, agent, env: dict[str, str]) -> dict:
+    await host.ask(protocol.AGENT_LAUNCH, {"channel": 1, "command": agent, "cwd": cwd, "env": env})
+    await host.tell(protocol.AGENT_FRAME, {"channel": 1, "line": _frame("env", 5)})
+    await host.until(lambda: host.notified(protocol.AGENT_FRAME))
+    seen = json.loads(host.notified(protocol.AGENT_FRAME)[0]["line"])["result"]
+    await host.ask(protocol.AGENT_CLOSE, {"channel": 1}, request_id=2)
+    await host.until(lambda: host.notified(protocol.AGENT_EXIT))
+    return seen
+
+
+@pytest.mark.slow
+async def test_an_agent_starts_the_way_this_machine_s_mirror_fallback_says(tmp_path, agent, monkeypatch):
+    """Decided here, on the machine the agent runs on: whether the host can reach
+    a registry says nothing about whether this machine can. Asked with the
+    environment the agent starts with and the directory it runs in -- one not
+    made yet, as a task's directory is until the launch makes it."""
+    from raven.utils import mirrors
+
+    monkeypatch.setattr(server, "capture_login_env", lambda: {**os.environ, "FROM_LOGIN": "yes"})
+    asked: list[tuple[list[str], object, object, object]] = []
+
+    def package_launch(argv, env, cwd=None):
+        asked.append((list(argv), env.get("FROM_LOGIN"), env.get("FROM_ENTRY"), cwd))
+        return [*argv, "--as-the-answer-says"], {"npm_config_registry": mirrors.NPM_REGISTRY}
+
+    monkeypatch.setattr(mirrors, "package_launch", package_launch)
+    cwd = tmp_path / "task" / "work"
+
+    seen = await _what_the_agent_saw(_Host(), str(cwd), agent, {"FROM_ENTRY": "1"})
+
+    assert seen["registry"] == mirrors.NPM_REGISTRY
+    assert seen["args"] == ["--as-the-answer-says"]
+    (argv, login, entry, asked_cwd), *_ = asked
+    assert argv[0] == sys.executable
+    assert (login, entry) == ("yes", "1"), "asked with the environment the agent starts with"
+    assert asked_cwd == str(cwd)
+
+
+@pytest.mark.slow
+async def test_an_entry_s_own_registry_wins_over_the_mirror(tmp_path, agent, monkeypatch):
+    from raven.utils import mirrors
+
+    monkeypatch.setattr(server, "capture_login_env", lambda: dict(os.environ))
+    monkeypatch.setattr(
+        mirrors,
+        "package_launch",
+        lambda argv, env, cwd=None: (list(argv), {"npm_config_registry": mirrors.NPM_REGISTRY}),
+    )
+
+    seen = await _what_the_agent_saw(
+        _Host(), str(tmp_path), agent, {"npm_config_registry": "https://registry.example.internal/"}
+    )
+
+    assert seen["registry"] == "https://registry.example.internal/"
 
 
 @pytest.mark.slow

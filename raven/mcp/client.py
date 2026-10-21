@@ -1,6 +1,7 @@
 """MCP client: connects to MCP servers and wraps their tools as native Raven tools."""
 
 import asyncio
+import os
 from collections.abc import Container
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from raven.contracts.tool import Tool, ToolResult
 from raven.mcp.naming import MCPToolRef, tool_name
 from raven.mcp.paging import walk_tools
 from raven.sandbox import SandboxInitError
+from raven.utils import mirrors
 
 if TYPE_CHECKING:
     from raven.sandbox import SandboxExecutor
@@ -194,10 +196,20 @@ async def open_mcp_transport(
         from mcp.client.streamable_http import streamable_http_client
 
         if transport_type == "stdio":
+            # `npx -y <server>` and `uvx <server>` fetch the server on first
+            # start. The mirror goes under the entry's own env, so a registry the
+            # entry names wins, and into this launch only: written into the
+            # entry, it would be the choice of registry PlugHub's vetting refuses
+            # a catalogue entry (see market/vetting.py).
+            argv, mirror_env = await mirrors.package_launch_async(
+                [cfg.command, *cfg.args], {**os.environ, **(cfg.env or {})}
+            )
+            command, args = argv[0], argv[1:]
+            env = {**mirror_env, **(cfg.env or {})} or None
             if executor is not None and executor.supports_process_spawning:
-                read, write = await executor.start_process(cfg.command, cfg.args, env=cfg.env or None)
+                read, write = await executor.start_process(command, args, env=env)
             else:
-                params = StdioServerParameters(command=cfg.command, args=cfg.args, env=cfg.env or None)
+                params = StdioServerParameters(command=command, args=args, env=env)
                 read, write = await stack.enter_async_context(stdio_client(params))
         elif transport_type == "sse":
 

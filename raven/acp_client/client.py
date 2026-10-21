@@ -45,6 +45,7 @@ from raven.acp_client.protocol import (
     AcpRemoteError,
     AcpTimeoutError,
 )
+from raven.utils import mirrors
 from raven.utils.commands import command_argv
 
 _STDERR_LINES = 200
@@ -466,10 +467,23 @@ class AcpClient:
         # These agents need the login shell's PATH, not raven's -- the same
         # reason the cli transport does it.
         base_env = await asyncio.to_thread(login_shell_env)
+        # An ``npx -y <shim>`` agent fetches its shim on first run, so a registry
+        # that cannot be reached is a launch that never starts. Asked here rather
+        # than before the pool: the pool keys on the launch as configured, and a
+        # verdict that flips must not restart the agents already running.
+        argv, mirror_env = await mirrors.package_launch_async(argv, {**base_env, **(env or {})}, cwd)
         # The role goes on before the caller's own map, so a config ``env`` entry
-        # is the way to hand one agent back its full registry. The mark goes on
-        # last, so no entry can make an agent pass for another host's.
-        child_env = {**base_env, **host_identity_env(), **subagent_role_env(), **(env or {}), **leftovers.launch_env()}
+        # is the way to hand one agent back its full registry, or its own choice
+        # of package registry. The mark goes on last, so no entry can make an
+        # agent pass for another host's.
+        child_env = {
+            **base_env,
+            **host_identity_env(),
+            **subagent_role_env(),
+            **mirror_env,
+            **(env or {}),
+            **leftovers.launch_env(),
+        }
         # An acp server's argv is its configuration -- its turns travel over
         # stdio -- so a batch file may stand in for the program here.
         argv = resolve_program(argv, child_env, batch_files=True)

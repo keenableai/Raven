@@ -12,6 +12,7 @@ read; the sections at the end cover that capture and the launch that consumes it
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import sys
@@ -101,6 +102,88 @@ async def test_acp_child_is_told_it_serves_as_a_subagent(tmp_path: Path, monkeyp
     # the written form alone would pass while the child ignored it.
     monkeypatch.setenv(SUBAGENT_ENV_VAR, arrived)
     assert is_subagent_process(), f"the child was handed {arrived!r}, which it does not read as a sub-agent role"
+
+
+async def _reported(observed: Path) -> str:
+    for _ in range(200):
+        if observed.exists():
+            break
+        await asyncio.sleep(0.01)
+    return observed.read_text(encoding="utf-8")
+
+
+def _launch_reporting_child(script: Path) -> str:
+    """A child that reports the registry it was handed and the arguments it got,
+    staged and renamed like :func:`_reporting_child`'s report."""
+    script.write_text(
+        "import json, os, pathlib, sys, time\n"
+        "target = pathlib.Path(os.environ['OUTPUT'])\n"
+        "partial = target.with_name(target.name + '.partial')\n"
+        "seen = {'registry': os.environ.get('npm_config_registry', '<missing>'), 'args': sys.argv[1:]}\n"
+        "partial.write_text(json.dumps(seen))\n"
+        "os.replace(partial, target)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+
+
+async def test_an_acp_child_starts_the_way_the_mirror_fallback_says(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``npx -y <shim>`` fetches the shim the first time it runs. The launch asks
+    with the argv it is about to start, the environment the child would
+    otherwise get and the directory it runs in, and starts the child with the
+    answer: its argv, and its variables."""
+    from raven.utils import mirrors
+
+    observed = tmp_path / "observed.json"
+    command = _launch_reporting_child(tmp_path / "child.py")
+    monkeypatch.setattr(backend_env, "login_shell_env", lambda: {"PATH": os.environ["PATH"], "OUTPUT": str(observed)})
+    asked: list[tuple[list[str], dict[str, str], str | None]] = []
+
+    def package_launch(argv: list[str], env: dict[str, str], cwd: str | None = None):
+        asked.append((list(argv), dict(env), cwd))
+        return [*argv, "--as-the-answer-says"], {"npm_config_registry": mirrors.NPM_REGISTRY}
+
+    monkeypatch.setattr(mirrors, "package_launch", package_launch)
+
+    client = await AcpClient.launch(name="mirror-probe", command=command, cwd=str(tmp_path))
+    try:
+        arrived = json.loads(await _reported(observed))
+    finally:
+        await client.close()
+
+    assert arrived == {"registry": mirrors.NPM_REGISTRY, "args": ["--as-the-answer-says"]}
+    (argv, env, cwd), *_ = asked
+    assert argv[0] == sys.executable, "asked about the program the entry names"
+    assert env["OUTPUT"] == str(observed), "asked with the login environment the child starts from"
+    assert cwd == str(tmp_path), "asked where the child runs, where a project's .npmrc would be"
+
+
+async def test_an_acp_entrys_own_registry_wins_over_the_mirror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A config ``env`` entry is how one agent is told where to fetch from; the
+    mirror goes in under it, never over it."""
+    from raven.utils import mirrors
+
+    observed = tmp_path / "observed.json"
+    command = _launch_reporting_child(tmp_path / "child.py")
+    monkeypatch.setattr(backend_env, "login_shell_env", lambda: {"PATH": os.environ["PATH"], "OUTPUT": str(observed)})
+    monkeypatch.setattr(
+        mirrors,
+        "package_launch",
+        lambda argv, env, cwd=None: (list(argv), {"npm_config_registry": mirrors.NPM_REGISTRY}),
+    )
+
+    client = await AcpClient.launch(
+        name="mirror-probe", command=command, env={"npm_config_registry": "https://registry.example.internal/"}
+    )
+    try:
+        arrived = json.loads(await _reported(observed))
+    finally:
+        await client.close()
+
+    assert arrived["registry"] == "https://registry.example.internal/"
 
 
 @pytest.mark.parametrize("legacy", [True, False])
