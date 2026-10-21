@@ -325,6 +325,27 @@ def _delivered_file(item: dict[str, Any], on_disk: bool) -> dict[str, Any]:
     return gone
 
 
+_WIRE_TOOL_TEXT_MAX_CHARS = 16_000
+"""How much of one stored tool result a transcript sent to a client carries.
+
+The session files tool results whole (``context.toolResultMaxChars``) so that
+``context_retrieve`` can hand the original back; a transcript sent to a client
+is for drawing, and a session holding a few large reads would otherwise go out
+as one frame larger than a client accepts (the TUI drops frames over 1 MiB).
+The value is the filing cap results were stored under before, so a resumed
+transcript draws what it always drew.
+"""
+
+
+def _bounded_display_text(text: str, limit: int = _WIRE_TOOL_TEXT_MAX_CHARS) -> str:
+    """``text`` cut to ``limit`` characters for display, saying how much was left out."""
+    if len(text) <= limit:
+        return text
+    return (
+        f"{text[:limit]}\n... ({len(text) - limit:,} more characters not shown here; the session keeps the full result)"
+    )
+
+
 def _map_to_wire(
     messages: list[dict[str, Any]], session_key: str, *, deliveries_on_disk: bool = True
 ) -> list[dict[str, Any]]:
@@ -374,6 +395,9 @@ def _map_to_wire(
     ``deliveries_on_disk`` is false for a transcript recorded on another
     machine (an Imported Conversation): its delivered files are drawn as
     missing whatever this machine has at their paths (``_delivered_file``).
+
+    A ``role="tool"`` entry's ``text`` is cut to ``_WIRE_TOOL_TEXT_MAX_CHARS``
+    (:func:`_bounded_display_text`); what is stored is left whole.
     """
     out = []
     for m in messages:
@@ -390,6 +414,8 @@ def _map_to_wire(
             entry["text"] = content
         elif content is not None:
             entry["text"] = str(content)
+        if m["role"] == "tool" and isinstance(entry.get("text"), str):
+            entry["text"] = _bounded_display_text(entry["text"])
         for extra_key in (
             "context",
             "name",
