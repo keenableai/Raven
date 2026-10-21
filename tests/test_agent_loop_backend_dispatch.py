@@ -165,7 +165,7 @@ class TestDispatcher:
 
         b = _FakeBackend()
         agent = _make_loop(tmp_path, backend=b)
-        cjk = "字" * 128_000
+        cjk = chr(0x5B57) * 128_000
         slice_ = [
             {"role": "user", "content": "read it"},
             {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": cjk},

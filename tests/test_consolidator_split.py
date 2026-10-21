@@ -502,7 +502,7 @@ async def test_annotate_reads_a_large_tool_result_as_its_view(tmp_path: Path):
         return await original_chat(**kwargs)
 
     provider.chat = recording_chat
-    read = "字" * 600_000
+    read = chr(0x5B57) * 600_000
     messages = [
         *CASE_06_MESSAGES,
         {"role": "tool", "timestamp": "2026-05-07T12:31", "content": read},
