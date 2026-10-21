@@ -8,7 +8,9 @@
 # clone. Set RAVEN_LOCAL_SRC=<dir> to force an editable install of a checkout.
 # Set RAVEN_MINIMAL=1 to skip the resource download, chromium and the LibreOffice offer;
 # the wheel install itself is unchanged. Set RAVEN_NO_LAUNCH=1 to skip the
-# closing `raven web` (CI, Dockerfiles), so the script returns.
+# closing `raven web` (CI, Dockerfiles), so the script returns. A download whose
+# host cannot be reached at all is fetched from a mirror in mainland China
+# instead; set RAVEN_NO_MIRROR=1 to keep every download on its default host.
 #
 # Goal: a clean machine ends up able to run `raven` / `raven tui` from any
 # directory with no manual steps. The script is idempotent -- it detects what
@@ -36,6 +38,29 @@ MIN_NODE_MAJOR=22
 RAVEN_HOME="${RAVEN_HOME:-${HOME:?HOME is required, or set RAVEN_HOME explicitly}/.raven}"
 NODE_RUNTIME_DIR="$RAVEN_HOME/runtime"
 
+# Where a download goes when its default host cannot be reached at all. From a
+# mainland-China line with no proxy, GitHub and huggingface.co time out more
+# often than they answer, and astral.sh, PyPI, nodejs.org or the npm registry
+# can fail the same way. Only a connection that never completed moves a
+# download (reachable() below); an HTTP error is the host's answer and stays
+# final. A host the user chose is never replaced, and RAVEN_NO_MIRROR=1 keeps
+# every download on its default host. raven/utils/mirrors.py names the same
+# hosts for the runtime; a test holds the copies equal.
+NODE_DIST="https://nodejs.org/dist"
+NODE_MIRROR="https://cdn.npmmirror.com/binaries/node"
+PYPI_INDEX="https://pypi.org/simple/"
+PYPI_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
+PYTHON_DOWNLOADS="https://releases.astral.sh/"
+PYTHON_MIRROR="https://registry.npmmirror.com/-/binary/python-build-standalone"
+NPM_REGISTRY="https://registry.npmjs.org/"
+NPM_MIRROR="https://registry.npmmirror.com"
+PLAYWRIGHT_MIRROR="https://cdn.npmmirror.com/binaries/playwright"
+# The variables a fallback exported, unset again before the page starts: they
+# are for this install's own downloads, and the runtime decides for itself.
+MIRROR_EXPORTS=""
+# The host Node comes from, once chosen (choose_node_dist).
+NODE_FROM=""
+
 # uv does not byte-compile by default, so the first process to import a module
 # compiles it. For raven that process is the memory service the first session
 # starts, and it imports the serving stack -- measured at 22s on a fresh
@@ -54,6 +79,36 @@ sha256_of() {
   if have sha256sum; then sha256sum "$1" | cut -d' ' -f1
   elif have shasum; then shasum -a 256 "$1" | cut -d' ' -f1
   else printf ''; fi
+}
+
+# Read the way raven's own opt-outs read it, so this script and the
+# `raven resources` it starts agree on what a value means.
+mirrors_allowed() {
+  case "$(printf '%s' "${RAVEN_NO_MIRROR:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 1 ;;
+  esac
+  return 0
+}
+
+# False only when no connection to $1 completed: the name did not resolve, the
+# connection was refused, reset or timed out, or TLS never got going. Any HTTP
+# answer, an error status included, is the host being there, and so is a
+# certificate that fails verification: whatever re-signs this host's traffic
+# re-signs a mirror's too.
+reachable() {
+  code=0
+  curl -sS -o /dev/null --connect-timeout 5 --max-time 10 -I "$1" 2>/dev/null || code=$?
+  case "$code" in
+    6|7|28|35|52|56) return 1 ;;
+  esac
+  return 0
+}
+
+# use_mirror <variable> <value>: export it for the rest of this install, and
+# remember it so the page does not start with it.
+use_mirror() {
+  eval "export $1=\"\$2\""
+  MIRROR_EXPORTS="$MIRROR_EXPORTS $1"
 }
 
 # --- 0. platform detection -------------------------------------------------
@@ -79,12 +134,92 @@ ensure_uv() {
     return
   fi
   info "uv not found, installing..."
-  curl -fsSL https://astral.sh/uv/install.sh | sh
+  # Piped, so a curl that cannot reach astral.sh hands sh an empty script and
+  # the pipe still succeeds: whether uv arrived is asked below instead.
+  curl -fsSL --connect-timeout 15 https://astral.sh/uv/install.sh | sh || true
   # uv installs to ~/.local/bin (or $XDG_BIN_HOME) -- make it visible for the
   # rest of this script even before the shell profile is re-sourced.
   export PATH="$HOME/.local/bin:$PATH"
-  have uv || die "uv still unavailable after install; check PATH (expected in ~/.local/bin)"
+  have uv || install_uv_from_mirror || true
+  have uv || die "uv could not be installed, or is not where it was put; check PATH (expected in ~/.local/bin)"
   ok "uv installed"
+}
+
+# The absolute URL of the link $2 on the page at $1, which ends in /.
+resolve_href() {
+  case "$2" in
+    http://*|https://*) printf '%s' "$2"; return 0 ;;
+    /*) printf '%s%s' "$(printf '%s' "$1" | sed 's|^\([a-z]*://[^/]*\).*|\1|')" "$2"; return 0 ;;
+  esac
+  href_base="${1%/}"
+  href_rest="$2"
+  while :; do
+    case "$href_rest" in
+      ../*) href_base="${href_base%/*}"; href_rest="${href_rest#../}" ;;
+      ./*) href_rest="${href_rest#./}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s/%s' "$href_base" "$href_rest"
+}
+
+# uv publishes the binary its installer fetches to PyPI too, as a wheel, and a
+# wheel is a zip. When uv's own installer leaves no uv behind -- it does not say
+# why, and it reaches three hosts: astral.sh for itself, then releases.astral.sh
+# and GitHub for the binary -- uv and uvx are unpacked from the newest wheel for
+# this platform on the PyPI mirror, or on the index UV_DEFAULT_INDEX names when
+# the user named one, and checked against the sha256 the index publishes beside
+# the link.
+install_uv_from_mirror() {
+  mirrors_allowed || return 1
+  case "$NODE_OS-$NODE_ARCH" in
+    linux-x64)
+      uv_tag="manylinux_2_17_x86_64"
+      if ldd --version 2>&1 | grep -qi musl; then uv_tag="musllinux_1_1_x86_64"; fi
+      ;;
+    linux-arm64) uv_tag="manylinux_2_17_aarch64" ;;
+    darwin-x64) uv_tag="macosx_10_12_x86_64" ;;
+    darwin-arm64) uv_tag="macosx_11_0_arm64" ;;
+    *) return 1 ;;
+  esac
+  uv_index="${UV_DEFAULT_INDEX:-${UV_INDEX_URL:-$PYPI_MIRROR}}"
+  uv_page="${uv_index%/}/uv/"
+  warn "uv's installer left no uv behind; fetching uv from $uv_page instead (RAVEN_NO_MIRROR=1 turns this off)."
+  uv_work="$(mktemp -d)" || return 1
+  # The newest release, compared field by field: an index lists files in name
+  # order, where 0.9.9 sorts after 0.13.4.
+  uv_href="$(
+    curl -fsSL --connect-timeout 15 "$uv_page" 2>/dev/null | grep -o 'href="[^"]*"' | sed 's/^href="//; s/"$//' \
+      | grep "uv-[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-py3-none-[^/#]*$uv_tag[^/#]*\.whl" \
+      | sed 's|^\(.*uv-\([0-9][0-9.]*\)-py3-none-.*\)$|\2 \1|' \
+      | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1 | cut -d' ' -f2-
+  )" || uv_href=""
+  case "$uv_href" in
+    *'#sha256='*) uv_sha="${uv_href##*#sha256=}" ;;
+    *) uv_sha="" ;;
+  esac
+  uv_href="${uv_href%%#*}"
+  if [ -z "$uv_href" ] \
+    || ! curl -fsSL --connect-timeout 15 -o "$uv_work/uv.whl" "$(resolve_href "$uv_page" "$uv_href")" \
+    || { [ -n "$uv_sha" ] && [ "$(sha256_of "$uv_work/uv.whl")" != "$uv_sha" ]; }; then
+    rm -rf "$uv_work"
+    return 1
+  fi
+  if have unzip; then
+    unzip -q -o "$uv_work/uv.whl" -d "$uv_work/x" >/dev/null 2>&1 || { rm -rf "$uv_work"; return 1; }
+  elif have python3; then
+    python3 -m zipfile -e "$uv_work/uv.whl" "$uv_work/x" || { rm -rf "$uv_work"; return 1; }
+  else
+    rm -rf "$uv_work"
+    return 1
+  fi
+  mkdir -p "$HOME/.local/bin"
+  for exe in uv uvx; do
+    found="$(find "$uv_work/x" -path "*.data/scripts/$exe" -type f | head -n 1)"
+    if [ -n "$found" ]; then cp "$found" "$HOME/.local/bin/$exe" && chmod 755 "$HOME/.local/bin/$exe"; fi
+  done
+  rm -rf "$uv_work"
+  [ -x "$HOME/.local/bin/uv" ]
 }
 
 # --- 2. ensure Node >= 22 --------------------------------------------------
@@ -95,11 +230,23 @@ system_node_ok() {
   [ -n "$v" ] && [ "$v" -ge "$MIN_NODE_MAJOR" ] 2>/dev/null
 }
 
-# Resolve the latest v22 LTS version string (e.g. v22.20.0) from nodejs.org,
-# without requiring jq/python. Falls back to a pinned version if the index
-# can't be reached.
+# Where Node comes from: nodejs.org, or its mirror when nodejs.org cannot be
+# reached at all. Sets NODE_FROM, once, so a host that does not answer is waited
+# on once -- unless the caller is a subshell, which keeps its choice to itself.
+choose_node_dist() {
+  [ -z "$NODE_FROM" ] || return 0
+  NODE_FROM="$NODE_DIST"
+  if mirrors_allowed && ! reachable "$NODE_DIST/index.json"; then
+    warn "nodejs.org could not be reached; downloading Node from $NODE_MIRROR instead (RAVEN_NO_MIRROR=1 turns this off)."
+    NODE_FROM="$NODE_MIRROR"
+  fi
+}
+
+# Resolve the latest v22 LTS version string (e.g. v22.20.0) from the index on
+# host $1, without requiring jq/python. Falls back to a pinned version if the
+# index can't be reached.
 latest_node_v22() {
-  idx="$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null || true)"
+  idx="$(curl -fsSL "$1/index.json" 2>/dev/null || true)"
   ver="$(printf '%s' "$idx" | tr ',' '\n' | grep -o '"version":"v22\.[0-9.]*"' \
          | head -n1 | sed 's/.*"v/v/; s/"$//')"
   [ -n "$ver" ] && printf '%s' "$ver" || printf 'v22.20.0'
@@ -139,20 +286,22 @@ ensure_node() {
 # with no npm to call. Every failure here is fatal, so a caller that must not
 # die on a failed download runs this in a subshell.
 provision_private_node() {
-  ver="$(latest_node_v22)"
+  choose_node_dist
+  ver="$(latest_node_v22 "$NODE_FROM")"
   pkg="node-${ver}-${NODE_OS}-${NODE_ARCH}"
-  url="https://nodejs.org/dist/${ver}/${pkg}.tar.gz"
+  url="$NODE_FROM/${ver}/${pkg}.tar.gz"
   mkdir -p "$NODE_RUNTIME_DIR"
   tmp="$(mktemp -d)"
   info "  $url"
   curl -fsSL "$url" -o "$tmp/node.tar.gz" || die "Node download failed: $url"
 
-  # Supply-chain integrity: verify the tarball against the official
-  # SHASUMS256.txt before extracting/executing it. Node publishes this file
-  # next to every release. A tarball that cannot be verified is treated like
-  # one that fails verification: it is never extracted.
+  # Verify the tarball against the SHASUMS256.txt published beside it before
+  # extracting/executing it: nodejs.org's, or the mirror's copy when the tarball
+  # came from the mirror, so the check catches a corrupt or truncated download.
+  # A tarball that cannot be verified is treated like one that fails
+  # verification: it is never extracted.
   node_hint="Install Node.js >= ${MIN_NODE_MAJOR} with npm yourself and re-run; the installer then uses it instead of downloading one."
-  curl -fsSL "https://nodejs.org/dist/${ver}/SHASUMS256.txt" -o "$tmp/SHASUMS256.txt" 2>/dev/null \
+  curl -fsSL "$NODE_FROM/${ver}/SHASUMS256.txt" -o "$tmp/SHASUMS256.txt" 2>/dev/null \
     || { rm -rf "$tmp"; die "Could not fetch SHASUMS256.txt for Node ${ver}, so the download cannot be verified. $node_hint"; }
   expected="$(awk -v f="${pkg}.tar.gz" '$2==f {print $1}' "$tmp/SHASUMS256.txt")"
   [ -n "$expected" ] \
@@ -253,6 +402,24 @@ resolve_node_dir() {
   fi
 }
 
+# `npm ci` reads every package from the registry. One that cannot be reached at
+# all is swapped for its mirror, unless the user named a registry: in the
+# environment, or in npm's own configuration, which $1's npm reads out.
+use_npm_mirror() {
+  mirrors_allowed || return 0
+  [ -z "${npm_config_registry:-}${NPM_CONFIG_REGISTRY:-}" ] || return 0
+  # An npm that cannot say which registry it reads may be reading one the user
+  # chose, so only its own word for the default lets the mirror in.
+  configured="$(PATH="$1:$PATH" npm config get registry 2>/dev/null)" || return 0
+  case "$configured" in
+    "$NPM_REGISTRY"|"${NPM_REGISTRY%/}") ;;
+    *) return 0 ;;
+  esac
+  reachable "$NPM_REGISTRY" && return 0
+  warn "registry.npmjs.org could not be reached; installing packages from $NPM_MIRROR instead (RAVEN_NO_MIRROR=1 turns this off)."
+  use_mirror npm_config_registry "$NPM_MIRROR"
+}
+
 build_web_assets() {
   src="$1"
   need_tui=0
@@ -265,6 +432,7 @@ build_web_assets() {
 
   # One probe for both builds.
   resolve_node_dir
+  if [ -z "$blocker" ]; then use_npm_mirror "$node_dir"; fi
 
   if [ "$need_tui" = 1 ]; then
     if [ -n "$blocker" ]; then
@@ -308,7 +476,52 @@ is_raven_source() {
   [ -f "$1/pyproject.toml" ] && grep -q '^name = "raven"' "$1/pyproject.toml" 2>/dev/null
 }
 
+# Whether a uv.toml uv reads -- the user's, or the machine's -- has a line
+# matching the extended regular expression $1.
+uv_config_has() {
+  uv_pattern="$1"
+  if [ -n "${UV_CONFIG_FILE:-}" ]; then
+    [ -f "$UV_CONFIG_FILE" ] && grep -Eq "$uv_pattern" "$UV_CONFIG_FILE"
+    return
+  fi
+  # The user's, then the machine's: each of XDG_CONFIG_DIRS, then /etc.
+  uv_ifs="$IFS"
+  IFS=:
+  set -f
+  set -- ${XDG_CONFIG_HOME:-$HOME/.config} ${XDG_CONFIG_DIRS:-/etc/xdg} /etc
+  set +f
+  IFS="$uv_ifs"
+  for uv_root in "$@"; do
+    [ -f "$uv_root/uv/uv.toml" ] && grep -Eq "$uv_pattern" "$uv_root/uv/uv.toml" && return 0
+  done
+  return 1
+}
+
+uv_index_chosen() {
+  [ -n "${UV_DEFAULT_INDEX:-}${UV_INDEX_URL:-}${UV_INDEX:-}" ] && return 0
+  uv_config_has '^[[:space:]]*index-url[[:space:]]*=' && return 0
+  uv_config_has '^[[:space:]]*default[[:space:]]*=[[:space:]]*true'
+}
+
+# uv resolves raven's dependencies from PyPI, and fetches a Python when the
+# machine has none it can use. Either host that cannot be reached at all is
+# swapped for its mirror -- unless the user named one -- for this install's uv.
+use_package_mirrors() {
+  mirrors_allowed || return 0
+  if ! uv_index_chosen && ! reachable "$PYPI_INDEX"; then
+    warn "pypi.org could not be reached; installing packages from $PYPI_MIRROR instead (RAVEN_NO_MIRROR=1 turns this off)."
+    use_mirror UV_DEFAULT_INDEX "$PYPI_MIRROR"
+  fi
+  if [ -z "${UV_PYTHON_INSTALL_MIRROR:-}" ] \
+    && ! uv_config_has '^[[:space:]]*python-install-mirror[[:space:]]*=' \
+    && ! reachable "$PYTHON_DOWNLOADS"; then
+    warn "releases.astral.sh could not be reached; fetching any Python uv needs from $PYTHON_MIRROR instead (RAVEN_NO_MIRROR=1 turns this off)."
+    use_mirror UV_PYTHON_INSTALL_MIRROR "$PYTHON_MIRROR"
+  fi
+}
+
 install_raven() {
+  use_package_mirrors
   # Local mode: run from a raven source checkout -> editable install of the
   # working tree (what a developer wants). Otherwise install the release wheel.
   #
@@ -522,8 +735,15 @@ install_browser() {
   info "Downloading chromium for the browser tool..."
   # On Linux chromium may additionally need system libraries; playwright prints
   # the exact sudo command for them (--with-deps). We never run sudo ourselves.
-  "$py" -m playwright install chromium \
-    || warn "Chromium download failed; the browser tool stays off. Retry later with: $py -m playwright install chromium"
+  if "$py" -m playwright install chromium; then return 0; fi
+  # Playwright tries its own hosts in turn and reports only that none of them
+  # delivered, so the mirror gets one retry after the whole download failed --
+  # unless the user named a download host.
+  if mirrors_allowed && [ -z "${PLAYWRIGHT_DOWNLOAD_HOST:-}${PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST:-}" ]; then
+    warn "Chromium could not be downloaded; trying $PLAYWRIGHT_MIRROR instead (RAVEN_NO_MIRROR=1 turns this off)."
+    if PLAYWRIGHT_DOWNLOAD_HOST="$PLAYWRIGHT_MIRROR" "$py" -m playwright install chromium; then return 0; fi
+  fi
+  warn "Chromium download failed; the browser tool stays off. Retry later with: $py -m playwright install chromium"
 }
 
 # The word dictionary and the deepdoc vision models: ~110 MB that cannot live
@@ -563,6 +783,9 @@ LO_VERSION="26.8.0"
 LO_BUILD="26.8.0.3"
 LO_SHA256_ARM64="8858d8058da4f862f47559486814e65efc27294da67c5e4bb56b006b1ee59f89"
 LO_SHA256_X64="2dcbce4894e01bc1ecd594658e2cbda70ff7bfcd0b310f35d38887797172d09e"
+# TUNA's copy of libreoffice.org's download tree. The digest is pinned, so a
+# third source cannot change what is installed.
+LO_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/libreoffice/libreoffice"
 
 # Where a Mac's apps live; overridable so a test can install into a directory
 # of its own. raven's own lookup (raven/utils/office.py) checks the same two.
@@ -593,9 +816,12 @@ install_libreoffice_dmg() {
   dmg="$work/LibreOffice.dmg"
   info "Downloading LibreOffice $LO_VERSION for deck preview (about 300 MB)..."
   fetched=""
-  for url in \
-    "https://download.documentfoundation.org/libreoffice/stable/$LO_VERSION/mac/$lo_dir/LibreOffice_${LO_VERSION}_MacOS_$lo_arch.dmg" \
-    "https://downloadarchive.documentfoundation.org/libreoffice/old/$LO_BUILD/mac/$lo_dir/LibreOffice_${LO_BUILD}_MacOS_$lo_arch.dmg"; do
+  lo_path="stable/$LO_VERSION/mac/$lo_dir/LibreOffice_${LO_VERSION}_MacOS_$lo_arch.dmg"
+  set -- \
+    "https://download.documentfoundation.org/libreoffice/$lo_path" \
+    "https://downloadarchive.documentfoundation.org/libreoffice/old/$LO_BUILD/mac/$lo_dir/LibreOffice_${LO_BUILD}_MacOS_$lo_arch.dmg"
+  if mirrors_allowed; then set -- "$@" "$LO_MIRROR/$lo_path"; fi
+  for url in "$@"; do
     if curl -fsSL --retry 2 --max-time 1800 -o "$dmg" "$url" && [ "$(sha256_of "$dmg")" = "$lo_sha" ]; then
       fetched=1
       break
@@ -704,6 +930,9 @@ install_office() {
 # user's home, no password.
 
 HAN_FONT_URL="https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf"
+# The same file through jsDelivr, for when GitHub does not deliver. Pinned by
+# size and digest below, so a second source cannot change what is installed.
+HAN_FONT_MIRROR_URL="https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@Sans2.004/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf"
 HAN_FONT_SHA256="faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9"
 HAN_FONT_BYTES="8331336"
 HAN_FONT_NAME="NotoSansSC-Regular.otf"
@@ -721,16 +950,20 @@ install_linux_cjk_font() {
   mkdir -p "$dir" || { warn "Could not create $dir; Chinese pages in a deck will render as boxes. $hint"; return 1; }
   part="$dir/.$HAN_FONT_NAME.$$.part"
   info "Downloading a Chinese font for deck preview..."
-  # Size and digest both, before the file is put in place: a truncated OTF
-  # still parses and draws nothing, which is the failure this step exists for.
-  if curl -fsSL --max-time 120 -o "$part" "$HAN_FONT_URL" \
-    && [ "$(wc -c < "$part" | tr -d ' ')" = "$HAN_FONT_BYTES" ] \
-    && [ "$(sha256_of "$part")" = "$HAN_FONT_SHA256" ] \
-    && mv -f "$part" "$dir/$HAN_FONT_NAME"; then
-    have fc-cache && fc-cache -f "$dir" >/dev/null 2>&1
-    ok "Chinese font installed to $dir/$HAN_FONT_NAME"
-    return 0
-  fi
+  set -- "$HAN_FONT_URL"
+  if mirrors_allowed; then set -- "$@" "$HAN_FONT_MIRROR_URL"; fi
+  for url in "$@"; do
+    # Size and digest both, before the file is put in place: a truncated OTF
+    # still parses and draws nothing, which is the failure this step exists for.
+    if curl -fsSL --max-time 120 -o "$part" "$url" \
+      && [ "$(wc -c < "$part" | tr -d ' ')" = "$HAN_FONT_BYTES" ] \
+      && [ "$(sha256_of "$part")" = "$HAN_FONT_SHA256" ] \
+      && mv -f "$part" "$dir/$HAN_FONT_NAME"; then
+      have fc-cache && fc-cache -f "$dir" >/dev/null 2>&1
+      ok "Chinese font installed to $dir/$HAN_FONT_NAME"
+      return 0
+    fi
+  done
   rm -f "$part"
   warn "The Chinese font download failed; Chinese pages in a deck will render as boxes. $hint"
   return 1
@@ -804,6 +1037,10 @@ main() {
     *":$HOME/.local/bin:"*) ;;
     *) warn "Your current PATH does not include ~/.local/bin yet -- open a new terminal, or run: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
   esac
+
+  # A mirror served this install's downloads only: the page starts with the
+  # user's own environment, and the runtime falls back for itself.
+  for name in $MIRROR_EXPORTS; do unset "$name"; done
 
   [ -n "${RAVEN_NO_LAUNCH:-}" ] || launch_web
 }

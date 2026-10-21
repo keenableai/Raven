@@ -7,7 +7,9 @@
 # clone. Set RAVEN_LOCAL_SRC=<dir> to force an editable install of a checkout.
 # Set RAVEN_MINIMAL=1 to skip the chromium download and the LibreOffice offer;
 # the wheel install itself is unchanged. Set RAVEN_NO_LAUNCH=1 to skip the
-# closing `raven web` (CI), so the script returns.
+# closing `raven web` (CI), so the script returns. A download whose host cannot
+# be reached at all is fetched from a mirror in mainland China instead; set
+# RAVEN_NO_MIRROR=1 to keep every download on its default host.
 #
 # Goal: a clean Windows machine ends up able to run `raven` / `raven tui`
 # without admin rights. The script is idempotent: it reuses existing tools when
@@ -32,6 +34,32 @@ $ErrorActionPreference = "Stop"
 $MinNodeMajor = 22
 $RavenHome = if ($env:RAVEN_HOME) { $env:RAVEN_HOME } else { Join-Path $HOME ".raven" }
 $NodeRuntimeDir = Join-Path $RavenHome "runtime"
+
+# Where a download goes when its default host cannot be reached at all. From a
+# mainland-China line with no proxy, GitHub and huggingface.co time out more
+# often than they answer, and astral.sh, PyPI, nodejs.org or the npm registry
+# can fail the same way. Only a connection that never completed moves a
+# download (Test-Reachable); an HTTP error is the host's answer and stays final.
+# A host the user chose is never replaced, and RAVEN_NO_MIRROR=1 keeps every
+# download on its default host. raven/utils/mirrors.py names the same hosts for
+# the runtime; a test holds the copies equal.
+$NodeDist = "https://nodejs.org/dist"
+$NodeMirror = "https://cdn.npmmirror.com/binaries/node"
+$PypiIndex = "https://pypi.org/simple/"
+$PypiMirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
+$PythonDownloads = "https://releases.astral.sh/"
+$PythonMirror = "https://registry.npmmirror.com/-/binary/python-build-standalone"
+$NpmRegistry = "https://registry.npmjs.org/"
+$NpmMirror = "https://registry.npmmirror.com"
+$PlaywrightMirror = "https://cdn.npmmirror.com/binaries/playwright"
+# uv's own installer, run the way uv documents it (see Ensure-Uv).
+$UvInstallCommand = "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Every variable a fallback set, with the value it replaced: under `irm | iex`
+# this is the reader's own session, which gets its environment back when the
+# install ends (Restore-MirrorEnv).
+$script:MirrorSaved = @{}
+$script:NodeDistChosen = $null
 
 function Write-Info([string]$Message) {
     Write-Host ">" $Message -ForegroundColor Cyan
@@ -59,6 +87,52 @@ function Add-ProcessPath([string]$PathToAdd) {
     }
 }
 
+# Read the way raven's own opt-outs read it, so this script and the raven it
+# installs agree on what a value means.
+function Test-MirrorsAllowed {
+    return -not ($env:RAVEN_NO_MIRROR -match '^\s*(1|true|yes|on)\s*$')
+}
+
+# False only when no connection to $Url completed: the name did not resolve,
+# the connection was refused, reset or timed out, or TLS never got going. Any
+# HTTP answer, an error status included, carries a response and is the host
+# being there, and so is a certificate that fails verification: whatever
+# re-signs this host's traffic re-signs a mirror's too.
+function Test-Reachable([string]$Url) {
+    try {
+        $null = Invoke-WebRequest $Url -Method Head -UseBasicParsing -TimeoutSec 10
+        return $true
+    } catch {
+        if ($_.Exception.Response) { return $true }
+        # Windows PowerShell names a refused certificate outright.
+        if ("$($_.Exception.Status)" -eq "TrustFailure") { return $true }
+        # PowerShell 7 reports one as it does any handshake that failed, so the
+        # host is asked again without the check: an answer then means the
+        # certificate was all that failed.
+        if ("$($_.Exception.HttpRequestError)" -ne "SecureConnectionError") { return $false }
+    }
+    try {
+        $null = Invoke-WebRequest $Url -Method Head -UseBasicParsing -TimeoutSec 10 -SkipCertificateCheck
+        return $true
+    } catch {
+        return [bool]$_.Exception.Response
+    }
+}
+
+function Set-MirrorEnv([string]$Name, [string]$Value) {
+    if (-not $script:MirrorSaved.ContainsKey($Name)) {
+        $script:MirrorSaved[$Name] = [Environment]::GetEnvironmentVariable($Name, "Process")
+    }
+    [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+}
+
+function Restore-MirrorEnv {
+    foreach ($name in @($script:MirrorSaved.Keys)) {
+        [Environment]::SetEnvironmentVariable($name, $script:MirrorSaved[$name], "Process")
+    }
+    $script:MirrorSaved = @{}
+}
+
 function Find-Uv {
     $cmd = Get-Command uv -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -82,14 +156,73 @@ function Ensure-Uv {
     }
 
     Write-Info "uv not found; installing..."
-    Invoke-Expression (Invoke-RestMethod "https://astral.sh/uv/install.ps1")
+    # In a PowerShell of its own: uv's installer ends a failed download with
+    # `exit 1`, which run inside this script would end the install too -- and,
+    # under `irm | iex`, the reader's whole session -- before the mirror below
+    # is tried.
+    $shell = (Get-Process -Id $PID).Path
+    if (-not $shell) { $shell = "powershell.exe" }
+    try {
+        & $shell -NoProfile -ExecutionPolicy Bypass -Command $UvInstallCommand
+        if ($LASTEXITCODE -ne 0) { Write-Warn "uv's installer did not finish (exit code $LASTEXITCODE)." }
+    } catch {
+        Write-Warn "uv's installer did not start ($_)."
+    }
     $uv = Find-Uv
+    if (-not $uv -and (Test-MirrorsAllowed)) { $uv = Install-UvFromMirror }
     if (-not $uv) {
-        Fail "uv was installed but is still not available. Check PATH (expected ~/.local/bin)."
+        Fail "uv could not be installed, or is not where it was put. Check PATH (expected ~/.local/bin)."
     }
     Add-ProcessPath (Split-Path $uv -Parent)
     Write-Ok "uv installed"
     return $uv
+}
+
+# uv publishes the binary its installer fetches to PyPI too, as a wheel, and a
+# wheel is a zip. When uv's own installer leaves no uv behind -- it does not say
+# why, and it reaches three hosts: astral.sh for itself, then releases.astral.sh
+# and GitHub for the binary -- uv.exe and uvx.exe are unpacked from the newest
+# Windows wheel on the PyPI mirror, or on the index UV_DEFAULT_INDEX names when
+# the user named one, and checked against the sha256 the index publishes beside
+# the link. Returns the uv now found, if any.
+function Install-UvFromMirror {
+    $tag = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "win_arm64" } else { "win_amd64" }
+    $index = if ($env:UV_DEFAULT_INDEX) { $env:UV_DEFAULT_INDEX } elseif ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { $PypiMirror }
+    $page = $index.TrimEnd("/") + "/uv/"
+    Write-Warn "uv's installer left no uv behind; fetching uv from $page instead (RAVEN_NO_MIRROR=1 turns this off)."
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("raven-uv-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    try {
+        $html = (Invoke-WebRequest $page -UseBasicParsing).Content
+        # The newest release, compared field by field: an index lists files in
+        # name order, where 0.9.9 sorts after 0.13.4.
+        $best = $null
+        $link = 'href="([^"#]*?uv-(\d+)\.(\d+)\.(\d+)-py3-none-' + $tag + '\.whl)(?:#sha256=([0-9a-f]{64}))?"'
+        foreach ($match in [regex]::Matches($html, $link)) {
+            $version = [version]("{0}.{1}.{2}" -f $match.Groups[2].Value, $match.Groups[3].Value, $match.Groups[4].Value)
+            if (-not $best -or $version -gt $best.Version) {
+                $best = @{ Version = $version; Href = $match.Groups[1].Value; Sha = $match.Groups[5].Value }
+            }
+        }
+        if (-not $best) { throw "no uv wheel for $tag is listed" }
+        $wheel = Join-Path $tmp "uv.zip"
+        Invoke-WebRequest ([Uri]::new([Uri]$page, $best.Href).AbsoluteUri) -OutFile $wheel -UseBasicParsing
+        if ($best.Sha -and (Get-FileHash $wheel -Algorithm SHA256).Hash.ToLowerInvariant() -ne $best.Sha) {
+            throw "the wheel does not match the sha256 the index publishes"
+        }
+        Expand-Archive $wheel -DestinationPath $tmp -Force
+        $bin = Join-Path $HOME ".local\bin"
+        New-Item -ItemType Directory -Path $bin -Force | Out-Null
+        foreach ($exe in @("uv.exe", "uvx.exe")) {
+            $found = Get-ChildItem $tmp -Recurse -Filter $exe | Where-Object { $_.Directory.Name -eq "scripts" } | Select-Object -First 1
+            if ($found) { Copy-Item $found.FullName (Join-Path $bin $exe) -Force }
+        }
+    } catch {
+        Write-Warn "Could not fetch uv from $page ($_)."
+    } finally {
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    return Find-Uv
 }
 
 function Get-NodeArch {
@@ -133,15 +266,28 @@ function Find-PrivateNode {
     return $null
 }
 
-function Get-LatestNodeV22 {
+function Get-LatestNodeV22([string]$Dist) {
     try {
-        $index = Invoke-RestMethod "https://nodejs.org/dist/index.json"
+        $index = Invoke-RestMethod "$Dist/index.json"
         $entry = $index | Where-Object { $_.version -like "v22.*" } | Select-Object -First 1
         if ($entry -and $entry.version) { return $entry.version }
     } catch {
         Write-Warn "Could not query Node.js release index; falling back to v22.20.0"
     }
     return "v22.20.0"
+}
+
+# Where Node comes from: nodejs.org, or its mirror when nodejs.org cannot be
+# reached at all. Decided once, so a host that does not answer is waited on once.
+function Get-NodeDist {
+    if ($null -eq $script:NodeDistChosen) {
+        $script:NodeDistChosen = $NodeDist
+        if ((Test-MirrorsAllowed) -and -not (Test-Reachable "$NodeDist/index.json")) {
+            Write-Warn "nodejs.org could not be reached; downloading Node from $NodeMirror instead (RAVEN_NO_MIRROR=1 turns this off)."
+            $script:NodeDistChosen = $NodeMirror
+        }
+    }
+    return $script:NodeDistChosen
 }
 
 function Ensure-Node {
@@ -169,9 +315,10 @@ function Ensure-Node {
 # caller that must not abort on a failed download wraps this in try/catch.
 function Install-PrivateNode {
     $arch = Get-NodeArch
-    $version = Get-LatestNodeV22
+    $from = Get-NodeDist
+    $version = Get-LatestNodeV22 $from
     $pkg = "node-$version-win-$arch"
-    $url = "https://nodejs.org/dist/$version/$pkg.zip"
+    $url = "$from/$version/$pkg.zip"
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("raven-node-" + [guid]::NewGuid().ToString("N"))
     $zipPath = Join-Path $tmp "node.zip"
 
@@ -183,12 +330,14 @@ function Install-PrivateNode {
         Invoke-WebRequest $url -OutFile $zipPath
 
         # A zip that cannot be verified is treated like one that fails
-        # verification: it is never extracted. Fail raises under this script's
-        # ErrorActionPreference, so only the fetch sits inside the try below; a
-        # Fail inside it would be caught there and the zip extracted anyway.
+        # verification: it is never extracted. The checksums come from the host
+        # the zip came from, so the check catches a corrupt or truncated
+        # download. Fail raises under this script's ErrorActionPreference, so
+        # only the fetch sits inside the try below; a Fail inside it would be
+        # caught there and the zip extracted anyway.
         $hint = "Install Node.js >= $MinNodeMajor with npm yourself and re-run; the installer then uses it instead of downloading one."
         try {
-            $sums = (Invoke-WebRequest "https://nodejs.org/dist/$version/SHASUMS256.txt" -UseBasicParsing).Content
+            $sums = (Invoke-WebRequest "$from/$version/SHASUMS256.txt" -UseBasicParsing).Content
         } catch {
             Fail "Could not fetch SHASUMS256.txt for Node $version, so the download cannot be verified. $hint"
         }
@@ -390,6 +539,7 @@ function Build-WebAssets([string]$ScriptDir, [string]$NodePath, [string]$UvPath)
         if ($needPage) { Write-Warn "Found node but not npm; skipping served-page build; raven web will not start" }
         return
     }
+    Use-NpmMirror (Get-NpmRegistry $npm)
 
     if ($needTui) {
         Write-Info "Building TUI bundle (ui-tui/dist/entry.js)..."
@@ -442,7 +592,65 @@ function Build-WebAssets([string]$ScriptDir, [string]$NodePath, [string]$UvPath)
     }
 }
 
+# What $npm will install from, or $null when it cannot say: an npm that fails
+# may have printed its default all the same.
+function Get-NpmRegistry($npm) {
+    try {
+        $answer = [string](& $npm.Source config get registry 2>$null)
+        if ($LASTEXITCODE -eq 0) { return $answer.Trim() }
+    } catch { }
+    return $null
+}
+
+# `npm ci` reads every package from the registry. One that cannot be reached at
+# all is swapped for its mirror, unless the user named a registry. $Registry is
+# the one npm says it reads, and $null when it could not say, which is no proof
+# that the choice is npm's default. Untyped, since [string] turns $null into "".
+function Use-NpmMirror($Registry) {
+    if (-not (Test-MirrorsAllowed) -or $env:npm_config_registry) { return }
+    if ($null -eq $Registry -or $Registry.TrimEnd("/") -ne $NpmRegistry.TrimEnd("/")) { return }
+    if (Test-Reachable $NpmRegistry) { return }
+    Write-Warn "registry.npmjs.org could not be reached; installing packages from $NpmMirror instead (RAVEN_NO_MIRROR=1 turns this off)."
+    Set-MirrorEnv "npm_config_registry" $NpmMirror
+}
+
+# Whether a uv.toml uv reads -- the user's, or the machine's -- matches $Pattern.
+function Test-UvConfigHas([string]$Pattern) {
+    $paths = @()
+    if ($env:UV_CONFIG_FILE) {
+        $paths = @($env:UV_CONFIG_FILE)
+    } else {
+        $paths = @($env:APPDATA, $env:PROGRAMDATA) | Where-Object { $_ } | ForEach-Object { Join-Path $_ "uv\uv.toml" }
+    }
+    foreach ($path in $paths) {
+        if ((Test-Path $path) -and ((Get-Content -Raw $path) -match $Pattern)) { return $true }
+    }
+    return $false
+}
+
+function Test-UvIndexChosen {
+    if ($env:UV_DEFAULT_INDEX -or $env:UV_INDEX_URL -or $env:UV_INDEX) { return $true }
+    return (Test-UvConfigHas '(?m)^\s*index-url\s*=') -or (Test-UvConfigHas '(?m)^\s*default\s*=\s*true')
+}
+
+# uv resolves Raven's dependencies from PyPI, and fetches a Python when the
+# machine has none it can use. Either host that cannot be reached at all is
+# swapped for its mirror -- unless the user named one -- for this install's uv.
+function Use-PackageMirrors {
+    if (-not (Test-MirrorsAllowed)) { return }
+    if (-not (Test-UvIndexChosen) -and -not (Test-Reachable $PypiIndex)) {
+        Write-Warn "pypi.org could not be reached; installing packages from $PypiMirror instead (RAVEN_NO_MIRROR=1 turns this off)."
+        Set-MirrorEnv "UV_DEFAULT_INDEX" $PypiMirror
+    }
+    $pythonChosen = $env:UV_PYTHON_INSTALL_MIRROR -or (Test-UvConfigHas '(?m)^\s*python-install-mirror\s*=')
+    if (-not $pythonChosen -and -not (Test-Reachable $PythonDownloads)) {
+        Write-Warn "releases.astral.sh could not be reached; fetching any Python uv needs from $PythonMirror instead (RAVEN_NO_MIRROR=1 turns this off)."
+        Set-MirrorEnv "UV_PYTHON_INSTALL_MIRROR" $PythonMirror
+    }
+}
+
 function Install-Raven([string]$UvPath, [string]$NodePath) {
+    Use-PackageMirrors
     # $PSScriptRoot is set only when this script runs as a file. Piped through
     # `irm ... | iex` it is empty, and falling back to the current directory
     # turns a one-line install started from inside a clone into a silent
@@ -598,11 +806,25 @@ function Install-Browser([string]$UvPath) {
     }
     Write-Info "Downloading chromium for the browser tool..."
     try {
-        & $py -m playwright install chromium
-        if ($LASTEXITCODE -ne 0) { throw "playwright install chromium exited $LASTEXITCODE" }
+        if (-not (Install-Chromium $py)) { throw "playwright install chromium exited $LASTEXITCODE" }
     } catch {
         Write-Warn "Chromium download failed; the browser tool stays off. Retry later with: $py -m playwright install chromium"
     }
+}
+
+# Playwright tries its own hosts in turn and reports only that none of them
+# delivered, so the mirror gets one retry after the whole download failed --
+# unless the user named a download host. True when chromium is in place.
+function Install-Chromium([string]$Py) {
+    & $Py -m playwright install chromium
+    if ($LASTEXITCODE -eq 0) { return $true }
+    if (-not (Test-MirrorsAllowed) -or $env:PLAYWRIGHT_DOWNLOAD_HOST -or $env:PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST) {
+        return $false
+    }
+    Write-Warn "Chromium could not be downloaded; trying $PlaywrightMirror instead (RAVEN_NO_MIRROR=1 turns this off)."
+    Set-MirrorEnv "PLAYWRIGHT_DOWNLOAD_HOST" $PlaywrightMirror
+    & $Py -m playwright install chromium
+    return ($LASTEXITCODE -eq 0)
 }
 
 function Install-Office {
@@ -690,12 +912,19 @@ function Start-Web([string]$UvPath) {
 }
 
 function Main {
-    $uv = Ensure-Uv
-    $node = Ensure-Node
-    Install-Raven $uv $node
+    try {
+        $uv = Ensure-Uv
+        $node = Ensure-Node
+        Install-Raven $uv $node
 
-    if (-not $env:RAVEN_MINIMAL) { Install-Browser $uv }
-    if (-not $env:RAVEN_MINIMAL) { Install-Office }
+        if (-not $env:RAVEN_MINIMAL) { Install-Browser $uv }
+        if (-not $env:RAVEN_MINIMAL) { Install-Office }
+    } finally {
+        # A mirror served this install's downloads only. The page and the
+        # session the reader comes back to start with their own environment;
+        # the runtime falls back for itself.
+        Restore-MirrorEnv
+    }
 
     # Before the page, not after: the page holds this session until Ctrl-C, and
     # `raven` has to work in the session the reader comes back to.
