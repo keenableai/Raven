@@ -421,11 +421,11 @@ def _stored_revision(record: dict[str, Any]) -> tuple[str, int, str | None] | No
     log_id = record.get("log_id")
     generation = record.get("log_generation")
     try:
-        SessionRevision(log_id, generation)
+        revision = SessionRevision(log_id, generation)
     except ValueError:
         return None
     started = record.get("log_started_at")
-    return log_id, generation, started if isinstance(started, str) and started else None
+    return revision.log_id, revision.generation, started if isinstance(started, str) and started else None
 
 
 def _started(value: str | None) -> datetime:
