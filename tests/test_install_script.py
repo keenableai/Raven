@@ -1762,8 +1762,11 @@ def _run_uv_step(tmp_path: Path, served: dict[str, Path], *, env: dict[str, str]
     _fake_curl(bin_dir, served, down=("https://astral.sh/",), log=log)
     _fake_unzip(bin_dir)
     harness = tmp_path / "uv-step.sh"
+    # uv counts only where this step puts it: a uv the machine already has
+    # (/usr/bin/uv, say) would end the step before any of it ran.
+    have = 'have() { case "$1" in uv) [ -x "$HOME/.local/bin/uv" ] ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }\n'
     harness.write_text(
-        _SH_PREAMBLE + _have() + _sh_functions(_UV_STEP, ("PYPI_MIRROR",)) + "ensure_uv\n", encoding="utf-8"
+        _SH_PREAMBLE + have + _sh_functions(_UV_STEP, ("PYPI_MIRROR",)) + "ensure_uv\n", encoding="utf-8"
     )
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
