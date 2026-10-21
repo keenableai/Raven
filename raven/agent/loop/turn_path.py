@@ -104,7 +104,7 @@ from raven.providers import usage_record
 from raven.providers.base import bound_llm_detail, canonical_llm_error, llm_error_summary, parse_llm_error
 from raven.providers.first_byte import first_byte_budget
 from raven.providers.tool_calls import openai_tool_call
-from raven.session.refs import TOOL_RESULT_TRUNCATION_MARKER
+from raven.session.refs import TOOL_RESULT_TRUNCATION_MARKER, tool_result_view
 from raven.spine.events import bound_failure_text
 from raven.spine.turn import AnswerlessTurnError
 from raven.token_wise import usage_context
@@ -185,9 +185,10 @@ def _first_turns_within(messages: list[dict[str, Any]], budget: int) -> tuple[li
     The path this step replaces bounded its input by a token budget; without
     one a declined annotation is retried next turn with the tail one turn
     longer, so a tail that was refused for its size is refused larger every
-    time and the log stops being written for that session. A tool result is
-    kept at up to 16k characters, so a handful of tool-heavy turns reaches
-    that point.
+    time and the log stops being written for that session. A tool result
+    reaches the annotator as at most a 16k-character view
+    (``tool_result_view``), and is counted here as that view, so a handful of
+    tool-heavy turns reaches that point.
 
     Cuts only where a turn ends -- the next ``role == "user"`` -- so the
     annotator still sees whole exchanges. A first turn that alone exceeds the
@@ -206,7 +207,10 @@ def _first_turns_within(messages: list[dict[str, Any]], budget: int) -> tuple[li
             if spent > budget:
                 return (messages[:cut], False) if cut else (messages[:i], True)
             cut = i
-        spent += estimate_message_tokens(m)
+        if m.get("role") == "tool" and isinstance(m.get("content"), str):
+            spent += estimate_message_tokens({**m, "content": tool_result_view(m["content"])})
+        else:
+            spent += estimate_message_tokens(m)
     if spent <= budget:
         return messages, False
     return (messages[:cut], False) if cut else (messages, True)

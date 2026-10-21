@@ -26,15 +26,14 @@ Learning is per process and per wire model id -- it is a cache of an
 observation, not state anyone persists.
 
 Shared across sessions, and never decayed within the process, on purpose. What
-a refusal teaches is a property of the model's wire, not of the conversation
-that hit it: either the provider validates ``prompt + max_tokens`` against the
-window, or the local estimate under-counts that model's tokenizer; both hold
-for every session on that wire id. A per-session value would make every new
-session pay the same refusal again, and decaying it would schedule the next
-one. The cost is bounded: a refusal of a request already narrowed to the room
-beside its prompt moves the value by one step, any other to at most the
-model's output ceiling or the room it left plus a step, never past half the
-window; a restart clears it.
+a refusal teaches is mostly a property of the model's wire, not of the
+conversation that hit it: either the provider validates ``prompt + max_tokens``
+against the window, or the local estimate under-counts that model's tokenizer.
+A per-session value would make every new session pay the same refusal again,
+and decaying it would schedule the next one. The cost is bounded: a refusal of a request already narrowed to the room
+beside its prompt moves the value by one step; any other moves it to the larger
+of one step more and the model's output ceiling (or the room the request left
+plus a step); never past half the window; a restart clears it.
 
 Precedent for learning from one refusal rather than guessing statically:
 ``providers.prompt_cache.suppress`` and the loop's vision / image-in-tool-result
