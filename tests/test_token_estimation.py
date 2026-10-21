@@ -498,15 +498,15 @@ def test_ordinary_text_counts_exactly_as_one_encode() -> None:
     assert tokens.estimate_message_tokens({"role": "tool", "content": text}) == len(enc.encode(text))
 
 
-@pytest.mark.parametrize("run", ["=", "A", "0"])
+@pytest.mark.parametrize("run", ["=", "A", "0", " ", "\n", "\t"])
 def test_a_long_unbroken_run_never_reaches_the_encoder_whole(monkeypatch, run) -> None:
-    """tiktoken is quadratic in one piece's length; a 120K run held the loop for seconds."""
+    """tiktoken is quadratic in one piece's length; a 200K run held the loop for about twenty seconds."""
     real = tokens.tiktoken.get_encoding(tokens._ENCODING_NAME)
     longest: list[int] = []
 
     class Measured:
         def encode(self, text):
-            longest.append(max((len(m) for m in text.split()), default=0))
+            longest.append(max((len(m.group()) for m in tokens._RUN.finditer(text)), default=0))
             return real.encode(text)
 
     monkeypatch.setattr(tokens.tiktoken, "get_encoding", lambda _name: Measured())
@@ -518,3 +518,32 @@ def test_a_long_unbroken_run_never_reaches_the_encoder_whole(monkeypatch, run) -
 
     assert max(longest) <= tokens._RUN_SLICE
     assert estimate > 0 and prompt > 0
+
+
+@pytest.mark.parametrize("length", [1_000, 1_001, 1_500, 2_001, 3_000])
+def test_text_after_a_sliced_run_is_counted_once(length) -> None:
+    enc = tokens.tiktoken.get_encoding(tokens._ENCODING_NAME)
+    run = "A" * length
+    tail = " word" * 400
+    slices = -(-length // tokens._RUN_SLICE)
+    by_parts = sum(len(enc.encode(run[i : i + tokens._RUN_SLICE])) for i in range(0, length, tokens._RUN_SLICE))
+
+    assert tokens._encoded_len(enc, run + tail) == by_parts + len(enc.encode(tail))
+    assert abs(tokens._encoded_len(enc, run + tail) - len(enc.encode(run + tail))) <= 2 * slices
+
+
+def test_a_reused_count_with_long_runs_matches_a_fresh_one() -> None:
+    """The whole-payload and fragment paths of the trim cache must agree on sliced runs."""
+    rng = random.Random(11)
+    for _ in range(40):
+
+        def message() -> dict:
+            body = rng.choice(["=", "A", " ", "\n"]) * rng.randint(900, 3_500) + " tail " * rng.randint(0, 30)
+            return {"role": "tool", "content": body}
+
+        a = [message() for _ in range(4)]
+        b = [*a[: rng.randint(1, 4)], message()]
+        with tokens.reuse_prompt_tokenization():
+            tokens.estimate_prompt_tokens(a)
+            reused = tokens.estimate_prompt_tokens(b)
+        assert reused == tokens.estimate_prompt_tokens(b)

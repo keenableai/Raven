@@ -22,15 +22,16 @@ _ENCODING_NAME = "cl100k_base"
 _TOKEN_BOUNDARY = re.compile(r"(?<=[\r\n])(?=\S)")
 
 # tiktoken's merge loop is quadratic in the length of one regex piece, and an
-# unbroken run of one character (padding, a row of ``=``, base64 of zeros) is
-# one piece: 120,000 of them hold the event loop for seconds. A run longer than
-# this is counted in slices of it, which over-counts by at most a token a slice.
+# unbroken run of one character (padding, a row of ``=``, base64 of zeros, a
+# page of blank lines) is one piece: 200,000 of them hold the event loop for
+# about twenty seconds. A run of space or non-space longer than this is counted
+# in slices of it, which over-counts by a token or two a slice.
 _RUN_SLICE = 1_000
-_RUN = re.compile(r"\S+")
+_RUN = re.compile(r"\S+|\s+")
 
 
 def _encoded_len(encoding: tiktoken.Encoding, text: str) -> int:
-    """``len(encoding.encode(text))``, with any run of non-space past ``_RUN_SLICE`` counted in slices."""
+    """``len(encoding.encode(text))``, with any run past ``_RUN_SLICE`` counted in slices."""
     if len(text) <= _RUN_SLICE:
         return len(encoding.encode(text))
     long_runs = [m for m in _RUN.finditer(text) if m.end() - m.start() > _RUN_SLICE]
@@ -41,7 +42,9 @@ def _encoded_len(encoding: tiktoken.Encoding, text: str) -> int:
     for m in long_runs:
         if m.start() > pos:
             total += len(encoding.encode(text[pos : m.start()]))
-        total += sum(len(encoding.encode(text[i : i + _RUN_SLICE])) for i in range(m.start(), m.end(), _RUN_SLICE))
+        total += sum(
+            len(encoding.encode(text[i : min(i + _RUN_SLICE, m.end())])) for i in range(m.start(), m.end(), _RUN_SLICE)
+        )
         pos = m.end()
     if pos < len(text):
         total += len(encoding.encode(text[pos:]))
