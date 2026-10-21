@@ -43,6 +43,22 @@ cd Raven
 也会安装已发布的 wheel 包。如需在管道安装时指定本地源码目录，请设置
 `RAVEN_LOCAL_SRC=<dir>`。
 
+### 下载源连不上时 { #when-a-download-host-cannot-be-reached }
+
+安装脚本、`raven resources`、`raven upgrade`，以及 Raven 通过 `npx` 或 `uvx` 启动的
+智能体和 MCP 服务，都会先从默认地址下载。默认地址完全连不上时，改从中国大陆的镜像下载：
+Hugging Face 用 hf-mirror.com，GitHub 上的文件用 jsDelivr，PyPI 和 LibreOffice 用清华
+TUNA 镜像，Node.js、npm、Playwright 以及 uv 安装的 Python 用 npmmirror。能判断失败原因
+的下载，在默认地址返回 HTTP 错误或证书校验失败时都不会切换。uv 自带的安装脚本和
+Playwright 下载 Chromium 时说不清失败原因，所以无论因为什么失败都会再从镜像重试一次；
+LibreOffice 和字体文件有固定的摘要校验，默认地址都失败后会改从镜像下载。
+
+你自己配置的镜像会保留：`HF_ENDPOINT`，写在 `UV_DEFAULT_INDEX` 或 `uv.toml` 里的 uv
+索引，以及 npm 能读到的任何一处 registry 设置。`npx` 和 `uvx` 只在镜像连得上时才切换，
+所以缓存里已有的包离线时照样能启动；这样通过 `npx` 启动的智能体，自己运行的 npm 命令也会
+沿用 npm 镜像。设置 `RAVEN_NO_MIRROR=1` 可让所有下载都只使用默认地址。Raven 自己的发布
+文件来自 GitHub Releases，没有镜像。
+
 ## 更新 Raven { #update-raven }
 
 按安装时的方式更新 Raven。再次运行安装脚本时，它会先停止正在运行的 WebUI，

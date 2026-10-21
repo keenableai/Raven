@@ -46,6 +46,28 @@ from that checkout. Piping the installer to a shell installs the published
 wheel, even from inside a clone. To select a local source directory for a piped
 installation, set `RAVEN_LOCAL_SRC=<dir>`.
 
+### When a download host cannot be reached
+
+The installers, `raven resources`, `raven upgrade`, and the agents and MCP
+servers Raven starts through `npx` or `uvx` fetch from their usual hosts first.
+When a host cannot be reached at all, the download comes from a mirror in
+mainland China instead: hf-mirror.com for Hugging Face, jsDelivr for files on
+GitHub, the TUNA mirror for PyPI and LibreOffice, and npmmirror for Node.js,
+npm, Playwright and the Python builds uv installs. Where a download can tell
+why it failed, an HTTP error from the usual host does not switch hosts, and
+neither does a certificate that fails verification. uv's own installer and
+Playwright's Chromium download do not say why, so each is retried from its
+mirror after any failure, and the LibreOffice and font downloads, checked
+against a pinned digest, try the mirror after their usual hosts.
+
+A mirror you configured yourself is kept: `HF_ENDPOINT`, a uv index in
+`UV_DEFAULT_INDEX` or `uv.toml`, or an npm registry set anywhere npm reads one.
+An `npx` or `uvx` launch switches only when the mirror can be reached, so a
+package already in its cache still starts offline, and an agent started
+through `npx` this way keeps the npm mirror for the npm commands it runs
+itself. Set `RAVEN_NO_MIRROR=1` to keep every download on its usual host.
+Raven's own release files come from GitHub Releases, which has no mirror.
+
 ## Update Raven
 
 Update Raven the same way you installed it. Running an installer again stops
