@@ -3,7 +3,6 @@
 import copy
 import json
 import os
-import re
 import uuid
 import weakref
 from collections import OrderedDict
@@ -421,9 +420,9 @@ def _stored_revision(record: dict[str, Any]) -> tuple[str, int, str | None] | No
     """The (log_id, log_generation, log_started_at) a metadata record holds; None when it holds no valid one."""
     log_id = record.get("log_id")
     generation = record.get("log_generation")
-    if not isinstance(log_id, str) or re.fullmatch(r"[0-9a-f]{32}", log_id) is None:
-        return None
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+    try:
+        SessionRevision(log_id, generation)
+    except ValueError:
         return None
     started = record.get("log_started_at")
     return log_id, generation, started if isinstance(started, str) and started else None

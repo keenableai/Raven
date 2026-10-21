@@ -699,3 +699,52 @@ def test_invalid_revision_values_are_rejected(kwargs: dict) -> None:
     values = {"log_id": "a" * 32, "generation": 0} | kwargs
     with pytest.raises(ValueError):
         SessionRevision(**values)
+
+
+async def test_a_turn_hands_the_history_strategy_the_sessions_revision(tmp_path: Path, monkeypatch) -> None:
+    """One writer fills ``TurnContext.session_revision`` (the loop) and one copies
+    it into ``AssemblyContext`` (the assembler). Without it the default strategy
+    takes its unscoped branch every turn -- trim only, no prune, fold or refs --
+    and nothing else would notice."""
+    from raven.agent.loop import AgentLoop
+    from raven.agent.loop.bundles import ToolWiring, TurnPolicy
+    from raven.context_engine.history.compacting import CompactingHistoryBuilder
+    from raven.providers.base import LLMProvider, LLMResponse
+    from raven.spine.message import ChatType, Source
+    from raven.spine.turn import Origin, TurnRequest
+
+    class _Stub(LLMProvider):
+        def get_default_model(self) -> str:
+            return "stub"
+
+        async def chat(self, *args, **kwargs):
+            return LLMResponse(content="ok", finish_reason="stop")
+
+    seen: list[SessionRevision | None] = []
+    original = CompactingHistoryBuilder.build
+
+    async def recording_build(self, ctx):
+        seen.append(ctx.session_revision)
+        return await original(self, ctx)
+
+    monkeypatch.setattr(CompactingHistoryBuilder, "build", recording_build)
+    loop = AgentLoop(
+        provider=_Stub(api_key="test"),
+        workspace=tmp_path,
+        model="stub",
+        policy=TurnPolicy(max_iterations=2),
+        tools=ToolWiring(restrict_to_workspace=True),
+    )
+
+    await loop._process_message(
+        TurnRequest(
+            origin=Origin.USER,
+            source=Source(channel="test", chat_id="c1", sender_id="user", chat_type=ChatType.DM),
+            text="hello",
+        ),
+        session_key="s1",
+    )
+
+    assert seen, "the default strategy's builder never ran"
+    assert seen[0] is not None
+    assert seen[0] == loop.sessions.get_or_create("s1").revision
