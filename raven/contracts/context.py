@@ -47,25 +47,21 @@ if TYPE_CHECKING:
 class SessionRevision:
     """Identity and high-water mark of one append-only session-log view.
 
-    ``log_id`` changes when a new logical log is started (``/new``),
+    ``log_id`` changes when a new logical log is started (``/new``), and
     ``generation`` changes before an operation can hand an existing ordinal to
-    a different message (an undo), and ``message_count`` is how much of that
-    generation the reader observed. A ref into the log carries ``scope``, so a
+    a different message (an undo). A ref into the log carries ``scope``, so a
     ref minted before either change names a scope that no longer exists -- a
     miss rather than a wrong answer.
     """
 
     log_id: str
     generation: int
-    message_count: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.log_id, str) or re.fullmatch(r"[0-9a-f]{32}", self.log_id) is None:
             raise ValueError("log_id must be a lowercase UUID hex string")
         if not isinstance(self.generation, int) or isinstance(self.generation, bool) or self.generation < 0:
             raise ValueError("generation must be non-negative")
-        if not isinstance(self.message_count, int) or isinstance(self.message_count, bool) or self.message_count < 0:
-            raise ValueError("message_count must be non-negative")
 
     @property
     def scope(self) -> str:
@@ -75,16 +71,15 @@ class SessionRevision:
 
 @dataclass(frozen=True)
 class OverflowOutcome:
-    """What an engine did with a prompt the provider refused as too long.
+    """What an engine reclaimed from a prompt the provider refused as too long.
 
-    ``advanced`` is the whole discipline: ``False`` means nothing was
-    reclaimed, and the caller must not re-send a prompt of the same size on
-    the strength of it.
+    Returned only when something was reclaimed: an engine with nothing to give
+    back returns ``None`` from ``on_context_overflow`` instead, so the caller
+    never re-sends a prompt of the same size on the strength of an outcome.
     """
 
     messages: list[dict[str, Any]]
     reclaimed_tokens: int
-    advanced: bool
 
 
 @dataclass(frozen=True)
@@ -227,17 +222,6 @@ class ContextEngine(ABC):
         messages out-of-band)."""
 
     @property
-    def wants_full_history(self) -> bool:
-        """If True, the Memory role hands over ``session.messages`` -- the whole
-        append-only log -- instead of the post-consolidation slice.
-
-        Defaults to ``owns_compaction``, which is how the question was answered
-        before this property existed: an engine that archives for itself was
-        handed the whole log, and one written against that rule keeps it.
-        """
-        return self.owns_compaction
-
-    @property
     def mints_source_refs(self) -> bool:
         """If True, this engine puts ``[[ref ...]]`` tags where the model can
         read them, and the loop registers ``context_retrieve`` so they can be
@@ -274,7 +258,7 @@ class ContextEngine(ABC):
         ``session_messages`` is what the engine should consider as candidate
         history. Whether it's ``session.messages`` (full append-only log) or
         ``session.get_history()`` (post-consolidation slice) is decided by
-        the Memory role based on :attr:`wants_full_history`.
+        the Memory role based on :attr:`owns_compaction`.
         """
 
     async def after_turn(

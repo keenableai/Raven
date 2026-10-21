@@ -224,7 +224,6 @@ def build_context_engine(
         now_fn=now_fn,
         get_tool_notices=get_tool_notices,
         scent=scent,
-        wants_full_history=strategy.wants_full_history,
         owns_compaction=strategy.owns_compaction,
         mints_source_refs=strategy.mints_source_refs,
         turn_scratch=getattr(getattr(config, "cache", None), "turn_scratch", True),

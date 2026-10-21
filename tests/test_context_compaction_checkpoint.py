@@ -303,7 +303,7 @@ def _builder(
 
 
 def _revision(session: list[dict], *, log_id: str = LOG_ID) -> SessionRevision:
-    return SessionRevision(log_id=log_id, generation=0, message_count=len(session))
+    return SessionRevision(log_id=log_id, generation=0)
 
 
 def _ctx(
@@ -892,7 +892,7 @@ class TestTheChain:
         headroom.learn_from_overflow("stub", window=WINDOW, prompt_tokens=estimate_prompt_tokens(messages), step=8_192)
         outcome = await builder.on_context_overflow("s1", messages, attempt=1, window=WINDOW)
 
-        assert outcome is not None and outcome.advanced is True
+        assert outcome is not None
         assert len(outcome.messages) < len(messages)
         assert any(message.get("content") == standing for message in outcome.messages)
 

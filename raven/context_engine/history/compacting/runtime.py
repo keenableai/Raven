@@ -49,7 +49,7 @@ assembled prompt, where no position is a session ordinal, so nothing minted
 from one would point anywhere, and counting it would decay the head of a
 history that was never compacted.
 
-The strategy needs the whole append-only log (``wants_full_history``) and puts
+The strategy needs the whole append-only log (``owns_compaction``) and puts
 refs where the model can read them (``mints_source_refs``); the engine that
 hosts it has to answer both with ``True``.
 """
@@ -490,7 +490,7 @@ class CompactingHistoryBuilder:
             attempt,
             window,
         )
-        return OverflowOutcome(messages=reclaimed_messages, reclaimed_tokens=reclaimed, advanced=True)
+        return OverflowOutcome(messages=reclaimed_messages, reclaimed_tokens=reclaimed)
 
     # ------------------------------------------------------------------
 

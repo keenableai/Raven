@@ -1242,8 +1242,8 @@ the only importer of a strategy and refuses an unknown name at startup.
 `compacting` (default) hands history over verbatim until the window nears its
 trigger, then prunes large tool results to a one-line record and a Source Ref,
 drops whole groups behind a fold, and past that writes a History Checkpoint;
-`curator` is the Curator. Each registry entry declares `wants_full_history`,
-`owns_compaction` and `mints_source_refs`, which the host reads before any turn.
+`curator` is the Curator. Each registry entry declares `owns_compaction` and
+`mints_source_refs`, which the host reads before any turn.
 _Avoid_: calling it an engine; it is one builder inside the one engine.
 
 **History Checkpoint** (`context_engine/history/compacting/checkpoint.py`):
@@ -1267,11 +1267,12 @@ only beside a strategy that mints refs.
 _Avoid_: treating a ref as a citation the model may paraphrase; it is an address.
 
 **Session Revision** (`contracts/context.py`):
-The identity of one append-only view of a session log: `log_id` (new on `/new`),
-`generation` (bumped by an undo or by a save that had to re-read another
-writer's log) and `message_count`. Saves merge it across processes, taking the
-most recent clear's id and the larger generation, so a ref minted before an undo
-or a `/new` misses instead of naming a different message.
+The identity of one append-only view of a session log: `log_id` (new on `/new`)
+and `generation` (bumped by an undo, or by a save that finds another writer
+changed messages this copy had already filed; another writer that only appended
+leaves it alone). Saves merge it across processes, taking the most recent
+clear's id and the larger generation, so a ref minted before an undo or a `/new`
+misses instead of naming a different message.
 
 **Turn Scratch** (`context_engine/scratch.py`):
 The tagged block appended to the end of the turn's user message carrying the

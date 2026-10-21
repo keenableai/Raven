@@ -161,7 +161,7 @@ def _builder(
 
 
 def _revision(session: list[dict], *, log_id: str = LOG_ID, generation: int = 0) -> SessionRevision:
-    return SessionRevision(log_id=log_id, generation=generation, message_count=len(session))
+    return SessionRevision(log_id=log_id, generation=generation)
 
 
 def _ctx(
@@ -622,7 +622,7 @@ class TestReusedToolCallIds:
 
         outcome = await builder.on_context_overflow("s1", messages, attempt=1, window=WINDOW)
 
-        assert outcome is not None and outcome.advanced
+        assert outcome is not None
         assert HistoryTrimmer.structural_errors(outcome.messages) == []
 
 
@@ -655,7 +655,7 @@ class TestOverflow:
         outcome = await builder.on_context_overflow("s1", messages, attempt=1, window=WINDOW)
 
         assert outcome is not None
-        assert outcome.advanced is True
+        assert outcome is not None
         assert outcome.reclaimed_tokens > 0
         assert len(outcome.messages) < len(messages)
         assert estimate_prompt_tokens(outcome.messages) < estimate_prompt_tokens(messages)
@@ -694,7 +694,7 @@ class TestOverflow:
         session = _session(60)
         messages = await self._refused(builder, session)
         outcome = await builder.on_context_overflow("s1", messages, attempt=1, window=WINDOW)
-        assert outcome is not None and outcome.advanced
+        assert outcome is not None
 
         segment = await builder.build(_ctx(session))
 
@@ -735,7 +735,7 @@ class TestOverflow:
             )
             outcome = await builder.on_context_overflow("s1", messages, attempt=1, window=WINDOW)
 
-            assert outcome is not None and outcome.advanced is True
+            assert outcome is not None
             assert len(outcome.messages) < len(messages)
             assert any(m.get("content") == standing["content"] for m in outcome.messages)
 
@@ -990,7 +990,7 @@ class TestCostAndShape:
 
         outcome = await builder.on_context_overflow("s1", messages, attempt=1, window=WINDOW)
 
-        assert outcome is not None and outcome.advanced
+        assert outcome is not None
         for message in outcome.messages[1:]:
             seq = message["_turn_log_seq"]
             assert message == history[seq]
@@ -1049,9 +1049,7 @@ class TestGenerationsOfOneLog:
         )
 
         assert self._names(store) == before
-        reloaded = store.load(
-            "tui:k", SessionRevision(log_id=self.LOG, generation=1, message_count=41), message_count=41
-        )
+        reloaded = store.load("tui:k", SessionRevision(log_id=self.LOG, generation=1), message_count=41)
         assert reloaded.checkpoint is not None and reloaded.checkpoint.checkpoint_id == "aaaa"
         assert reloaded.pruned == frozenset({3, 4})
 
@@ -1062,7 +1060,7 @@ class TestGenerationsOfOneLog:
         store.write(_store_checkpoint("aaaa", f"{self.LOG}@1"))
         store.save("tui:k", CompactingState(scope=f"{self.LOG}@1", message_count=40, generation=1))
 
-        loaded = store.load("tui:k", SessionRevision(log_id=self.LOG, generation=0, message_count=45), message_count=45)
+        loaded = store.load("tui:k", SessionRevision(log_id=self.LOG, generation=0), message_count=45)
         assert loaded.lagging is True
         assert (loaded.checkpoint, loaded.pruned) == (None, frozenset())
 
@@ -1072,7 +1070,7 @@ class TestGenerationsOfOneLog:
         store = CheckpointStore(tmp_path)
         store.write(_store_checkpoint("aaaa", f"{self.LOG}@2"))
 
-        loaded = store.load("tui:k", SessionRevision(log_id=self.LOG, generation=1, message_count=45), message_count=45)
+        loaded = store.load("tui:k", SessionRevision(log_id=self.LOG, generation=1), message_count=45)
         assert loaded.lagging is True
 
     def test_a_newer_generation_is_never_deleted_by_an_older_one(self, tmp_path: Path) -> None:

@@ -28,7 +28,7 @@ from raven.context_engine.history_trimmer import HistoryTrimmer
 from raven.contracts.context import SessionRevision
 from raven.utils.refs import SourceRef
 
-REVISION = SessionRevision(log_id="1a2b3c4d" * 4, generation=0, message_count=0)
+REVISION = SessionRevision(log_id="1a2b3c4d" * 4, generation=0)
 SCOPE = REVISION.scope
 BIG = "stack trace line\n" * 3_000
 
@@ -126,7 +126,7 @@ class TestTheReplacement:
     def test_the_ref_is_the_half_that_survives_a_clip(self) -> None:
         """With a long enough scope the record has to give way to the ref: a
         clipped ref resolves to nothing, and then the body really is gone."""
-        long_scope = SessionRevision(log_id="f" * 32, generation=10**95, message_count=0)
+        long_scope = SessionRevision(log_id="f" * 32, generation=10**95)
         out = ToolResultPruner(ContextPruneConfig(keep_recent_pairs=0)).run(
             _session(("c1", "exec", BIG)),
             revision=long_scope,

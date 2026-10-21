@@ -3,8 +3,8 @@
 ``context.history.strategy`` names one of these. This module is the only place
 that knows which strategies exist and the only place that imports one, so the
 boundary is mechanical rather than a convention: the assembler and the Memory
-role read the three capabilities a :class:`HistoryStrategy` declares and never
-the strategy's name.
+role read the capabilities a :class:`HistoryStrategy` declares and never the
+strategy's name.
 
 Every ``build`` imports its strategy inside the function body. That is not
 tidiness: constructing the Curator's builder creates its archive directories on
@@ -26,14 +26,13 @@ class HistoryStrategy:
     """One registered strategy: how to build its builder, and what the host must know.
 
     The flags are declared here rather than read off a built builder, because
-    the host acts on them before any turn runs -- which view of the session to
-    hand over, whether to keep the lossy consolidator out of the loop, and
-    whether the turn needs the tool that reads a ref back.
+    the host acts on them before any turn runs -- whether to hand over the whole
+    log and keep the lossy consolidator out of the loop, and whether the turn
+    needs the tool that reads a ref back.
     """
 
     name: str
     build: Callable[..., "SegmentBuilder"]
-    wants_full_history: bool
     owns_compaction: bool
     mints_source_refs: bool = False
 
@@ -94,15 +93,14 @@ def _build_compacting(**kwargs: Any) -> "SegmentBuilder":
     )
 
 
-# It takes the full log because it budgets history itself, and it
-# owns compaction in the strong sense: the loop must keep MemoryConsolidator out
+# It owns compaction in the strong sense -- it takes the full log because it
+# budgets history itself: the loop must keep MemoryConsolidator out
 # of the way, since a lossy pass that advances ``last_consolidated`` would remove
 # the very messages this strategy is deciding about.
 register(
     HistoryStrategy(
         "compacting",
         build=_build_compacting,
-        wants_full_history=True,
         owns_compaction=True,
         mints_source_refs=True,
     )
@@ -113,7 +111,6 @@ register(
     HistoryStrategy(
         "curator",
         build=_build_curator,
-        wants_full_history=True,
         owns_compaction=True,
     )
 )

@@ -143,7 +143,7 @@ async def test_a_refusal_is_learned_and_the_strategys_reclaim_is_retried(workspa
 
     async def reclaim(key, messages, *, attempt, window):
         asked.append((key, attempt))
-        return OverflowOutcome(messages=[messages[0], messages[-1]], reclaimed_tokens=100, advanced=True)
+        return OverflowOutcome(messages=[messages[0], messages[-1]], reclaimed_tokens=100)
 
     monkeypatch.setattr(agent.context_engine, "on_context_overflow", reclaim)
     initial = [*_prompt(10)[:1], {"role": "user", "content": "old"}, {"role": "assistant", "content": "old answer"}]

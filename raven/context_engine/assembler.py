@@ -97,15 +97,13 @@ class ContextAssembler(ContextEngine):
         get_tool_notices: Callable[[], list[str]] | None = None,
         scent: "ScentMenu | None" = None,
         *,
-        wants_full_history: bool = True,
         owns_compaction: bool = True,
         mints_source_refs: bool = False,
         turn_scratch: bool = True,
     ) -> None:
-        # The three are the history strategy's, declared in its registry entry;
+        # The two are the history strategy's, declared in its registry entry;
         # the defaults are the Curator's, which is what an assembler built
         # without a registry entry (a test, an embedder) has always meant.
-        self._wants_full_history = wants_full_history
         self._owns_compaction = owns_compaction
         self._mints_source_refs = mints_source_refs
         self._scent = scent
@@ -122,10 +120,6 @@ class ContextAssembler(ContextEngine):
     @property
     def name(self) -> str:
         return "context_assembler"
-
-    @property
-    def wants_full_history(self) -> bool:
-        return self._wants_full_history
 
     @property
     def owns_compaction(self) -> bool:

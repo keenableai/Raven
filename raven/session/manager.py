@@ -314,7 +314,7 @@ class Session:
     @property
     def revision(self) -> SessionRevision:
         """Identity and high-water mark of this log view, the scope refs into it carry."""
-        return SessionRevision(log_id=self.log_id, generation=self.log_generation, message_count=len(self.messages))
+        return SessionRevision(log_id=self.log_id, generation=self.log_generation)
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input, aligned to a user turn."""

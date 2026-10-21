@@ -52,13 +52,9 @@ def _engine(tmp_path: Path, config: ContextConfig) -> ContextAssembler:
 def test_the_registry_names_both_strategies() -> None:
     assert strategies.registered() == ["compacting", "curator"]
     compacting = strategies.resolve("compacting")
-    assert (compacting.wants_full_history, compacting.owns_compaction, compacting.mints_source_refs) == (
-        True,
-        True,
-        True,
-    )
+    assert (compacting.owns_compaction, compacting.mints_source_refs) == (True, True)
     curator = strategies.resolve("curator")
-    assert (curator.wants_full_history, curator.owns_compaction, curator.mints_source_refs) == (True, True, False)
+    assert (curator.owns_compaction, curator.mints_source_refs) == (True, False)
 
 
 def test_a_name_is_read_without_case_or_padding() -> None:
@@ -81,7 +77,7 @@ def test_the_factory_refuses_to_build_on_an_unknown_strategy(tmp_path: Path) -> 
 def test_the_curator_strategy_builds_the_engine_it_always_did(tmp_path: Path) -> None:
     engine = _engine(tmp_path, ContextConfig.model_validate({"history": {"strategy": "curator"}}))
     assert [b.name for b in engine._phase_b] == ["curator"]
-    assert engine.wants_full_history and engine.owns_compaction
+    assert engine.owns_compaction
     assert not engine.mints_source_refs
 
 
@@ -177,11 +173,11 @@ class _Hooked:
 async def test_the_first_history_builder_with_an_answer_decides_an_overflow() -> None:
     from raven.contracts.context import OverflowOutcome
 
-    answer = OverflowOutcome(messages=[], reclaimed_tokens=10, advanced=True)
+    answer = OverflowOutcome(messages=[], reclaimed_tokens=10)
     broken = _Hooked("broken", None, raises=True)
     silent = _Hooked("silent", None)
     first = _Hooked("first", answer)
-    later = _Hooked("later", OverflowOutcome(messages=[], reclaimed_tokens=1, advanced=True))
+    later = _Hooked("later", OverflowOutcome(messages=[], reclaimed_tokens=1))
     phase_a = _Hooked("phase_a", answer, needs_prefix=False)
     engine = ContextAssembler([phase_a, broken, silent, first, later], list)
 

@@ -62,15 +62,13 @@ async def _retrieve(manager: SessionManager, key: str, ref: str) -> str:
 
 
 class TestLifecycle:
-    def test_append_advances_only_the_high_water_mark(self) -> None:
+    def test_an_append_leaves_the_revision_alone(self) -> None:
         session = Session(key="tui:append")
         before = session.revision
 
         session.add_message("user", "hello")
-        after = session.revision
 
-        assert (after.log_id, after.generation) == (before.log_id, before.generation)
-        assert (before.message_count, after.message_count) == (0, 1)
+        assert session.revision == before
 
     def test_a_new_session_has_a_uuid_log_id(self) -> None:
         session = Session(key="tui:fresh")
@@ -89,7 +87,6 @@ class TestLifecycle:
 
         assert session.revision.log_id == before.log_id
         assert session.revision.generation == before.generation + 1
-        assert session.revision.message_count == before.message_count
 
     def test_an_undo_that_removes_nothing_keeps_the_revision(self) -> None:
         session = Session(key="tui:noop", messages=[{"role": "assistant", "content": "hello"}])
@@ -107,7 +104,6 @@ class TestLifecycle:
 
         assert session.revision.log_id != before.log_id
         assert session.revision.generation == 0
-        assert session.revision.message_count == 0
         assert session.log_started_at is not None
 
 
@@ -697,11 +693,9 @@ def test_a_naive_start_from_an_earlier_write_still_compares() -> None:
         {"log_id": "bad#scope"},
         {"generation": -1},
         {"generation": True},
-        {"message_count": -1},
-        {"message_count": False},
     ],
 )
 def test_invalid_revision_values_are_rejected(kwargs: dict) -> None:
-    values = {"log_id": "a" * 32, "generation": 0, "message_count": 0} | kwargs
+    values = {"log_id": "a" * 32, "generation": 0} | kwargs
     with pytest.raises(ValueError):
         SessionRevision(**values)

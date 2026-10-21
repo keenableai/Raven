@@ -278,22 +278,24 @@ all of them this addition: without it the package stands at 3,632.
 Measured at 3,682.
 
 
-And once more, 3,700 -> 3,840 (2026-10-20), for the compacting history
-strategy on the context paper. Two carriers: ``SessionRevision``, the log id,
-generation and message count a ``[[ref ...]]`` into the session log is scoped
-by, so a ref minted before a ``/new`` or an undo misses instead of naming
-another message; and ``OverflowOutcome``, what an engine reclaimed from a
-prompt the provider refused as too long. ``ContextEngine`` gains two
-capability properties, ``wants_full_history`` (defaulting to
-``owns_compaction``, the rule it replaces) and ``mints_source_refs``, plus
+And once more, 3,700 -> 3,820 (2026-10-20), for the compacting history
+strategy on the context paper. Two carriers: ``SessionRevision``, the log id
+and generation a ``[[ref ...]]`` into the session log is scoped by, so a ref
+minted before a ``/new`` or an undo misses instead of naming another message;
+and ``OverflowOutcome``, what an engine reclaimed from a prompt the provider
+refused as too long (an engine with nothing to give back returns None).
+``ContextEngine`` gains the ``mints_source_refs`` capability property, plus
 ``on_context_overflow`` and ``note_request``, all defaulting to "not mine" so
 every existing engine is unchanged; ``AssemblyContext`` and ``TurnContext``
 each append one ``session_revision`` field. On the harness paper
 ``WindowState`` appends ``session_key``, and the ``shrink`` docstring states
-the copy convention the turn record relies on. 116 lines, all of them this
-addition: the package stood at the old ceiling, 3,700, without it.
+the copy convention the turn record relies on. 100 lines, all of them this
+addition: the package stood at the old ceiling, 3,700, without it. Review
+trimmed the first draft by 16: a message count on the revision, an
+``advanced`` flag on the outcome and a ``wants_full_history`` property that
+nothing read.
 
-Measured at 3,816.
+Measured at 3,800.
 
 """
 
@@ -305,7 +307,7 @@ import sys
 from pathlib import Path
 
 LINE_CEILING = 2_000
-CONTRACTS_LINE_CEILING = 3_840
+CONTRACTS_LINE_CEILING = 3_820
 THIRD_PARTY_ALLOWED = frozenset({"loguru"})
 DEBT_MARKER = re.compile(r"\b(TODO|FIXME|HACK)\b")
 

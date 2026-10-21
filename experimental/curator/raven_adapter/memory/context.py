@@ -64,10 +64,6 @@ class MemoryContext(ContextEngine):
         return self.base.owns_compaction if self.base is not None else True
 
     @property
-    def wants_full_history(self):
-        return self.base.wants_full_history if self.base is not None else True
-
-    @property
     def mints_source_refs(self):
         return self.base.mints_source_refs if self.base is not None else False
 
