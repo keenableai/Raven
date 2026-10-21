@@ -229,11 +229,100 @@ def use_system_ca():
         shutil.rmtree(TRUSTSTORE_COPY, ignore_errors=True)
 
 
+# Where uv fetches from when its default host cannot be reached at all: PyPI's
+# mirror for the packages, and a copy of the Python builds uv downloads when no
+# interpreter on the machine will do. raven.utils.mirrors names the same hosts;
+# this copy exists because the helper cannot import raven.
+PYPI_DEFAULT_INDEX = "https://pypi.org/simple/"
+PYPI_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple"
+PYTHON_DEFAULT_DOWNLOADS = "https://releases.astral.sh/"
+PYTHON_MIRROR = "https://registry.npmmirror.com/-/binary/python-build-standalone"
+MIRROR_PROBE_TIMEOUT_S = 5
+MIRROR_ENV = None
+
+
+def answers(url):
+    # Any HTTP answer, an error included, proves the host is there. Only a
+    # connection that never completed does not: a fault of ours must not move
+    # an install off the host it belongs to. Nor does a certificate that fails
+    # verification, since whatever re-signs this host re-signs the mirror too.
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=MIRROR_PROBE_TIMEOUT_S):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except OSError as exc:
+        return isinstance(exc, ssl.SSLCertVerificationError) or isinstance(
+            getattr(exc, "reason", None), ssl.SSLCertVerificationError
+        )
+    except Exception:
+        return True
+
+
+def uv_configs():
+    # Each uv.toml a user who named none has uv read -- theirs, then the
+    # machine's -- on its own: one file's list of indexes hides no other's.
+    import tomllib
+
+    if os.environ.get("UV_CONFIG_FILE"):
+        paths = [os.environ["UV_CONFIG_FILE"]]
+    elif sys.platform == "win32":
+        paths = [os.path.join(root, "uv", "uv.toml") for root in (os.environ.get("APPDATA"), os.environ.get("PROGRAMDATA")) if root]
+    else:
+        user = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+        system = (os.environ.get("XDG_CONFIG_DIRS") or "/etc/xdg").split(os.pathsep)
+        paths = [os.path.join(root, "uv", "uv.toml") for root in (user, *system, "/etc") if root]
+    configs = []
+    for path in paths:
+        try:
+            with open(path, "rb") as handle:
+                configs.append(tomllib.load(handle))
+        except (OSError, ValueError):
+            continue
+    return configs
+
+
+def names_a_default_index(config):
+    indexes = config.get("index") if isinstance(config.get("index"), list) else []
+    return bool(config.get("index-url")) or any(isinstance(entry, dict) and entry.get("default") for entry in indexes)
+
+
+def mirror_environment():
+    # Decided once per upgrade, since uv may run twice. A host the user chose,
+    # by variable or in uv.toml, is never replaced.
+    global MIRROR_ENV
+    if MIRROR_ENV is not None:
+        return MIRROR_ENV
+    MIRROR_ENV = {}
+    if os.environ.get("RAVEN_NO_MIRROR", "").strip().lower() in ("1", "true", "yes", "on"):
+        return MIRROR_ENV
+    configs = uv_configs()
+    index_chosen = any(os.environ.get(name) for name in ("UV_DEFAULT_INDEX", "UV_INDEX_URL", "UV_INDEX")) or any(
+        names_a_default_index(config) for config in configs
+    )
+    if not index_chosen and not answers(PYPI_DEFAULT_INDEX):
+        print(f"pypi.org could not be reached; installing from {PYPI_MIRROR} instead (RAVEN_NO_MIRROR=1 turns this off).")
+        MIRROR_ENV["UV_DEFAULT_INDEX"] = PYPI_MIRROR
+    python_chosen = os.environ.get("UV_PYTHON_INSTALL_MIRROR") or any(c.get("python-install-mirror") for c in configs)
+    if not python_chosen and not answers(PYTHON_DEFAULT_DOWNLOADS):
+        print(
+            f"releases.astral.sh could not be reached; fetching any Python uv needs from {PYTHON_MIRROR} instead"
+            " (RAVEN_NO_MIRROR=1 turns this off)."
+        )
+        MIRROR_ENV["UV_PYTHON_INSTALL_MIRROR"] = PYTHON_MIRROR
+    return MIRROR_ENV
+
+
 def uv_environment(uv_path):
     # uv keeps its own bundled roots unless told otherwise. It is told when the
     # system store was handed over, and only uv is: the Raven relaunched after
-    # the install inherits this helper's own environment.
-    env = dict(os.environ)
+    # the install inherits this helper's own environment. A mirror reaches uv
+    # the same way, and only uv.
+    env = {**os.environ, **mirror_environment()}
     if TRUSTSTORE_COPY:
         env.setdefault("UV_SYSTEM_CERTS", "1")
         # The name uv read before 0.11. Later releases still honour it but call
