@@ -52,8 +52,15 @@ $PythonMirror = "https://registry.npmmirror.com/-/binary/python-build-standalone
 $NpmRegistry = "https://registry.npmjs.org/"
 $NpmMirror = "https://registry.npmmirror.com"
 $PlaywrightMirror = "https://cdn.npmmirror.com/binaries/playwright"
-# uv's own installer, run the way uv documents it (see Ensure-Uv).
-$UvInstallCommand = "irm https://astral.sh/uv/install.ps1 | iex"
+# uv's installer, the PowerShell uv documents running it in, and where it
+# downloads uv from besides releases.astral.sh ($PythonDownloads): GitHub's
+# release files. Asked only to tell why the installer left no uv
+# (Test-UvUnreachable).
+$UvInstaller = "https://astral.sh/uv/install.ps1"
+$UvInstallShell = "powershell.exe"
+$UvGithubRelease = "https://github.com/astral-sh/uv/releases/latest/download/uv-installer.ps1"
+# Where playwright downloads Chromium from, in its own order (Install-Chromium).
+$PlaywrightHosts = @("https://cdn.playwright.dev/dbazure/download/playwright", "https://playwright.download.prss.microsoft.com/dbazure/download/playwright")
 
 # Every variable a fallback set, with the value it replaced: under `irm | iex`
 # this is the reader's own session, which gets its environment back when the
@@ -156,21 +163,34 @@ function Ensure-Uv {
     }
 
     Write-Info "uv not found; installing..."
-    # In a PowerShell of its own: uv's installer ends a failed download with
-    # `exit 1`, which run inside this script would end the install too -- and,
-    # under `irm | iex`, the reader's whole session -- before the mirror below
-    # is tried. What it prints goes to the console: left in this function's
-    # output it would come back beside uv's path.
-    $shell = (Get-Process -Id $PID).Path
-    if (-not $shell) { $shell = "powershell.exe" }
+    # Fetched here rather than by the installer's own PowerShell, so a host that
+    # answered with an error is told apart from one that could not be reached.
+    $installer = Join-Path ([IO.Path]::GetTempPath()) ("raven-uv-installer-" + [guid]::NewGuid().ToString("N") + ".ps1")
+    $fetched = $false
     try {
-        & $shell -NoProfile -ExecutionPolicy Bypass -Command $UvInstallCommand | Out-Host
-        if ($LASTEXITCODE -ne 0) { Write-Warn "uv's installer did not finish (exit code $LASTEXITCODE)." }
+        Invoke-WebRequest $UvInstaller -OutFile $installer -UseBasicParsing
+        $fetched = $true
     } catch {
-        Write-Warn "uv's installer did not start ($_)."
+        Write-Warn "uv's installer could not be fetched from $UvInstaller ($_)."
     }
+    if ($fetched) {
+        # In a Windows PowerShell of its own, as uv documents: the installer
+        # ends a failed download with `exit 1`, which run inside this script
+        # would end the install too -- and, under `irm | iex`, the reader's
+        # whole session -- before the mirror below is tried. What it prints
+        # goes to the console: left in this function's output it would come
+        # back beside uv's path.
+        $run = "Invoke-Expression ([IO.File]::ReadAllText('" + ($installer -replace "'", "''") + "'))"
+        try {
+            & $UvInstallShell -NoProfile -ExecutionPolicy Bypass -Command $run | Out-Host
+            if ($LASTEXITCODE -ne 0) { Write-Warn "uv's installer did not finish (exit code $LASTEXITCODE)." }
+        } catch {
+            Write-Warn "uv's installer did not start ($_)."
+        }
+    }
+    Remove-Item $installer -Force -ErrorAction SilentlyContinue
     $uv = Find-Uv
-    if (-not $uv -and (Test-MirrorsAllowed)) { $uv = Install-UvFromMirror }
+    if (-not $uv -and (Test-MirrorsAllowed) -and (Test-UvUnreachable $fetched)) { $uv = Install-UvFromMirror }
     if (-not $uv) {
         Fail "uv could not be installed, or is not where it was put. Check PATH (expected ~/.local/bin)."
     }
@@ -179,18 +199,28 @@ function Ensure-Uv {
     return $uv
 }
 
+# Whether uv's installer failed for want of a connection, the one failure a
+# mirror stands in for: astral.sh could not be reached for the installer, or
+# the installer ran and neither host it downloads uv from could be reached. Any
+# answer -- an HTTP error, a certificate that fails verification, a failure
+# inside the installer -- is final, and installing uv from another host would
+# hide it.
+function Test-UvUnreachable([bool]$Fetched) {
+    if (-not $Fetched) { return -not (Test-Reachable $UvInstaller) }
+    return (-not (Test-Reachable $PythonDownloads)) -and (-not (Test-Reachable $UvGithubRelease))
+}
+
 # uv publishes the binary its installer fetches to PyPI too, as a wheel, and a
-# wheel is a zip. When uv's own installer leaves no uv behind -- it does not say
-# why, and it reaches three hosts: astral.sh for itself, then releases.astral.sh
-# and GitHub for the binary -- uv.exe and uvx.exe are unpacked from the newest
-# Windows wheel on the PyPI mirror, or on the index UV_DEFAULT_INDEX names when
-# the user named one, and checked against the sha256 the index publishes beside
-# the link. Returns the uv now found, if any.
+# wheel is a zip. When uv's own installer could not reach its hosts
+# (Test-UvUnreachable), uv.exe and uvx.exe are unpacked from the newest Windows
+# wheel on the PyPI mirror, or on the index UV_DEFAULT_INDEX names when the user
+# named one, and checked against the sha256 the index publishes beside the link.
+# Returns the uv now found, if any.
 function Install-UvFromMirror {
     $tag = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "win_arm64" } else { "win_amd64" }
     $index = if ($env:UV_DEFAULT_INDEX) { $env:UV_DEFAULT_INDEX } elseif ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { $PypiMirror }
     $page = $index.TrimEnd("/") + "/uv/"
-    Write-Warn "uv's installer left no uv behind; fetching uv from $page instead (RAVEN_NO_MIRROR=1 turns this off)."
+    Write-Warn "uv's installer could not reach its hosts; fetching uv from $page instead (RAVEN_NO_MIRROR=1 turns this off)."
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("raven-uv-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $tmp -Force | Out-Null
     try {
@@ -815,13 +845,18 @@ function Install-Browser([string]$UvPath) {
 
 # Playwright tries its own hosts in turn and reports only that none of them
 # delivered, so the mirror gets one retry after the whole download failed --
-# unless the user named a download host. True when chromium is in place; what
-# playwright prints goes to the console rather than into that answer.
+# unless the user named a download host, or one of those hosts answered: it had
+# its say, and the mirror stands in only for hosts that cannot be reached. True
+# when chromium is in place; what playwright prints goes to the console rather
+# than into that answer.
 function Install-Chromium([string]$Py) {
     & $Py -m playwright install chromium | Out-Host
     if ($LASTEXITCODE -eq 0) { return $true }
     if (-not (Test-MirrorsAllowed) -or $env:PLAYWRIGHT_DOWNLOAD_HOST -or $env:PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST) {
         return $false
+    }
+    foreach ($playwrightHost in $PlaywrightHosts) {
+        if (Test-Reachable $playwrightHost) { return $false }
     }
     Write-Warn "Chromium could not be downloaded; trying $PlaywrightMirror instead (RAVEN_NO_MIRROR=1 turns this off)."
     Set-MirrorEnv "PLAYWRIGHT_DOWNLOAD_HOST" $PlaywrightMirror

@@ -416,6 +416,7 @@ def test_resolve_node_dir_answers_each_case_it_exists_for(tmp_path: Path) -> Non
 _NODE_STEP = (
     "sha256_of",
     "mirrors_allowed",
+    "connection_failed",
     "reachable",
     "choose_node_dist",
     "latest_node_v22",
@@ -453,11 +454,20 @@ def _node_release(tmp_path: Path) -> tuple[Path, str]:
     return dist, hashlib.sha256((dist / "node.tar.gz").read_bytes()).hexdigest()
 
 
-def _fake_curl(bin_dir: Path, served: dict[str, Path], *, down: tuple[str, ...] = (), log: Path | None = None) -> None:
+def _fake_curl(
+    bin_dir: Path,
+    served: dict[str, Path],
+    *,
+    down: tuple[str, ...] = (),
+    codes: dict[str, int] | None = None,
+    log: Path | None = None,
+) -> None:
     """A curl that answers each URL in ``served`` from its file and every other
-    URL with an HTTP error (exit 22), and never connects to a URL under ``down``
-    (exit 7, the code for a connection that was refused or timed out)."""
-    refused = "".join(f"  '{prefix}'*) exit 7 ;;\n" for prefix in down)
+    URL with an HTTP error (exit 22), never connects to a URL under ``down``
+    (exit 7, the code for a connection that was refused or timed out), and
+    ends with the given code for a URL under a prefix in ``codes``."""
+    refused = "".join(f"  '{prefix}'*) exit {code} ;;\n" for prefix, code in (codes or {}).items())
+    refused += "".join(f"  '{prefix}'*) exit 7 ;;\n" for prefix in down)
     answers = "".join(f"  '{url}') src='{path}' ;;\n" for url, path in served.items())
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "curl").write_text(
@@ -614,7 +624,9 @@ function Get-Install([string[]]$Names) {
 """
 
 # A web that answers `$Served` (URL -> file under $WebRoot), refuses every
-# connection to a URL under `$Down`, and answers anything else with a 404.
+# connection to a URL under `$Down`, fails the certificate check of a URL under
+# `$Untrusted` (as PowerShell 7 reports it), and answers anything else with a
+# 404.
 _PS1_FAKE_WEB = r"""
 function New-Refusal([string]$Uri) {
     [System.Net.Http.HttpRequestException]::new("No connection could be made to $Uri")
@@ -624,9 +636,13 @@ function New-NotFound([string]$Uri) {
     $failure | Add-Member -NotePropertyName Response -NotePropertyValue "404"
     $failure
 }
+function New-Untrusted([string]$Uri) {
+    [System.Net.Http.HttpRequestException]::new([System.Net.Http.HttpRequestError]::SecureConnectionError, "The SSL connection could not be established: $Uri", $null, $null)
+}
 function Invoke-WebRequest {
-    param([Parameter(Position = 0)][string]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [string]$Method, [int]$TimeoutSec)
+    param([Parameter(Position = 0)][string]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [string]$Method, [int]$TimeoutSec, [switch]$SkipCertificateCheck)
     foreach ($prefix in $Down) { if ($prefix -and $Uri.StartsWith($prefix)) { throw (New-Refusal $Uri) } }
+    foreach ($prefix in $Untrusted) { if ($prefix -and $Uri.StartsWith($prefix) -and -not $SkipCertificateCheck) { throw (New-Untrusted $Uri) } }
     $file = $Served[$Uri]
     if (-not $file -or -not (Test-Path (Join-Path $WebRoot $file))) { throw (New-NotFound $Uri) }
     if ($OutFile) { Copy-Item (Join-Path $WebRoot $file) $OutFile; return }
@@ -1621,8 +1637,19 @@ def test_the_opt_out_reads_the_way_ravens_own_do(tmp_path: Path, value: str, all
 @POSIX_SH_ONLY
 @pytest.mark.parametrize(
     ("code", "reached"),
-    [(0, True), (22, True), (60, True), (6, False), (7, False), (28, False), (35, False), (52, False), (56, False)],
-    ids=["answered", "http-error", "certificate", "no-name", "refused", "timed-out", "tls", "empty", "reset"],
+    [
+        (0, True),
+        (22, True),
+        (60, True),
+        (6, False),
+        (7, False),
+        (28, False),
+        (35, False),
+        (52, False),
+        (56, False),
+        (97, False),
+    ],
+    ids=["answered", "http-error", "certificate", "no-name", "refused", "timed-out", "tls", "empty", "reset", "proxy"],
 )
 def test_only_a_connection_that_never_completed_is_unreachable(tmp_path: Path, code: int, reached: bool) -> None:
     """An HTTP error, and a certificate that fails verification, are answers:
@@ -1634,7 +1661,7 @@ def test_only_a_connection_that_never_completed_is_unreachable(tmp_path: Path, c
     harness = tmp_path / "reachable.sh"
     harness.write_text(
         _SH_PREAMBLE
-        + _sh_functions(("reachable",))
+        + _sh_functions(("connection_failed", "reachable"))
         + "if reachable https://example.org/; then echo YES; else echo NO; fi\n",
         encoding="utf-8",
     )
@@ -1643,6 +1670,33 @@ def test_only_a_connection_that_never_completed_is_unreachable(tmp_path: Path, c
     )
 
     assert result.stdout.strip() == ("YES" if reached else "NO"), result.stderr
+
+
+@POSIX_SH_ONLY
+def test_a_host_is_reached_where_its_redirects_end(tmp_path: Path) -> None:
+    """GitHub answers a release file's address with a redirect to the host that
+    serves it, and from mainland China that second host is the one that times
+    out; the address answering is not the file being reachable."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # Answers at once, unless asked to follow where it points, which times out.
+    (bin_dir / "curl").write_text(
+        '#!/bin/sh\nfor arg in "$@"; do case "$arg" in --location|-[a-zA-Z]*L*) exit 28 ;; esac; done\nexit 0\n',
+        encoding="utf-8",
+    )
+    (bin_dir / "curl").chmod(0o755)
+    harness = tmp_path / "reachable.sh"
+    harness.write_text(
+        _SH_PREAMBLE
+        + _sh_functions(("connection_failed", "reachable"))
+        + "if reachable https://github.com/o/r/releases/latest/download/f; then echo YES; else echo NO; fi\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["sh", str(harness)], capture_output=True, text=True, check=False, env={"PATH": f"{bin_dir}:/usr/bin:/bin"}
+    )
+
+    assert result.stdout.strip() == "NO", result.stderr
 
 
 _PS1_REACHABLE_STEP = r"""
@@ -1753,21 +1807,37 @@ def _fake_unzip(bin_dir: Path) -> None:
     (bin_dir / "unzip").chmod(0o755)
 
 
-_UV_STEP = ("sha256_of", "mirrors_allowed", "resolve_href", "install_uv_from_mirror", "ensure_uv")
+_UV_STEP = (
+    "sha256_of",
+    "mirrors_allowed",
+    "connection_failed",
+    "reachable",
+    "resolve_href",
+    "install_uv_from_mirror",
+    "uv_unreachable",
+    "ensure_uv",
+)
+_UV_SETTINGS = ("PYPI_MIRROR", "UV_INSTALLER", "PYTHON_DOWNLOADS", "UV_GITHUB_RELEASE")
+_UV_INSTALLER_URL = "https://astral.sh/uv/install.sh"
 
 
-def _run_uv_step(tmp_path: Path, served: dict[str, Path], *, env: dict[str, str] | None = None):
+def _run_uv_step(
+    tmp_path: Path,
+    served: dict[str, Path],
+    *,
+    env: dict[str, str] | None = None,
+    down: tuple[str, ...] = ("https://astral.sh/",),
+    codes: dict[str, int] | None = None,
+):
     bin_dir = tmp_path / "bin"
     log = tmp_path / "curl.log"
-    _fake_curl(bin_dir, served, down=("https://astral.sh/",), log=log)
+    _fake_curl(bin_dir, served, down=down, codes=codes, log=log)
     _fake_unzip(bin_dir)
     harness = tmp_path / "uv-step.sh"
     # uv counts only where this step puts it: a uv the machine already has
     # (/usr/bin/uv, say) would end the step before any of it ran.
     have = 'have() { case "$1" in uv) [ -x "$HOME/.local/bin/uv" ] ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }\n'
-    harness.write_text(
-        _SH_PREAMBLE + have + _sh_functions(_UV_STEP, ("PYPI_MIRROR",)) + "ensure_uv\n", encoding="utf-8"
-    )
+    harness.write_text(_SH_PREAMBLE + have + _sh_functions(_UV_STEP, _UV_SETTINGS) + "ensure_uv\n", encoding="utf-8")
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     result = subprocess.run(
@@ -1837,7 +1907,84 @@ def test_the_opt_out_leaves_uv_to_its_own_installer(tmp_path: Path) -> None:
     result, _bin_dir, asked = _run_uv_step(tmp_path, {_UV_PAGE: page, **served}, env={"RAVEN_NO_MIRROR": "1"})
 
     assert result.returncode != 0 and "DIE " in result.stderr
-    assert asked == ["https://astral.sh/uv/install.sh"]
+    assert asked == [_UV_INSTALLER_URL]
+
+
+def _uv_installer(tmp_path: Path, *, works: bool) -> Path:
+    """uv's installer as astral.sh serves it: one that puts uv where uv's own
+    does, or one that ends the way it does when its download failed."""
+    script = tmp_path / "web" / "install.sh"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    if works:
+        body = (
+            'mkdir -p "$HOME/.local/bin"\n'
+            "printf '#!/bin/sh\\necho uv 0.13.4\\n' > \"$HOME/.local/bin/uv\"\n"
+            'chmod +x "$HOME/.local/bin/uv"\n'
+        )
+    else:
+        body = "echo 'downloading uv 0.13.4'\nexit 1\n"
+    script.write_text(body, encoding="utf-8")
+    return script
+
+
+@POSIX_SH_ONLY
+@pytest.mark.parametrize(
+    ("code", "mirrored"),
+    [(22, False), (60, False), (97, True)],
+    ids=["http-error", "certificate", "proxy-could-not-connect"],
+)
+def test_uv_comes_from_the_mirror_only_when_its_installer_could_not_be_reached(
+    tmp_path: Path, code: int, mirrored: bool
+) -> None:
+    """astral.sh's answer -- an HTTP error, a certificate that fails
+    verification -- is final, and installing uv from another host would hide
+    it; a proxy that could not connect is no answer."""
+    page, served = _uv_index(tmp_path, _UV_LINUX_TAG)
+
+    result, bin_dir, asked = _run_uv_step(
+        tmp_path, {_UV_PAGE: page, **served}, down=(), codes={"https://astral.sh/": code}
+    )
+
+    assert (bin_dir / "uv").exists() is mirrored, result.stdout + result.stderr
+    assert any("tuna" in url for url in asked) is mirrored
+    assert (result.returncode == 0) is mirrored
+
+
+_UV_HOSTS_DOWN = [
+    (("https://releases.astral.sh/", "https://github.com/"), True),
+    (("https://releases.astral.sh/",), False),
+    ((), False),
+]
+_UV_HOSTS_DOWN_IDS = ["both-unreachable", "github-answered", "both-answered"]
+
+
+@POSIX_SH_ONLY
+@pytest.mark.parametrize(("down", "mirrored"), _UV_HOSTS_DOWN, ids=_UV_HOSTS_DOWN_IDS)
+def test_an_installer_that_left_no_uv_hands_over_to_the_mirror_only_when_its_hosts_cannot_be_reached(
+    tmp_path: Path, down: tuple[str, ...], mirrored: bool
+) -> None:
+    """The installer does not say why it failed, so the hosts it downloads uv
+    from -- releases.astral.sh, then GitHub's release files -- are asked, and
+    the mirror stands in only when neither can be reached."""
+    page, served = _uv_index(tmp_path, _UV_LINUX_TAG)
+    installer = _uv_installer(tmp_path, works=False)
+
+    result, bin_dir, asked = _run_uv_step(tmp_path, {_UV_INSTALLER_URL: installer, _UV_PAGE: page, **served}, down=down)
+
+    assert (bin_dir / "uv").exists() is mirrored, result.stdout + result.stderr
+    assert any("tuna" in url for url in asked) is mirrored
+    assert "https://releases.astral.sh/" in asked
+
+
+@POSIX_SH_ONLY
+def test_an_installer_that_works_is_all_uv_takes(tmp_path: Path) -> None:
+    installer = _uv_installer(tmp_path, works=True)
+
+    result, bin_dir, asked = _run_uv_step(tmp_path, {_UV_INSTALLER_URL: installer}, down=())
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert os.access(bin_dir / "uv", os.X_OK)
+    assert asked == [_UV_INSTALLER_URL], "no host is asked about once uv is in place"
 
 
 _PS1_UV_STEP = r"""
@@ -1917,52 +2064,72 @@ def test_a_windows_uv_comes_from_the_index_the_user_named(tmp_path: Path) -> Non
 
 
 _PS1_ENSURE_UV_STEP = r"""
-foreach ($text in (Get-Install @("Ensure-Uv", "Test-MirrorsAllowed"))) { Invoke-Expression $text }
+$names = @("Ensure-Uv", "Test-UvUnreachable", "Test-Reachable", "Test-MirrorsAllowed")
+foreach ($text in (Get-Install $names)) { Invoke-Expression $text }
 function Write-Info([string]$Message) { }
 function Write-Ok([string]$Message) { }
 function Write-Warn([string]$Message) { [Console]::Out.WriteLine("WARN $Message") }
 function Fail([string]$Message) { [Console]::Out.WriteLine("FAIL $Message"); exit 3 }
 function Add-ProcessPath([string]$PathToAdd) { }
-$script:Fetched = $false
-function Find-Uv { if ($script:Fetched) { "C:\fake\uv.exe" } }
-function Install-UvFromMirror { $script:Fetched = $true; [Console]::Out.WriteLine("MIRROR"); Find-Uv }
-# uv's own installer, the way it ends when its binary cannot be downloaded:
-# `catch { Write-Information $_; exit 1 }`, as of 0.13.4.
-$Failing = "try { throw 'no binary' } catch { exit 1 }"
-function Invoke-RestMethod { $Failing }
-$UvInstallCommand = $Failing
-$uv = Ensure-Uv
-[Console]::Out.WriteLine("FOUND $uv")
-"""
-
-
-@pytest.mark.slow
-@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
-def test_a_windows_uv_installer_that_exits_still_leaves_the_mirror_to_try(tmp_path: Path) -> None:
-    """uv's installer ends a failed download with `exit 1`. Run inside this
-    script it would end the install with it -- and under `irm | iex` the
-    reader's whole session -- before the mirror is asked."""
-    result = _run_ps1(tmp_path, "ensure-uv-step", _ps1_settings("ErrorActionPreference") + _PS1_ENSURE_UV_STEP)
-
-    assert "MIRROR" in result.stdout, result.stdout + result.stderr
-    assert "FOUND C:\\fake\\uv.exe" in result.stdout
-
-
-_PS1_ENSURE_UV_WORKS_STEP = r"""
-foreach ($text in (Get-Install @("Ensure-Uv", "Test-MirrorsAllowed"))) { Invoke-Expression $text }
-function Write-Info([string]$Message) { }
-function Write-Ok([string]$Message) { }
-function Write-Warn([string]$Message) { [Console]::Out.WriteLine("WARN $Message") }
-function Fail([string]$Message) { [Console]::Out.WriteLine("FAIL $Message"); exit 3 }
-function Add-ProcessPath([string]$PathToAdd) { }
+# uv in place, whoever put it there, is the marker file.
 function Find-Uv { if (Test-Path $Marker) { "C:\fake\uv.exe" } }
-function Install-UvFromMirror { [Console]::Out.WriteLine("MIRROR"); Find-Uv }
-# uv's own installer, the way it ends when it worked: what it did, on stdout.
-$UvInstallCommand = "Write-Output 'downloading uv 0.13.4'; Write-Output 'everything is installed!'; New-Item -ItemType File -Path '$Marker' | Out-Null"
+function Install-UvFromMirror {
+    New-Item -ItemType File -Path $Marker -Force | Out-Null
+    [Console]::Out.WriteLine("MIRROR")
+    Find-Uv
+}
+# The installer's own PowerShell is Windows PowerShell; away from Windows, this one.
+if ($IsWindows -eq $false) { $UvInstallShell = (Get-Process -Id $PID).Path }
+$Served = @{}
+foreach ($pair in ($ServedList -split ";")) {
+    if ($pair) { $url, $file = $pair -split "=", 2; $Served[$url] = $file }
+}
+$Down = @($DownList -split ",")
+$Untrusted = @($UntrustedList -split ",")
 $uv = Ensure-Uv
 [Console]::Out.WriteLine("FOUND $uv")
 [Console]::Out.WriteLine("COUNT $(@($uv).Count)")
 """
+
+_PS1_UV_INSTALLER_URL = "https://astral.sh/uv/install.ps1"
+# uv's installer, the two ways it ends: having put uv in place, printing what it
+# did, or the way it ends when its download failed (`catch { ...; exit 1 }`, as
+# of 0.13.4).
+_PS1_UV_INSTALLER_WORKS = "Write-Output 'downloading uv 0.13.4'\nNew-Item -ItemType File -Path '<MARKER>' | Out-Null\n"
+_PS1_UV_INSTALLER_FAILS = "Write-Output 'downloading uv 0.13.4'\ntry { throw 'no binary' } catch { exit 1 }\n"
+
+
+def _run_ps1_ensure_uv_step(
+    tmp_path: Path,
+    *,
+    installer: str | None = None,
+    down: tuple[str, ...] = (),
+    untrusted: tuple[str, ...] = (),
+    env: dict[str, str] | None = None,
+):
+    """Ensure-Uv on a machine with no uv. ``installer`` is what astral.sh serves
+    for uv's installer; with none, astral.sh answers with a 404."""
+    web = tmp_path / "web"
+    web.mkdir(exist_ok=True)
+    marker = tmp_path / "uv-installed"
+    served = {}
+    if installer is not None:
+        (web / "install.ps1").write_text(installer.replace("<MARKER>", str(marker)), encoding="utf-8")
+        served[_PS1_UV_INSTALLER_URL] = "install.ps1"
+    result = _run_ps1(
+        tmp_path,
+        "ensure-uv-step",
+        _ps1_settings("ErrorActionPreference", "UvInstaller", "UvInstallShell", "UvGithubRelease", "PythonDownloads")
+        + _PS1_FAKE_WEB
+        + _PS1_ENSURE_UV_STEP,
+        env=env,
+        WebRoot=str(web),
+        ServedList=";".join(f"{url}={name}" for url, name in served.items()),
+        DownList=",".join(down),
+        UntrustedList=",".join(untrusted),
+        Marker=str(marker),
+    )
+    return result, result.stdout.splitlines()
 
 
 @pytest.mark.slow
@@ -1972,14 +2139,8 @@ def test_a_windows_uv_installer_that_works_hands_back_only_where_uv_is(tmp_path:
     that process's stdout. Left in this function's output it comes back
     beside the path, and the caller runs the lot as the uv command. It still
     reaches the reader's console."""
-    result = _run_ps1(
-        tmp_path,
-        "ensure-uv-works-step",
-        _ps1_settings("ErrorActionPreference") + _PS1_ENSURE_UV_WORKS_STEP,
-        Marker=str(tmp_path / "uv-installed"),
-    )
+    result, lines = _run_ps1_ensure_uv_step(tmp_path, installer=_PS1_UV_INSTALLER_WORKS)
 
-    lines = result.stdout.splitlines()
     assert "FOUND C:\\fake\\uv.exe" in lines and "COUNT 1" in lines, result.stdout + result.stderr
     assert "downloading uv 0.13.4" in lines, "the installer's own report still reaches the reader"
     assert "MIRROR" not in lines
@@ -1987,22 +2148,66 @@ def test_a_windows_uv_installer_that_works_hands_back_only_where_uv_is(tmp_path:
 
 @pytest.mark.slow
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
-def test_the_windows_opt_out_leaves_uv_to_its_own_installer(tmp_path: Path) -> None:
-    result = _run_ps1(
+@pytest.mark.parametrize(("down", "mirrored"), _UV_HOSTS_DOWN, ids=_UV_HOSTS_DOWN_IDS)
+def test_a_windows_uv_installer_that_exits_hands_over_to_the_mirror_only_when_its_hosts_cannot_be_reached(
+    tmp_path: Path, down: tuple[str, ...], mirrored: bool
+) -> None:
+    """uv's installer ends a failed download with `exit 1`. Run inside this
+    script it would end the install with it -- and under `irm | iex` the
+    reader's whole session -- before the mirror is asked. It does not say why
+    it failed, so the hosts it downloads uv from are asked."""
+    result, lines = _run_ps1_ensure_uv_step(tmp_path, installer=_PS1_UV_INSTALLER_FAILS, down=down)
+
+    assert ("MIRROR" in lines) is mirrored, result.stdout + result.stderr
+    assert ("FOUND C:\\fake\\uv.exe" in lines) is mirrored
+    assert any(line.startswith("WARN uv's installer did not finish") for line in lines)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+@pytest.mark.parametrize(
+    ("down", "untrusted", "mirrored"),
+    [(("https://astral.sh/",), (), True), ((), (), False), ((), ("https://astral.sh/",), False)],
+    ids=["unreachable", "http-error", "certificate"],
+)
+def test_a_windows_uv_comes_from_the_mirror_only_when_its_installer_could_not_be_reached(
+    tmp_path: Path, down: tuple[str, ...], untrusted: tuple[str, ...], mirrored: bool
+) -> None:
+    """astral.sh's answer -- an HTTP error, a certificate that fails
+    verification -- is final, and installing uv from another host would hide
+    it."""
+    result, lines = _run_ps1_ensure_uv_step(
         tmp_path,
-        "ensure-uv-step",
-        _ps1_settings("ErrorActionPreference") + _PS1_ENSURE_UV_STEP,
-        env={"RAVEN_NO_MIRROR": "1"},
+        installer=_PS1_UV_INSTALLER_WORKS if untrusted else None,
+        down=down,
+        untrusted=untrusted,
     )
 
-    assert "MIRROR" not in result.stdout.splitlines(), result.stdout + result.stderr
-    assert "FAIL uv could not be installed" in result.stdout
+    assert ("MIRROR" in lines) is mirrored, result.stdout + result.stderr
+    assert ("FOUND C:\\fake\\uv.exe" in lines) is mirrored
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+def test_the_windows_opt_out_leaves_uv_to_its_own_installer(tmp_path: Path) -> None:
+    result, lines = _run_ps1_ensure_uv_step(tmp_path, down=("https://astral.sh/",), env={"RAVEN_NO_MIRROR": "1"})
+
+    assert "MIRROR" not in lines, result.stdout + result.stderr
+    assert any(line.startswith("FAIL uv could not be installed") for line in lines)
+
+
+def test_the_windows_installer_runs_uvs_installer_in_windows_powershell() -> None:
+    """As uv documents it (`powershell -ExecutionPolicy ByPass -c ...`):
+    Windows PowerShell is on every Windows, whichever PowerShell runs this
+    script."""
+    assert _ps1_settings("UvInstallShell").strip() == '$UvInstallShell = "powershell.exe"'
 
 
 # --- PyPI and the Python uv fetches ----------------------------------------------
 
 _PACKAGE_STEP = (
     "mirrors_allowed",
+    "connection_failed",
     "reachable",
     "use_mirror",
     "uv_config_has",
@@ -2304,7 +2509,7 @@ def test_the_windows_opt_out_keeps_pypi(tmp_path: Path) -> None:
 
 # --- The npm registry a source build reads -------------------------------------
 
-_NPM_STEP = ("mirrors_allowed", "reachable", "use_mirror", "use_npm_mirror")
+_NPM_STEP = ("mirrors_allowed", "connection_failed", "reachable", "use_mirror", "use_npm_mirror")
 
 
 def _run_npm_step(
@@ -2476,9 +2681,19 @@ def test_a_windows_source_build_asks_npm_which_registry_it_reads(tmp_path: Path,
 # them delivered, so the one retry comes after the whole download failed.
 
 
-def _run_browser_step(tmp_path: Path, *, first_fails: bool = True, env: dict[str, str] | None = None):
+_PLAYWRIGHT_HOSTS = ("https://cdn.playwright.dev/", "https://playwright.download.prss.microsoft.com/")
+
+
+def _run_browser_step(
+    tmp_path: Path,
+    *,
+    first_fails: bool = True,
+    env: dict[str, str] | None = None,
+    down: tuple[str, ...] = _PLAYWRIGHT_HOSTS,
+):
     """A playwright whose download succeeds only from the mirror (or always,
-    with `first_fails` off); every host it was pointed at lands in the log."""
+    with `first_fails` off); every host it was pointed at lands in the log.
+    Its own hosts cannot be reached unless ``down`` says otherwise."""
     tools = tmp_path / "tools"
     python = tools / "raven" / "bin" / "python"
     python.parent.mkdir(parents=True)
@@ -2499,10 +2714,14 @@ def _run_browser_step(tmp_path: Path, *, first_fails: bool = True, env: dict[str
     bin_dir.mkdir()
     (bin_dir / "uv").write_text(f"#!/bin/sh\n[ \"$1 $2\" = 'tool dir' ] && echo '{tools}'\n", encoding="utf-8")
     (bin_dir / "uv").chmod(0o755)
+    _fake_curl(bin_dir, {}, down=down)
     harness = tmp_path / "browser-step.sh"
     harness.write_text(
         _SH_PREAMBLE
-        + _sh_functions(("mirrors_allowed", "install_browser"), ("PLAYWRIGHT_MIRROR",))
+        + _sh_functions(
+            ("mirrors_allowed", "connection_failed", "reachable", "playwright_answers", "install_browser"),
+            ("PLAYWRIGHT_MIRROR", "PLAYWRIGHT_HOSTS"),
+        )
         + "install_browser\n",
         encoding="utf-8",
     )
@@ -2550,38 +2769,92 @@ def test_the_opt_out_tries_playwrights_hosts_only(tmp_path: Path) -> None:
     assert "Chromium download failed" in result.stderr
 
 
+@POSIX_SH_ONLY
+@pytest.mark.parametrize("down", [(), _PLAYWRIGHT_HOSTS[:1]], ids=["both-answered", "the-second-answered"])
+def test_a_chromium_download_that_reached_playwrights_hosts_is_not_retried(
+    tmp_path: Path, down: tuple[str, ...]
+) -> None:
+    """playwright does not say why it failed, so its hosts are asked: one that
+    answered had its say, and the mirror stands in only for hosts that cannot
+    be reached."""
+    result, hosts = _run_browser_step(tmp_path, down=down)
+
+    assert hosts == ["default"]
+    assert "Chromium download failed" in result.stderr
+
+
 _PS1_BROWSER_STEP = r"""
-foreach ($text in (Get-Install @("Test-MirrorsAllowed", "Set-MirrorEnv", "Install-Chromium"))) {
-    Invoke-Expression $text
-}
+$names = @("Test-MirrorsAllowed", "Test-Reachable", "Set-MirrorEnv", "Install-Chromium")
+foreach ($text in (Get-Install $names)) { Invoke-Expression $text }
 function Write-Warn([string]$Message) { [Console]::Out.WriteLine("WARN $Message") }
+$Served = @{}
+$Down = @($DownList -split ",")
 $ok = Install-Chromium $Python
 [Console]::Out.WriteLine("OK=$ok")
 """
 
 
-@pytest.mark.slow
-@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
-def test_a_windows_chromium_is_retried_from_the_mirror_when_playwrights_hosts_fail(tmp_path: Path) -> None:
+def _run_ps1_browser_step(tmp_path: Path, python: Path, *, down: tuple[str, ...] = _PLAYWRIGHT_HOSTS):
+    """Install-Chromium with ``python`` as the install's own; Playwright's
+    hosts cannot be reached unless ``down`` says otherwise."""
+    result = _run_ps1(
+        tmp_path,
+        "browser-step",
+        _ps1_settings("ErrorActionPreference", "PlaywrightMirror", "PlaywrightHosts")
+        + "$script:MirrorSaved = @{}\n"
+        + _PS1_FAKE_WEB
+        + _PS1_BROWSER_STEP,
+        env={"PLAYWRIGHT_DOWNLOAD_HOST": "", "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST": ""},
+        Python=str(python),
+        WebRoot=str(tmp_path),
+        DownList=",".join(down),
+    )
+    return result, result.stdout.splitlines()
+
+
+def _ps1_playwright(tmp_path: Path, *, mirror_works: bool = True, says: bool = False) -> tuple[Path, Path]:
+    """A python whose playwright download fails from its own hosts, and works
+    from the mirror unless ``mirror_works`` is off; every host it was pointed at
+    lands in the log, and with ``says`` it reports each attempt on stdout, as
+    playwright does."""
     log = tmp_path / "playwright.log"
     python = tmp_path / "python.ps1"
     python.write_text(
         "$asked = if ($env:PLAYWRIGHT_DOWNLOAD_HOST) { $env:PLAYWRIGHT_DOWNLOAD_HOST } else { 'default' }\n"
         f"Add-Content -Path '{log}' -Value $asked\n"
-        "if ($env:PLAYWRIGHT_DOWNLOAD_HOST) { exit 0 } else { exit 1 }\n",
+        + ('Write-Output "Downloading Chromium from $asked"\n' if says else "")
+        + ("if ($env:PLAYWRIGHT_DOWNLOAD_HOST) { exit 0 } else { exit 1 }\n" if mirror_works else "exit 1\n"),
         encoding="utf-8",
     )
+    return python, log
 
-    result = _run_ps1(
-        tmp_path,
-        "browser-step",
-        _ps1_settings("ErrorActionPreference", "PlaywrightMirror") + "$script:MirrorSaved = @{}\n" + _PS1_BROWSER_STEP,
-        env={"PLAYWRIGHT_DOWNLOAD_HOST": "", "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST": ""},
-        Python=str(python),
-    )
 
-    assert "OK=True" in result.stdout, result.stdout + result.stderr
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+def test_a_windows_chromium_is_retried_from_the_mirror_when_playwrights_hosts_fail(tmp_path: Path) -> None:
+    python, log = _ps1_playwright(tmp_path)
+
+    result, lines = _run_ps1_browser_step(tmp_path, python)
+
+    assert "OK=True" in lines, result.stdout + result.stderr
     assert log.read_text(encoding="utf-8").split() == ["default", "https://cdn.npmmirror.com/binaries/playwright"]
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+@pytest.mark.parametrize("down", [(), _PLAYWRIGHT_HOSTS[:1]], ids=["both-answered", "the-second-answered"])
+def test_a_windows_chromium_download_that_reached_playwrights_hosts_is_not_retried(
+    tmp_path: Path, down: tuple[str, ...]
+) -> None:
+    """playwright does not say why it failed, so its hosts are asked: one that
+    answered had its say, and the mirror stands in only for hosts that cannot
+    be reached."""
+    python, log = _ps1_playwright(tmp_path)
+
+    result, lines = _run_ps1_browser_step(tmp_path, python, down=down)
+
+    assert "OK=False" in lines, result.stdout + result.stderr
+    assert log.read_text(encoding="utf-8").split() == ["default"]
 
 
 @pytest.mark.slow
@@ -2593,23 +2866,10 @@ def test_a_windows_chromium_download_shows_its_progress_and_still_reports_how_it
     """playwright reports its download on stdout. Left in the function's output
     it comes back beside the true or false, which then reads as true either
     way, so a failed download would never be reported."""
-    python = tmp_path / "python.ps1"
-    python.write_text(
-        "$asked = if ($env:PLAYWRIGHT_DOWNLOAD_HOST) { $env:PLAYWRIGHT_DOWNLOAD_HOST } else { 'default' }\n"
-        'Write-Output "Downloading Chromium from $asked"\n'
-        + ("if ($env:PLAYWRIGHT_DOWNLOAD_HOST) { exit 0 } else { exit 1 }\n" if mirror_works else "exit 1\n"),
-        encoding="utf-8",
-    )
+    python, _log = _ps1_playwright(tmp_path, mirror_works=mirror_works, says=True)
 
-    result = _run_ps1(
-        tmp_path,
-        "browser-step",
-        _ps1_settings("ErrorActionPreference", "PlaywrightMirror") + "$script:MirrorSaved = @{}\n" + _PS1_BROWSER_STEP,
-        env={"PLAYWRIGHT_DOWNLOAD_HOST": "", "PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST": ""},
-        Python=str(python),
-    )
+    result, lines = _run_ps1_browser_step(tmp_path, python)
 
-    lines = result.stdout.splitlines()
     assert said in lines, result.stdout + result.stderr
     assert "Downloading Chromium from default" in lines, "playwright's own report still reaches the reader"
 

@@ -55,6 +55,13 @@ PYTHON_MIRROR="https://registry.npmmirror.com/-/binary/python-build-standalone"
 NPM_REGISTRY="https://registry.npmjs.org/"
 NPM_MIRROR="https://registry.npmmirror.com"
 PLAYWRIGHT_MIRROR="https://cdn.npmmirror.com/binaries/playwright"
+# uv's installer, and where it downloads uv from besides releases.astral.sh
+# (PYTHON_DOWNLOADS): GitHub's release files. Asked only to tell why the
+# installer left no uv (uv_unreachable).
+UV_INSTALLER="https://astral.sh/uv/install.sh"
+UV_GITHUB_RELEASE="https://github.com/astral-sh/uv/releases/latest/download/uv-installer.sh"
+# Where playwright downloads Chromium from, in its own order (playwright_answers).
+PLAYWRIGHT_HOSTS="https://cdn.playwright.dev/dbazure/download/playwright https://playwright.download.prss.microsoft.com/dbazure/download/playwright"
 # The variables a fallback exported, unset again before the page starts: they
 # are for this install's own downloads, and the runtime decides for itself.
 MIRROR_EXPORTS=""
@@ -90,18 +97,24 @@ mirrors_allowed() {
   return 0
 }
 
-# False only when no connection to $1 completed: the name did not resolve, the
-# connection was refused, reset or timed out, or TLS never got going. Any HTTP
-# answer, an error status included, is the host being there, and so is a
-# certificate that fails verification: whatever re-signs this host's traffic
+# Whether curl's exit code $1 says no connection completed: the name did not
+# resolve, the connection -- or a proxy's, to the host -- was refused, reset or
+# timed out, or TLS never got going.
+connection_failed() {
+  case "$1" in
+    6|7|28|35|52|56|97) return 0 ;;
+  esac
+  return 1
+}
+
+# False only when no connection to $1, or to where it redirects, completed.
+# Any HTTP answer, an error status included, is the host being there, and so is
+# a certificate that fails verification: whatever re-signs this host's traffic
 # re-signs a mirror's too.
 reachable() {
   code=0
-  curl -sS -o /dev/null --connect-timeout 5 --max-time 10 -I "$1" 2>/dev/null || code=$?
-  case "$code" in
-    6|7|28|35|52|56) return 1 ;;
-  esac
-  return 0
+  curl -sS -o /dev/null --connect-timeout 5 --max-time 10 -IL "$1" 2>/dev/null || code=$?
+  ! connection_failed "$code"
 }
 
 # use_mirror <variable> <value>: export it for the rest of this install, and
@@ -134,15 +147,33 @@ ensure_uv() {
     return
   fi
   info "uv not found, installing..."
-  # Piped, so a curl that cannot reach astral.sh hands sh an empty script and
-  # the pipe still succeeds: whether uv arrived is asked below instead.
-  curl -fsSL --connect-timeout 15 https://astral.sh/uv/install.sh | sh || true
+  # Fetched, then run, rather than piped: curl's exit code tells a host that
+  # answered with an error from one that could not be reached.
+  uv_fetch=0
+  uv_installer="$(mktemp "${TMPDIR:-/tmp}/raven-uv-installer.XXXXXX")" || die "Could not create a file for uv's installer."
+  curl -fsSL --connect-timeout 15 "$UV_INSTALLER" -o "$uv_installer" || uv_fetch=$?
+  if [ "$uv_fetch" -eq 0 ]; then sh "$uv_installer" || true; fi
+  rm -f "$uv_installer"
   # uv installs to ~/.local/bin (or $XDG_BIN_HOME) -- make it visible for the
   # rest of this script even before the shell profile is re-sourced.
   export PATH="$HOME/.local/bin:$PATH"
-  have uv || install_uv_from_mirror || true
+  if ! have uv && mirrors_allowed && uv_unreachable "$uv_fetch"; then install_uv_from_mirror || true; fi
   have uv || die "uv could not be installed, or is not where it was put; check PATH (expected in ~/.local/bin)"
   ok "uv installed"
+}
+
+# Whether uv's installer failed for want of a connection, the one failure a
+# mirror stands in for: astral.sh could not be reached for the installer ($1 is
+# curl's exit code fetching it), or the installer ran and neither host it
+# downloads uv from could be reached. Any answer -- an HTTP error, a
+# certificate that fails verification, a failure inside the installer -- is
+# final, and installing uv from another host would hide it.
+uv_unreachable() {
+  if [ "$1" -ne 0 ]; then
+    connection_failed "$1"
+    return
+  fi
+  ! reachable "$PYTHON_DOWNLOADS" && ! reachable "$UV_GITHUB_RELEASE"
 }
 
 # The absolute URL of the link $2 on the page at $1, which ends in /.
@@ -164,14 +195,12 @@ resolve_href() {
 }
 
 # uv publishes the binary its installer fetches to PyPI too, as a wheel, and a
-# wheel is a zip. When uv's own installer leaves no uv behind -- it does not say
-# why, and it reaches three hosts: astral.sh for itself, then releases.astral.sh
-# and GitHub for the binary -- uv and uvx are unpacked from the newest wheel for
-# this platform on the PyPI mirror, or on the index UV_DEFAULT_INDEX names when
-# the user named one, and checked against the sha256 the index publishes beside
-# the link.
+# wheel is a zip. When uv's own installer could not reach its hosts
+# (uv_unreachable), uv and uvx are unpacked from the newest wheel for this
+# platform on the PyPI mirror, or on the index UV_DEFAULT_INDEX names when the
+# user named one, and checked against the sha256 the index publishes beside the
+# link.
 install_uv_from_mirror() {
-  mirrors_allowed || return 1
   case "$NODE_OS-$NODE_ARCH" in
     linux-x64)
       uv_tag="manylinux_2_17_x86_64"
@@ -184,7 +213,7 @@ install_uv_from_mirror() {
   esac
   uv_index="${UV_DEFAULT_INDEX:-${UV_INDEX_URL:-$PYPI_MIRROR}}"
   uv_page="${uv_index%/}/uv/"
-  warn "uv's installer left no uv behind; fetching uv from $uv_page instead (RAVEN_NO_MIRROR=1 turns this off)."
+  warn "uv's installer could not reach its hosts; fetching uv from $uv_page instead (RAVEN_NO_MIRROR=1 turns this off)."
   uv_work="$(mktemp -d)" || return 1
   # The newest release, compared field by field: an index lists files in name
   # order, where 0.9.9 sorts after 0.13.4.
@@ -738,12 +767,23 @@ install_browser() {
   if "$py" -m playwright install chromium; then return 0; fi
   # Playwright tries its own hosts in turn and reports only that none of them
   # delivered, so the mirror gets one retry after the whole download failed --
-  # unless the user named a download host.
-  if mirrors_allowed && [ -z "${PLAYWRIGHT_DOWNLOAD_HOST:-}${PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST:-}" ]; then
+  # unless the user named a download host, or one of those hosts answered.
+  if mirrors_allowed && [ -z "${PLAYWRIGHT_DOWNLOAD_HOST:-}${PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST:-}" ] \
+    && ! playwright_answers; then
     warn "Chromium could not be downloaded; trying $PLAYWRIGHT_MIRROR instead (RAVEN_NO_MIRROR=1 turns this off)."
     if PLAYWRIGHT_DOWNLOAD_HOST="$PLAYWRIGHT_MIRROR" "$py" -m playwright install chromium; then return 0; fi
   fi
   warn "Chromium download failed; the browser tool stays off. Retry later with: $py -m playwright install chromium"
+}
+
+# Whether a host playwright downloads Chromium from answers. One that answered
+# had its say -- an HTTP error, a certificate that fails verification -- and
+# the mirror stands in only for hosts that cannot be reached.
+playwright_answers() {
+  for playwright_host in $PLAYWRIGHT_HOSTS; do
+    reachable "$playwright_host" && return 0
+  done
+  return 1
 }
 
 # The word dictionary and the deepdoc vision models: ~110 MB that cannot live
