@@ -704,6 +704,16 @@ def _fill_resumed_context(usage: dict[str, Any], session: Any) -> None:
         return
     if not messages:
         return
+    # The session files tool results whole for ``context_retrieve``; the next
+    # call carries at most the view of each (the compacting strategy prunes
+    # them shorter still), so counting the stored text reports a context many
+    # times fuller than the one that will be sent.
+    messages = [
+        {**m, "content": tool_result_view(m["content"])}
+        if m.get("role") == "tool" and isinstance(m.get("content"), str)
+        else m
+        for m in messages
+    ]
     try:
         used = estimate_prompt_tokens(messages)
     except Exception:

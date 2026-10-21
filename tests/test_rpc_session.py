@@ -4088,3 +4088,24 @@ async def test_delete_of_an_imported_conversation(tmp_path: Path) -> None:
     assert not state.exists()
     assert state.resolve() not in tidx._INDEXERS
     assert await session_delete({"session_id": key}) == {"deleted": None, "still_on_disk": False}
+
+
+def test_a_resumed_gauge_counts_tool_results_as_the_view_the_next_call_carries() -> None:
+    """Filed whole for ``context_retrieve``, a large read is never sent whole again,
+    so the resumed gauge must not count it whole."""
+    from raven.rpc.methods.session import _fill_resumed_context
+    from raven.session.manager import Session
+
+    session = Session(key="tui:gauge")
+    for i in range(9):
+        session.add_message("user", f"read part {i}")
+        session.messages.append(
+            {"role": "tool", "tool_call_id": f"c{i}", "name": "read_file", "content": "x " * 64_000}
+        )
+        session.add_message("assistant", "read")
+    usage: dict = {"context_max": 200_000}
+
+    _fill_resumed_context(usage, session)
+
+    assert usage["context_estimated"] is True
+    assert 0 < usage["context_used"] < 9 * 9_000
