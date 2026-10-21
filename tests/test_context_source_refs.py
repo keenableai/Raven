@@ -295,6 +295,35 @@ class TestRetrieval:
 
         assert "small result" in out
 
+    async def test_an_entry_larger_than_one_call_is_read_in_turns(self, tmp_path: Path) -> None:
+        """A filed result can be far larger than one call's budget; the cut answer
+        names where to start next, and the turns join back into the original."""
+        import re as _re
+
+        manager, session = _saved(tmp_path, HUGE)
+        tool, ref, offset, pieces = _retriever(manager, session), _ref(session, 2).render(), 0, []
+        for _ in range(40):
+            out = await tool.execute(refs=[ref], max_tokens=1_000, offset=offset)
+            header, body = out.split("\n", 1)
+            pieces.append(body)
+            nxt = _re.search(r"next_offset=(\d+)", header)
+            if nxt is None:
+                break
+            offset = int(nxt.group(1))
+        assert len(pieces) > 1, "one call should not have held the whole entry"
+        assert "".join(pieces) == HUGE
+
+    async def test_an_offset_past_the_end_reads_nothing_more(self, tmp_path: Path) -> None:
+        manager, session = _saved(tmp_path, "small result")
+        out = await _retriever(manager, session).execute(refs=[_ref(session, 2).render()], offset=10_000)
+        assert out.split("\n", 1)[1] == ""
+        assert "next_offset" not in out
+
+    def test_a_read_back_needs_no_approval(self) -> None:
+        from raven.permissions.rules import Tier, default_tier
+
+        assert default_tier("context_retrieve", {"refs": ["[[ref session/x@0#1]]"]}) is Tier.ALLOW
+
     async def test_an_unusable_budget_falls_back_to_the_default(self, tmp_path: Path) -> None:
         manager, session = _saved(tmp_path, "small result")
 

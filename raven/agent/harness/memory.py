@@ -44,6 +44,7 @@ from loguru import logger
 
 from raven.agent.harness.participants import Intake, compose_addendum, compose_intake, compose_record
 from raven.agent.window import compaction, shrink
+from raven.agent.window.images import ATTACHED_IMAGE_KEY
 from raven.context_engine import headroom
 from raven.contracts.assembled import TokenBudget
 from raven.contracts.harness import MemoryModule, ShrinkResult, WindowPressure, WindowState
@@ -307,6 +308,11 @@ class DefaultMemory:
                 # The engine loses its say on this refusal, never the turn: the
                 # elision below is what answers instead.
                 logger.opt(exception=True).error("the context engine failed on a refused prompt; eliding instead")
+        if outcome is not None and not _keeps_the_question(messages, outcome.messages):
+            # Whatever the engine meant to give back, a retry without the turn's
+            # own question answers something the user did not ask this turn.
+            logger.error("the context engine's reclaim dropped the turn's question; eliding instead")
+            outcome = None
         if outcome is not None:
             state.compress_retries += 1
             state.last_context_used = 0
@@ -443,6 +449,21 @@ class DefaultMemory:
         self, step: StepView, reply: str | None, participants: Sequence[AgentParticipant]
     ) -> dict[str, Any] | None:
         return await compose_record(step, reply, participants)
+
+
+def _keeps_the_question(sent: list[dict[str, Any]], reclaimed: list[dict[str, Any]]) -> bool:
+    """Whether ``reclaimed`` still holds the latest user message ``sent`` held.
+
+    A message carrying only pictures a tool showed (``ATTACHED_IMAGE_KEY``) is the
+    loop's, not the user's, and is not the question.
+    """
+    question = next(
+        (m for m in reversed(sent) if m.get("role") == "user" and not m.get(ATTACHED_IMAGE_KEY)),
+        None,
+    )
+    if question is None:
+        return True
+    return any(m.get("role") == "user" and m.get("content") == question.get("content") for m in reclaimed)
 
 
 def bind(memory: DefaultMemory) -> MemoryModule:

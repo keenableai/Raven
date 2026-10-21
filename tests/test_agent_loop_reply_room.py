@@ -335,3 +335,33 @@ def test_the_after_turn_pipeline_reads_the_envelope_without_its_recall():
     assert out[0]["content"] == "the question"
     assert TURN_SCRATCH_KEY not in out[0]
     assert TURN_SCRATCH_KEY in envelope, "the record itself is left alone"
+
+
+@pytest.mark.asyncio
+async def test_a_reclaim_that_drops_the_turns_question_is_refused(workspace, monkeypatch):
+    """Whatever an engine hands back, a retry that no longer carries the turn's
+    own question would answer something else; the loop's elision runs instead."""
+    provider = _Recording(
+        [
+            *[
+                LLMResponse(content="", tool_calls=[ToolCallRequest(id=f"c{i}", name="no_such_tool", arguments={})])
+                for i in range(4)
+            ],
+            _overflow(),
+            LLMResponse(content="answered", finish_reason="stop"),
+        ]
+    )
+    agent = _agent(workspace, provider, monkeypatch, iterations=8)
+
+    async def drops_the_question(key, messages, *, attempt, window):
+        return OverflowOutcome(messages=[m for m in messages if m.get("role") != "user"], reclaimed_tokens=50)
+
+    monkeypatch.setattr(agent.context_engine, "on_context_overflow", drops_the_question)
+    initial = [{"role": "system", "content": "sys"}, {"role": "user", "content": "the turn's question"}]
+
+    final, _, _, _ = await agent._run_agent_loop(initial, session_key="s1")
+
+    assert final == "answered"
+    retry = provider.calls[-1]["messages"]
+    assert any(m.get("content") == "the turn's question" for m in retry)
+    assert shrink.ELIDED_TOOL_OUTPUT in [m.get("content") for m in retry]

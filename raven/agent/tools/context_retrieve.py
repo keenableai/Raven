@@ -93,6 +93,11 @@ class ContextRetrieveTool(Tool):
                     "maximum": _MAX_MAX_TOKENS,
                     "description": f"Budget for the reply (default {_DEFAULT_MAX_TOKENS}).",
                 },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "exact mode: start this many characters in (a cut reply names next_offset).",
+                },
             },
             "required": ["refs"],
         }
@@ -113,6 +118,7 @@ class ContextRetrieveTool(Tool):
         if mode not in ("exact", "snippet"):
             return f"Error: unknown mode {mode!r}; expected 'exact' or 'snippet'."
         budget = _clamp_budget(kwargs.get("max_tokens"))
+        offset = _clamp_offset(kwargs.get("offset"))
 
         session_key = self._session_key.get()
         if not session_key:
@@ -135,7 +141,7 @@ class ContextRetrieveTool(Tool):
 
         sections: list[str] = []
         for item in answered:
-            section, spent = self._resolve(item, messages, revision, mode=mode, budget=budget)
+            section, spent = self._resolve(item, messages, revision, mode=mode, budget=budget, offset=offset)
             sections.append(section)
             budget -= spent
             if budget <= 0:
@@ -162,6 +168,7 @@ class ContextRetrieveTool(Tool):
         *,
         mode: str,
         budget: int,
+        offset: int = 0,
     ) -> tuple[str, int]:
         """One ref: its entries and what reading them cost."""
         if isinstance(item, str):
@@ -204,10 +211,18 @@ class ContextRetrieveTool(Tool):
                 messages[index],
                 mode=mode,
                 budget=budget - spent,
+                offset=offset,
             )
             rendered.append(entry)
             spent += cost
         return ("\n\n".join(rendered), spent)
+
+
+def _clamp_offset(raw: Any) -> int:
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _clamp_budget(raw: Any) -> int:
@@ -224,8 +239,14 @@ def _render_entry(
     *,
     mode: str,
     budget: int,
+    offset: int = 0,
 ) -> tuple[str, int]:
-    """One message, headed by what it is and how much of it is here."""
+    """One message, headed by what it is and how much of it is here.
+
+    ``offset`` (exact mode) starts the body that many characters in, so an entry
+    larger than one call's budget is read in turns; a cut answer names the
+    ``next_offset`` to ask for.
+    """
     body = _body(message.get("content"))
     header = [ref.render(), f"role={message.get('role', '?')}"]
     if name := message.get("name"):
@@ -236,16 +257,23 @@ def _render_entry(
         # so saying so is the only honest answer.
         header.append("truncated=true")
 
-    shown = body if mode == "exact" else _snippet(body)
+    start = min(offset, len(body)) if mode == "exact" else 0
+    if start:
+        header.append(f"offset={start:,}")
+    rest = body[start:]
+    shown = rest if mode == "exact" else _snippet(body)
     whole = f"{' '.join(header)}\n{shown}"
     cost = _tokens(whole)
-    if cost <= budget and shown == body:
+    if cost <= budget and shown == rest:
         return whole, cost
     # The header that will head a cut body, at its longest, is what the body
     # has to leave room for.
-    widest = [*header, f"shown={len(body):,}/{len(body):,} chars"]
+    widest = [*header, f"shown={len(body):,}/{len(body):,} chars", f"next_offset={len(body):,}"]
     shown = _fit(shown, budget - _tokens(f"{' '.join(widest)}\n"))
-    text = f"{' '.join([*header, f'shown={len(shown):,}/{len(body):,} chars'])}\n{shown}"
+    labels = [*header, f"shown={len(shown):,}/{len(body):,} chars"]
+    if mode == "exact" and start + len(shown) < len(body):
+        labels.append(f"next_offset={start + len(shown)}")
+    text = f"{' '.join(labels)}\n{shown}"
     return text, _tokens(text)
 
 

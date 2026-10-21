@@ -37,6 +37,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from loguru import logger
+
 from raven.agent.context import ContextBuilder
 from raven.config.live import LiveConfig, curator_pin, skill_gate_pin
 from raven.context_engine import history as history_strategies
@@ -216,8 +218,24 @@ def build_context_engine(
             ),
         )
     dropped = frozenset(getattr(config, "drop_segments", None) or ())
+    # The history slot's builder is named for its strategy now; ``curator`` is
+    # what a config written before the registry calls it, so either name drops
+    # it. Without it nothing mints refs, and the engine must not say otherwise.
+    history_builder = builders[-1].name
+    history_dropped = bool(dropped & {history_builder, "curator"})
+    if history_dropped:
+        dropped |= {history_builder}
     if dropped:
         builders = [b for b in builders if b.name not in dropped]
+    if strategy.name != "curator" and (
+        getattr(config, "curator_model", None) or getattr(config, "curator_provider", None)
+    ):
+        logger.warning(
+            "context.curatorModel / curatorProvider are set but context.history.strategy is {!r}: they apply "
+            "to the curator strategy only; this strategy summarises on the turn's model unless "
+            "context.history.compacting.summary.model names one",
+            strategy.name,
+        )
     engine = ContextAssembler(
         builders,
         get_tool_definitions,
@@ -225,7 +243,7 @@ def build_context_engine(
         get_tool_notices=get_tool_notices,
         scent=scent,
         owns_compaction=strategy.owns_compaction,
-        mints_source_refs=strategy.mints_source_refs,
+        mints_source_refs=strategy.mints_source_refs and not history_dropped,
         turn_scratch=getattr(getattr(config, "cache", None), "turn_scratch", True),
     )
     # The find_skill tool searches through the same router the engine

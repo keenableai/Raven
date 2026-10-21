@@ -189,3 +189,13 @@ async def test_the_first_history_builder_with_an_answer_decides_an_overflow() ->
 async def test_an_assembler_with_no_strategy_hook_leaves_overflow_to_the_loop(tmp_path: Path) -> None:
     engine = _engine(tmp_path, ContextConfig.model_validate({"history": {"strategy": "curator"}}))
     assert await engine.on_context_overflow("k", [{"role": "user", "content": "x"}], attempt=1, window=8192) is None
+
+
+@pytest.mark.parametrize("name", ["curator", "compacting"])
+def test_dropping_the_history_slot_by_either_name_drops_it_and_its_refs(tmp_path: Path, name: str) -> None:
+    """``curator`` is what a config written before the registry calls the history
+    builder; it still drops it under the default strategy, and an engine with no
+    history builder does not claim to mint refs."""
+    engine = _engine(tmp_path, ContextConfig.model_validate({"dropSegments": [name]}))
+    assert engine._phase_b == []
+    assert not engine.mints_source_refs

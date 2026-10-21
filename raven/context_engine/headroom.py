@@ -1,13 +1,15 @@
 """Reply headroom -- how much of the window a turn holds back for the answer.
 
-Every prompt bound in the tree is ``window - reply_headroom(...)``: the
-per-turn :class:`~raven.contracts.assembled.TokenBudget` (its
-``reserved_output``), and through it
-:class:`~raven.context_engine.history_trimmer.HistoryTrimmer` under whichever
-history strategy fills the history slot. The policy is one number for the
-whole process, not a strategy's private tuning, which is why this module sits
-beside ``history_trimmer`` rather than inside a strategy package: with
-compaction off it still runs.
+The compacting history strategy bounds its prompts by
+``window - reply_headroom(...)`` -- its trigger and the trimmer it hands the
+budget to -- and the loop sizes a near-window request's ``max_tokens`` with
+:func:`request_max_tokens`; refusals are learned here whichever strategy runs.
+The per-turn :class:`~raven.contracts.assembled.TokenBudget` still reserves
+the model's whole output ceiling (``reserved_output``): that is the Curator's
+arithmetic, and the compacting strategy computes its own room rather than
+reading it. The table is one number per model for the whole process, not a
+strategy's private tuning, which is why this module sits beside
+``history_trimmer`` rather than inside a strategy package.
 
 The number it answers with is a **floor plus what refusals taught it**, not
 the model's output ceiling. Reserving the ceiling is arithmetically safe and
