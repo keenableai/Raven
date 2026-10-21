@@ -486,3 +486,35 @@ def test_image_tokens_survive_the_tiktoken_fallback_path(
 
     assert tokens.estimate_prompt_tokens([{"role": "user", "content": [block]}]) == 100
     assert tokens.estimate_message_tokens({"role": "user", "content": [block]}) == 100
+
+
+def test_ordinary_text_counts_exactly_as_one_encode() -> None:
+    enc = tokens.tiktoken.get_encoding(tokens._ENCODING_NAME)
+    rng = random.Random(7)
+    words = ["alpha", "beta", "path/to/file.py", "x=1", chr(0x4E2D) + chr(0x6587), "{}", "\n"]
+    text = " ".join(rng.choice(words) for _ in range(20_000))
+
+    assert tokens._encoded_len(enc, text) == len(enc.encode(text))
+    assert tokens.estimate_message_tokens({"role": "tool", "content": text}) == len(enc.encode(text))
+
+
+@pytest.mark.parametrize("run", ["=", "A", "0"])
+def test_a_long_unbroken_run_never_reaches_the_encoder_whole(monkeypatch, run) -> None:
+    """tiktoken is quadratic in one piece's length; a 120K run held the loop for seconds."""
+    real = tokens.tiktoken.get_encoding(tokens._ENCODING_NAME)
+    longest: list[int] = []
+
+    class Measured:
+        def encode(self, text):
+            longest.append(max((len(m) for m in text.split()), default=0))
+            return real.encode(text)
+
+    monkeypatch.setattr(tokens.tiktoken, "get_encoding", lambda _name: Measured())
+    content = "head line\n" + run * 120_000 + "\ntail line"
+
+    estimate = tokens.estimate_message_tokens({"role": "tool", "content": content})
+    with tokens.reuse_prompt_tokenization():
+        prompt = tokens.estimate_prompt_tokens([{"role": "tool", "content": content}])
+
+    assert max(longest) <= tokens._RUN_SLICE
+    assert estimate > 0 and prompt > 0
