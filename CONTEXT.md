@@ -1044,7 +1044,12 @@ rolls token counts and USD cost up into per-session, per-day, and lifetime aggre
 **CacheOptimizer**:
 The shipped TokenStrategy (`"cache_optimizer"`) that places Anthropic's ≤4 ephemeral
 `cache_control` breakpoints adaptively (tools tail + system tail + a rolling message-tail
-window). A Hermes-faithful `SystemAndTailCacheStrategy` ships alongside as an A/B reference.
+window). When the compacting History Strategy flags the message its next summary is
+expected to end on (`cache_compaction_boundary`, `context.cache.compactionBreakpoint`),
+that mark takes the rolling window's oldest slot: the summary replays an earlier request as
+a byte prefix that stops behind every rolling mark, so it is the only breakpoint the
+summary can read back past the system head. A Hermes-faithful `SystemAndTailCacheStrategy`
+ships alongside as an A/B reference.
 
 **UsageSnapshot**:
 The token/cost accounting unit for a single LLM or built-in image-generation API call: input / output / cache-read /

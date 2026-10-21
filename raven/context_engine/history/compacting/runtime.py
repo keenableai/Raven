@@ -395,9 +395,34 @@ class CompactingHistoryBuilder:
         memo.checkpoint_message = checkpoint_message
         memo.keys = self._keys(outcome, checkpoint, checkpoint_at)
         memo.view = tuple(_comparable(message) for message in plain) if memo.keys else ()
+        history = self._marked(outcome, checkpoint_message, checkpoint_at, pinned)
+        if memo.keys and not removed and self.config.cache.compaction_breakpoint:
+            # Gated on the keys: without them no request of this turn is kept,
+            # so no summary will ever replay the mark. A turn that removed
+            # something has just come down to the target, and the next
+            # summary is too far off for anything it writes to stay cached.
+            cut = self._next_cut(
+                revision,
+                session,
+                ledger,
+                memo,
+                plan,
+                ranges,
+                fixed_tokens=estimate_prompt_tokens([system_message], prefix.tool_defs) + standing,
+                retired=retired,
+                protected=pinned | retired,
+                rewritten=rewritten,
+                generation=generation,
+            )
+            history = _flag_compaction_boundary(
+                history,
+                included=outcome.included_ids,
+                cut=cut,
+                checkpoint_at=checkpoint_at if checkpoint_message is not None else None,
+            )
         return Segment(
             text="",
-            history=self._marked(outcome, checkpoint_message, checkpoint_at, pinned),
+            history=history,
             meta=self._meta(
                 generation,
                 checkpoint,
@@ -638,6 +663,56 @@ class CompactingHistoryBuilder:
             budget_tokens=plan.target_tokens,
             retired=retired,
         )
+
+    def _next_cut(
+        self,
+        revision: "SessionRevision",
+        session: list[dict[str, Any]],
+        ledger: MessageLedger,
+        memo: _Memo,
+        plan: CompactionPlan,
+        ranges: Ranges,
+        *,
+        fixed_tokens: int,
+        retired: frozenset[int],
+        protected: frozenset[int],
+        rewritten: frozenset[int],
+        generation: int,
+    ) -> int:
+        """Where the next summary's replay would end if this log compacted now.
+
+        The turn that next removes anything runs this same pipeline over a log
+        that has only grown: prune, then empty COMPACT from the front until the
+        prompt is under a target that does not move. What removal keeps is the
+        longest stretch at the end of COMPACT that still fits, and a longer log
+        only pushes that stretch forward -- so unless the rest of the prompt
+        shrank, its cut lands at or past this one, and a mark here is inside
+        the span it replays.
+
+        ``fixed_tokens`` leaves the turn's own message out, because the next
+        one is not known yet and may be shorter. Guessing it small moves this
+        cut back, which costs the summary a few uncached tokens; guessing it
+        large could put the mark past the cut, which costs the summary all of
+        them. Zero when nothing would be removed yet.
+        """
+        if plan.prompt_tokens <= plan.target_tokens:
+            return 0
+        pressed = dataclass_replace(plan, action="compact")
+        pruned = self._prune(revision, session, ranges, pressed, protected, [e.tokens for e in ledger.entries])
+        if pruned.changed:
+            ledger = MessageLedger(pruned.messages, self._prices(memo, pruned.messages, rewritten | pruned.ordinals))
+            ranges = self.planner.split(ledger, pressed, generation=generation)
+        selection = self.planner.keep_within(
+            ledger,
+            ranges,
+            fixed_tokens=fixed_tokens,
+            budget_tokens=plan.target_tokens,
+            retired=retired,
+        )
+        removed = frozenset(selection.dropped) - retired
+        if not removed:
+            return 0
+        return ledger.align_forward(max(removed) + 1, self.cfg.boundary)
 
     async def _checkpoint_for(
         self,
@@ -997,6 +1072,42 @@ def _turn_held(history: Sequence[dict[str, Any]]) -> frozenset[int]:
         for index in range(question, len(history))
         if history[index].get("role") == "user" and not history[index].get(_ATTACHED_IMAGE_KEY)
     )
+
+
+def _flag_compaction_boundary(
+    history: list[dict[str, Any]],
+    *,
+    included: Sequence[int],
+    cut: int,
+    checkpoint_at: int | None,
+) -> list[dict[str, Any]]:
+    """Flag the last message in front of ``cut``, the next summary's predicted end.
+
+    A summarising request replays a recorded request up to the end of what it
+    removes, so the only breakpoint it can carry past the system head is one an
+    ordinary request already put inside that span. Not the far edge of
+    COMPACT, which is only the deepest a summary could reach: removal stops
+    once the prompt is back under target and keeps the end of COMPACT, so a
+    mark there usually lies past the cut. The flag is carried on the message
+    rather than as a position, because the loop and the provider both rewrite
+    the list after this; the cache optimizer turns it into the mark, and the
+    sanitizer drops it on the way out.
+
+    Only the position moves through the checkpoint splice: the checkpoint sits
+    where the messages it replaced used to be, so an entry after it shifts by
+    one.
+    """
+    carried = sum(1 for index in included if index < cut)
+    if carried <= 0:
+        return history
+    position = carried - 1
+    if checkpoint_at is not None and checkpoint_at <= position:
+        position += 1
+    if not 0 <= position < len(history):
+        return history
+    flagged = list(history)
+    flagged[position] = {**flagged[position], prompt_cache.COMPACTION_BOUNDARY_KEY: True}
+    return flagged
 
 
 def _splice(items: Sequence[Any], item: Any, at: int) -> list[Any]:

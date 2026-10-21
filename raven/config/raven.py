@@ -60,7 +60,8 @@ class _Base(BaseModel):
 class ContextCacheConfig(_Base):
     """Where the query-conditioned segments sit, which decides how much of each
     request a provider's prefix cache can match. Shared by every history
-    strategy: it governs the system and user slots, not the history slot."""
+    strategy: it governs the system and user slots, not the history slot --
+    save ``compaction_breakpoint``, which only the compacting strategy reads."""
 
     turn_scratch: bool = True
     """Keep query-conditioned segments out of the system prompt.
@@ -77,6 +78,22 @@ class ContextCacheConfig(_Base):
     ``False`` puts them back in the system prompt. Note that the segment order
     is normalised either way -- ``# Active Skills`` now precedes ``# Memory``,
     since it is the one of the two that does not move with the query.
+    """
+
+    compaction_breakpoint: bool = True
+    """Also mark where the next summarising request is expected to end.
+
+    The compacting strategy writes a summary by replaying an earlier request as
+    a prefix, cut where the removed span ends. That cut sits behind every
+    rolling breakpoint, so without one of its own the summary reads back only
+    the system head. Once the prompt is past the compaction target, each turn
+    flags where its summary would end if the log compacted now -- the next
+    real cut lands at or past it -- and the cache optimizer spends its oldest
+    rolling mark there. It adds no write to the ordinary request -- everything
+    in front of the last mark is written regardless -- and only
+    breakpoint-style caches (Anthropic) read it; an automatic prefix cache hits
+    either way. Takes effect only while ``tokenWise.cacheOptimization`` places
+    the marks.
     """
 
 

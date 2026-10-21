@@ -67,6 +67,7 @@ from raven.contracts.assembled import TokenBudget
 from raven.contracts.context import AssembledPrefix, AssemblyContext, SessionRevision
 from raven.contracts.llm_provider import LLMResponse, ToolCallRequest
 from raven.session.refs import belongs_to
+from raven.token_wise.cache_optimizer import CacheOptimizer
 from raven.utils.refs import SourceRef
 from raven.utils.tokens import estimate_prompt_tokens
 
@@ -431,6 +432,28 @@ class TestPrefixReuse:
         sent = provider.sent[0]
         assert sent[:-1] == request[: len(sent) - 1]
         assert second.meta["byte_prefix_reused"] is True
+
+    async def test_every_summary_replays_a_breakpoint_the_turn_before_put_inside_its_cut(self, tmp_path: Path) -> None:
+        """The cut sits behind every rolling mark, so the only breakpoint a
+        summary can carry past the system head is one an ordinary request
+        placed there ahead of time -- and a breakpoint-style cache reads
+        nothing without one. Stepped the way production grows, with the real
+        cache optimizer marking what the loop sends: each summary has to carry
+        that mark, deep enough that most of what it replays is cacheable."""
+        provider = _RecordingProvider()
+        builder = _builder(tmp_path, provider)
+        optimizer = CacheOptimizer(supports_caching=lambda _model: True)
+        for exchanges in range(UNDER, 140, 2):
+            segment = await builder.build(_ctx(_session(exchanges)))
+            request, _tools, _model = await optimizer.before_llm_call(_request(segment.history), None, "stub")
+            builder.note_request("s1", request, "stub")
+
+        assert len(provider.sent) >= 2, "the session has to cross the trigger twice for this to say anything"
+        for sent in provider.sent:
+            replayed = [i for i, m in enumerate(sent[1:-1], 1) if "cache_control" in json.dumps(m)]
+            assert len(replayed) == 1
+            covered = estimate_prompt_tokens(sent[: replayed[0] + 1])
+            assert covered / estimate_prompt_tokens(sent[:-1]) > 0.9
 
     async def test_a_request_whose_history_was_rewritten_is_not_kept(self, tmp_path: Path) -> None:
         """In-turn window management may elide a body before the request goes

@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from raven.config.raven import (
+    ContextCacheConfig,
     ContextCompactionConfig,
     ContextConfig,
     ContextHistoryConfig,
@@ -34,6 +35,7 @@ from raven.context_engine.history.markers import HISTORY_CHECKPOINT_KEY, HISTORY
 from raven.context_engine.history_trimmer import HistoryTrimmer
 from raven.contracts.assembled import TokenBudget
 from raven.contracts.context import AssembledPrefix, AssemblyContext, SessionRevision
+from raven.providers.prompt_cache import COMPACTION_BOUNDARY_KEY
 from raven.utils.refs import SourceRef
 from raven.utils.tokens import estimate_prompt_tokens
 
@@ -339,6 +341,63 @@ class TestACompaction:
         await _builder(tmp_path, config=_fold_only()).build(_ctx(session))
         assert not any("<compacted-" in str(m.get("content")) for m in session)
         assert not any(set(m) & HISTORY_PRIVATE_KEYS for m in session)
+
+
+class TestTheSummaryBreakpointFlag:
+    """Where the next summary is expected to end, flagged for the cache optimizer.
+
+    One turn's half of it. That the next summary really replays the mark is
+    asserted where the summarising request is, in the checkpoint tests.
+    """
+
+    PAST_TARGET = 40
+    """Exchanges that put the prompt past the compaction target and under the trigger."""
+
+    @staticmethod
+    def _flagged(history: list[dict]) -> list[int]:
+        return [i for i, m in enumerate(history) if m.get(COMPACTION_BOUNDARY_KEY)]
+
+    async def test_a_prompt_under_the_target_flags_nothing(self, tmp_path: Path) -> None:
+        segment = await _builder(tmp_path).build(_ctx(_session(4)))
+        assert self._flagged(segment.history) == []
+
+    async def test_past_the_target_one_message_before_the_tail_is_flagged_and_nothing_else_changes(
+        self, tmp_path: Path
+    ) -> None:
+        session = _session(self.PAST_TARGET)
+        segment = await _builder(tmp_path).build(_ctx(session))
+
+        meta = segment.meta
+        assert meta["compaction_action"] == "pass"
+        assert meta["target_tokens"] < meta["prompt_tokens"] < meta["trigger_tokens"]
+        [flagged] = self._flagged(segment.history)
+        assert 0 < flagged < len(session) - ContextCompactionConfig().tail_keep_messages
+        assert [{k: v for k, v in m.items() if k != COMPACTION_BOUNDARY_KEY} for m in segment.history] == session
+
+    async def test_the_flag_only_moves_forward_as_the_log_grows(self, tmp_path: Path) -> None:
+        """A longer log is cut at or past where a shorter one would be, which
+        is the whole reason a mark placed a turn early is still inside the cut."""
+        builder = _builder(tmp_path)
+        positions = []
+        for exchanges in range(self.PAST_TARGET, 56, 2):
+            segment = await builder.build(_ctx(_session(exchanges)))
+            assert segment.meta["compaction_action"] == "pass"
+            positions += self._flagged(segment.history)
+
+        assert len(positions) == len(range(self.PAST_TARGET, 56, 2))
+        assert positions == sorted(positions)
+
+    async def test_the_switch_turns_the_flag_off(self, tmp_path: Path) -> None:
+        config = ContextConfig(cache=ContextCacheConfig(compaction_breakpoint=False))
+        segment = await _builder(tmp_path, config=config).build(_ctx(_session(self.PAST_TARGET)))
+        assert self._flagged(segment.history) == []
+
+    async def test_a_turn_that_removed_messages_flags_nothing(self, tmp_path: Path) -> None:
+        """It has just come down to the target; the next summary is a whole
+        climb to the trigger away, past any cache lifetime."""
+        segment = await _builder(tmp_path, config=_fold_only()).build(_ctx(_session(80)))
+        assert segment.meta["compaction_action"] == "compact"
+        assert self._flagged(segment.history) == []
 
 
 class TestPinnedBodies:
