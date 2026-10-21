@@ -53,12 +53,13 @@ servers Raven starts through `npx` or `uvx` fetch from their usual hosts first.
 When a host cannot be reached at all, the download comes from a mirror in
 mainland China instead: hf-mirror.com for Hugging Face, jsDelivr for files on
 GitHub, the TUNA mirror for PyPI and LibreOffice, and npmmirror for Node.js,
-npm, Playwright and the Python builds uv installs. Where a download can tell
-why it failed, an HTTP error from the usual host does not switch hosts, and
-neither does a certificate that fails verification. uv's own installer and
-Playwright's Chromium download do not say why, so each is retried from its
-mirror after any failure, and the LibreOffice and font downloads, checked
-against a pinned digest, try the mirror after their usual hosts.
+npm, Playwright and the Python builds uv installs. An HTTP error from the
+usual host does not switch hosts, and neither does a certificate that fails
+verification. uv's own installer and Playwright's Chromium download do not say
+why they failed, so the hosts they download from are asked, and the mirror
+stands in only when none of them can be reached. The LibreOffice and font
+downloads, checked against a pinned digest, try the mirror after their usual
+hosts.
 
 A mirror you configured yourself is kept: `HF_ENDPOINT`, a uv index in
 `UV_DEFAULT_INDEX` or `uv.toml`, or an npm registry set anywhere npm reads one.
