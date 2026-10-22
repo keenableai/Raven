@@ -307,7 +307,13 @@ def mirror_environment():
     if not index_chosen and not answers(PYPI_DEFAULT_INDEX):
         print(f"pypi.org could not be reached; installing from {PYPI_MIRROR} instead (RAVEN_NO_MIRROR=1 turns this off).")
         MIRROR_ENV["UV_DEFAULT_INDEX"] = PYPI_MIRROR
-    python_chosen = os.environ.get("UV_PYTHON_INSTALL_MIRROR") or any(c.get("python-install-mirror") for c in configs)
+    # A Python source counts in each form uv reads: a mirror it is given
+    # outranks a copy of releases.astral.sh, and fails outright beside a list
+    # of downloads that live elsewhere.
+    python_chosen = any(
+        os.environ.get(name)
+        for name in ("UV_PYTHON_INSTALL_MIRROR", "UV_PYTHON_DOWNLOADS_JSON_URL", "UV_ASTRAL_MIRROR_URL")
+    ) or any(c.get("python-install-mirror") or c.get("python-downloads-json-url") for c in configs)
     if not python_chosen and not answers(PYTHON_DEFAULT_DOWNLOADS):
         print(
             f"releases.astral.sh could not be reached; fetching any Python uv needs from {PYTHON_MIRROR} instead"

@@ -2545,7 +2545,15 @@ class TestTheHelperFallsBackToAMirror:
     @pytest.fixture(autouse=True)
     def _fallbacks_on(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.delenv("RAVEN_NO_MIRROR", raising=False)
-        for name in ("UV_DEFAULT_INDEX", "UV_INDEX_URL", "UV_INDEX", "UV_PYTHON_INSTALL_MIRROR", "UV_CONFIG_FILE"):
+        for name in (
+            "UV_DEFAULT_INDEX",
+            "UV_INDEX_URL",
+            "UV_INDEX",
+            "UV_PYTHON_INSTALL_MIRROR",
+            "UV_PYTHON_DOWNLOADS_JSON_URL",
+            "UV_ASTRAL_MIRROR_URL",
+            "UV_CONFIG_FILE",
+        ):
             monkeypatch.delenv(name, raising=False)
         # The user's uv.toml is looked for under these; none is there.
         for name in ("APPDATA", "PROGRAMDATA", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "HOME", "USERPROFILE"):
@@ -2695,6 +2703,44 @@ class TestTheHelperFallsBackToAMirror:
         assert not any("UV_DEFAULT_INDEX" in env for env in uv)
         said = capsys.readouterr().out
         assert "releases.astral.sh could not be reached" in said and "RAVEN_NO_MIRROR" in said
+
+    @pytest.mark.parametrize(
+        ("variable", "uv_toml"),
+        [
+            ("UV_PYTHON_INSTALL_MIRROR", None),
+            ("UV_PYTHON_DOWNLOADS_JSON_URL", None),
+            ("UV_ASTRAL_MIRROR_URL", None),
+            (None, 'python-install-mirror = "https://python.example.internal"\n'),
+            (None, 'python-downloads-json-url = "https://python.example.internal/downloads.json"\n'),
+        ],
+        ids=["mirror", "downloads-list", "astral-copy", "uv-toml-mirror", "uv-toml-downloads-list"],
+    )
+    def test_a_python_source_the_user_chose_is_kept(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        release_directory: _ReleaseDirectory,
+        tmp_path: Path,
+        variable: str | None,
+        uv_toml: str | None,
+    ) -> None:
+        """uv puts a mirror it is given before a copy of releases.astral.sh, and
+        fails outright beside a list of downloads that live elsewhere."""
+        from raven.utils import mirrors
+
+        release_directory.unreachable.add("https://releases.astral.sh/")
+        if variable is not None:
+            monkeypatch.setenv(variable, "https://python.example.internal")
+        if uv_toml is not None:
+            root = tmp_path / ("appdata" if os.name == "nt" else "xdg_config_home")
+            (root / "uv").mkdir(parents=True)
+            (root / "uv" / "uv.toml").write_text(uv_toml, encoding="utf-8")
+
+        uv, _relaunched = self._uv_environments(monkeypatch)
+
+        assert uv and not any(env.get("UV_PYTHON_INSTALL_MIRROR") == mirrors.PYTHON_DOWNLOADS for env in uv)
+        assert self._probes(release_directory, "https://releases.astral.sh/") == 0, (
+            "a choice already made is not second-guessed"
+        )
 
     def test_the_helper_names_the_hosts_the_runtime_does(self) -> None:
         """The helper runs outside the environment it rewrites and cannot import

@@ -548,8 +548,11 @@ use_package_mirrors() {
     warn "pypi.org could not be reached; installing packages from $PYPI_MIRROR instead (RAVEN_NO_MIRROR=1 turns this off)."
     use_mirror UV_DEFAULT_INDEX "$PYPI_MIRROR"
   fi
-  if [ -z "${UV_PYTHON_INSTALL_MIRROR:-}" ] \
-    && ! uv_config_has '^[[:space:]]*python-install-mirror[[:space:]]*=' \
+  # A Python source the user named counts in each form uv reads: a mirror it is
+  # given outranks a copy of releases.astral.sh, and fails outright beside a
+  # list of downloads that live elsewhere.
+  if [ -z "${UV_PYTHON_INSTALL_MIRROR:-}${UV_PYTHON_DOWNLOADS_JSON_URL:-}${UV_ASTRAL_MIRROR_URL:-}" ] \
+    && ! uv_config_has '^[[:space:]]*python-(install-mirror|downloads-json-url)[[:space:]]*=' \
     && ! reachable "$PYTHON_DOWNLOADS"; then
     warn "releases.astral.sh could not be reached; fetching any Python uv needs from $PYTHON_MIRROR instead (RAVEN_NO_MIRROR=1 turns this off)."
     use_mirror UV_PYTHON_INSTALL_MIRROR "$PYTHON_MIRROR"

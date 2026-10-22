@@ -682,7 +682,11 @@ function Use-PackageMirrors {
         Write-Warn "pypi.org could not be reached; installing packages from $PypiMirror instead (RAVEN_NO_MIRROR=1 turns this off)."
         Set-MirrorEnv "UV_DEFAULT_INDEX" $PypiMirror
     }
-    $pythonChosen = $env:UV_PYTHON_INSTALL_MIRROR -or (Test-UvConfigHas '(?m)^\s*python-install-mirror\s*=')
+    # A Python source the user named counts in each form uv reads: a mirror it
+    # is given outranks a copy of releases.astral.sh, and fails outright beside
+    # a list of downloads that live elsewhere.
+    $pythonNamed = $env:UV_PYTHON_INSTALL_MIRROR -or $env:UV_PYTHON_DOWNLOADS_JSON_URL -or $env:UV_ASTRAL_MIRROR_URL
+    $pythonChosen = $pythonNamed -or (Test-UvConfigHas '(?m)^\s*python-(install-mirror|downloads-json-url)\s*=')
     if (-not $pythonChosen -and -not (Test-Reachable $PythonDownloads)) {
         Write-Warn "releases.astral.sh could not be reached; fetching any Python uv needs from $PythonMirror instead (RAVEN_NO_MIRROR=1 turns this off)."
         Set-MirrorEnv "UV_PYTHON_INSTALL_MIRROR" $PythonMirror

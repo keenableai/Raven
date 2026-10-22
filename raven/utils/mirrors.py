@@ -324,8 +324,13 @@ def _uv_index_chosen(env: Mapping[str, str]) -> bool:
     return False
 
 
-def _uv_python_mirror_chosen(env: Mapping[str, str]) -> bool:
-    return _set(env, "UV_PYTHON_INSTALL_MIRROR") or any(c.get("python-install-mirror") for c in _uv_settings(env))
+def _uv_python_source_chosen(env: Mapping[str, str]) -> bool:
+    """Whether the user named where uv fetches a Python from, in any form uv
+    reads: a mirror it is given outranks a copy of releases.astral.sh, and
+    fails outright beside a list of downloads that live elsewhere."""
+    if _set(env, "UV_PYTHON_INSTALL_MIRROR", "UV_PYTHON_DOWNLOADS_JSON_URL", "UV_ASTRAL_MIRROR_URL"):
+        return True
+    return any(c.get("python-install-mirror") or c.get("python-downloads-json-url") for c in _uv_settings(env))
 
 
 def _names(args: Sequence[str], flags: Sequence[str]) -> bool:
@@ -391,7 +396,7 @@ def _package_launch(argv: list[str], env: Mapping[str, str], cwd: str | None) ->
     mirror_of: dict[str, str] = {}
     if not _uv_index_named(argv[1:]) and not _uv_index_chosen(env):
         mirror_of[PYPI_DEFAULT_INDEX] = PYPI_INDEX
-    if not _uv_python_mirror_chosen(env):
+    if not _uv_python_source_chosen(env):
         mirror_of[PYTHON_DEFAULT_DOWNLOADS] = PYTHON_DOWNLOADS
     moved = _moved(mirror_of) if mirror_of else set()
     extra: dict[str, str] = {}

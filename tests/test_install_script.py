@@ -2397,16 +2397,21 @@ def test_a_uv_toml_uv_config_file_names_is_read_alone(
     assert said["INDEX"] == index
 
 
+# Each form in which uv is told where a Python comes from: a mirror of the
+# builds, a list of downloads of the user's own, a copy of releases.astral.sh.
+_PYTHON_SOURCES = [
+    ({"UV_PYTHON_INSTALL_MIRROR": "https://python.example.internal"}, None),
+    ({"UV_PYTHON_DOWNLOADS_JSON_URL": "https://python.example.internal/downloads.json"}, None),
+    ({"UV_ASTRAL_MIRROR_URL": "https://astral.example.internal"}, None),
+    ({}, 'python-install-mirror = "https://python.example.internal"\n'),
+    ({}, 'python-downloads-json-url = "https://python.example.internal/downloads.json"\n'),
+]
+_PYTHON_SOURCE_IDS = ["mirror", "downloads-list", "astral-copy", "uv-toml-mirror", "uv-toml-downloads-list"]
+
+
 @POSIX_SH_ONLY
-@pytest.mark.parametrize(
-    ("env", "uv_toml"),
-    [
-        ({"UV_PYTHON_INSTALL_MIRROR": "https://python.example.internal"}, None),
-        ({}, 'python-install-mirror = "https://python.example.internal"\n'),
-    ],
-    ids=["environment", "uv-toml"],
-)
-def test_a_python_mirror_the_user_chose_is_kept(tmp_path: Path, env: dict[str, str], uv_toml: str | None) -> None:
+@pytest.mark.parametrize(("env", "uv_toml"), _PYTHON_SOURCES, ids=_PYTHON_SOURCE_IDS)
+def test_a_python_source_the_user_chose_is_kept(tmp_path: Path, env: dict[str, str], uv_toml: str | None) -> None:
     _result, said, probes = _run_package_step(tmp_path, down=("https://releases.astral.sh/",), env=env, uv_toml=uv_toml)
 
     assert said["PYTHON"] == env.get("UV_PYTHON_INSTALL_MIRROR", "")
@@ -2531,17 +2536,11 @@ def test_a_windows_install_reads_only_the_uv_toml_uv_config_file_names(tmp_path:
 
 @pytest.mark.slow
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
-@pytest.mark.parametrize(
-    ("env", "uv_tomls"),
-    [
-        ({"UV_PYTHON_INSTALL_MIRROR": "https://python.example.internal"}, None),
-        ({}, {"appdata": 'python-install-mirror = "https://python.example.internal"\n'}),
-    ],
-    ids=["environment", "uv-toml"],
-)
-def test_a_windows_install_keeps_a_python_mirror_the_user_chose(
-    tmp_path: Path, env: dict[str, str], uv_tomls: dict[str, str] | None
+@pytest.mark.parametrize(("env", "uv_toml"), _PYTHON_SOURCES, ids=_PYTHON_SOURCE_IDS)
+def test_a_windows_install_keeps_a_python_source_the_user_chose(
+    tmp_path: Path, env: dict[str, str], uv_toml: str | None
 ) -> None:
+    uv_tomls = {"appdata": uv_toml} if uv_toml is not None else None
     _result, said = _run_ps1_package_step(tmp_path, down=("https://releases.astral.sh/",), env=env, uv_tomls=uv_tomls)
 
     assert said["PYTHON"] == env.get("UV_PYTHON_INSTALL_MIRROR", "")

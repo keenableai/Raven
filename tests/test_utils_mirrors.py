@@ -462,11 +462,31 @@ class TestPackageRunners:
             "pkg",
         ]
 
-    def test_a_python_mirror_in_uv_toml_wins(self, network, tmp_path) -> None:
+    @pytest.mark.parametrize(
+        ("variable", "uv_toml"),
+        [
+            ("UV_PYTHON_INSTALL_MIRROR", None),
+            ("UV_PYTHON_DOWNLOADS_JSON_URL", None),
+            ("UV_ASTRAL_MIRROR_URL", None),
+            (None, 'python-install-mirror = "https://python.example.internal"\n'),
+            (None, 'python-downloads-json-url = "https://python.example.internal/downloads.json"\n'),
+        ],
+        ids=["mirror", "downloads-list", "astral-copy", "uv-toml-mirror", "uv-toml-downloads-list"],
+    )
+    def test_a_python_source_the_user_chose_wins(
+        self, network, tmp_path, variable: str | None, uv_toml: str | None
+    ) -> None:
+        """uv puts a mirror it is given before a copy of releases.astral.sh, and
+        fails outright beside a list of downloads that live elsewhere."""
         network.down.add(mirrors.PYTHON_DEFAULT_DOWNLOADS)
-        self._uv_toml(tmp_path, 'python-install-mirror = "https://python.example.internal"\n')
+        env = self._home(tmp_path)
+        if variable is not None:
+            env = {**env, variable: "https://python.example.internal"}
+        if uv_toml is not None:
+            self._uv_toml(tmp_path, uv_toml)
 
-        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path))[1] == {}
+        assert mirrors.package_launch(["uvx", "pkg"], env)[1] == {}
+        assert mirrors.PYTHON_DEFAULT_DOWNLOADS not in network.asked, "a choice already made is not second-guessed"
 
     def test_the_opt_out_leaves_every_runner_alone(self, network, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
         network.down |= {mirrors.NPM_DEFAULT_REGISTRY, mirrors.PYPI_DEFAULT_INDEX}
