@@ -369,6 +369,19 @@ All notable changes to Raven are documented here.
 
 ### Fixed
 
+- Installing the Raven node on a machine whose package index crawls there no
+  longer stalls the install. The index pip is configured with (else PyPI) is
+  timed from the machine first; when it cannot be reached there, or serves
+  slower than 256 KB/s, the packages come from the faster of two PyPI mirrors
+  in mainland China (Tsinghua's TUNA, Alibaba Cloud's), with the machine's own
+  index tried after it, and the plan says so; `RAVEN_NO_MIRROR=1` keeps every
+  install on the machine's index. The **Machines** tab now waits for as long as
+  an install runs, where a fifteen-minute deadline of its own gave up just before
+  the gateway reported a step out of time and left the card spinning; such a
+  step now names itself and the index it was downloading from instead of
+  saying the machine did not answer; a half-made Raven node left by a step
+  given up on no longer fails the next attempt; and the optional search package
+  running out of time no longer fails the install.
 - An empty reply from a model behind OpenRouter (`content: " "`,
   `finish_reason: stop`) is no longer reported as an upstream transport
   failure and retried for minutes before the verdict's own sentence is
