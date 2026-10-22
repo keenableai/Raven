@@ -382,6 +382,11 @@ All notable changes to Raven are documented here.
   running**, and a cancelled run **Stopped**, where both used to read
   **Finished**. Conversations stored before this keep the fold they had.
 
+- A decision node's card on the tasks board keeps its first selected route
+  whole. The agent line gave the selection all of its overflow, so a long agent
+  name and a tool count cut it down to its arrow; now the instance handle and
+  any further routes give way first, then the agent's name.
+
 - An empty reply from a model behind OpenRouter (`content: " "`,
   `finish_reason: stop`) is no longer reported as an upstream transport
   failure and retried for minutes before the verdict's own sentence is
