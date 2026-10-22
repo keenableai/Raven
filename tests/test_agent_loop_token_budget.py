@@ -134,10 +134,11 @@ def test_a_ceiling_as_large_as_the_window_still_leaves_room_for_history(workspac
     # rule's only statement. What stayed out: worked examples, and a second copy
     # of the rule in the tool descriptions.
     #
-    # The compacting history strategy then became the default and brought `context_retrieve` onto every
-    # default face: its schema is ~300 tokens, the cost of the refs the
-    # strategy leaves in the window being readable at all. Nothing was traded:
-    # the tool is only registered beside a strategy that mints refs.
+    # The compacting history strategy then became the default and brought
+    # `context_retrieve` onto every default face: its schema is ~250 tokens, the
+    # cost of the refs the strategy leaves in the window being readable at all.
+    # Measured 125_680 with both, so the bound stayed. Nothing was traded: the
+    # tool is only registered beside a strategy that mints refs.
     assert budget.available_history > 125_500, "an honest ceiling must not squeeze history toward zero"
     # `reserved_tools` is what the old 129_000 bound was really watching, and it
     # is invariant across those same three paths: paid on every turn of every
