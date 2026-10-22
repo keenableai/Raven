@@ -1045,7 +1045,7 @@ rolls token counts and USD cost up into per-session, per-day, and lifetime aggre
 The shipped TokenStrategy (`"cache_optimizer"`) that places Anthropic's ≤4 ephemeral
 `cache_control` breakpoints adaptively (tools tail + system tail + a rolling message-tail
 window). When the compacting History Strategy flags the message its next summary is
-expected to end on (`cache_compaction_boundary`, `context.cache.compactionBreakpoint`),
+expected to end on (`cache_compaction_boundary`, opt-in through `context.cache.compactionBreakpoint`),
 that mark takes the rolling window's oldest slot: the summary replays an earlier request as
 a byte prefix that stops behind every rolling mark, so it is the only breakpoint the
 summary can read back past the system head. A Hermes-faithful `SystemAndTailCacheStrategy`

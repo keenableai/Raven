@@ -51,7 +51,7 @@ DEFAULTS = [
     ("headroom floor constant", headroom.DEFAULT_MIN_REPLY_HEADROOM_TOKENS, 4_096),
     ("headroom backoff constant", headroom.DEFAULT_OVERFLOW_BACKOFF_TOKENS, 8_192),
     ("cache.turnScratch", _CONTEXT.cache.turn_scratch, True),
-    ("cache.compactionBreakpoint", _CONTEXT.cache.compaction_breakpoint, True),
+    ("cache.compactionBreakpoint", _CONTEXT.cache.compaction_breakpoint, False),
     ("toolResultMaxChars", _CONTEXT.tool_result_max_chars, 1_000_000),
     ("context_retrieve default budget", context_retrieve._DEFAULT_MAX_TOKENS, 4_000),
     ("context_retrieve budget ceiling", context_retrieve._MAX_MAX_TOKENS, 32_000),

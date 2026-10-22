@@ -80,7 +80,7 @@ class ContextCacheConfig(_Base):
     since it is the one of the two that does not move with the query.
     """
 
-    compaction_breakpoint: bool = True
+    compaction_breakpoint: bool = False
     """Also mark where the next summarising request is expected to end.
 
     The compacting strategy writes a summary by replaying an earlier request as
@@ -89,11 +89,17 @@ class ContextCacheConfig(_Base):
     the system head. Once the prompt is past the compaction target, each turn
     flags where its summary would end if the log compacted now -- the next
     real cut lands at or past it -- and the cache optimizer spends its oldest
-    rolling mark there. It adds no write to the ordinary request -- everything
-    in front of the last mark is written regardless -- and only
-    breakpoint-style caches (Anthropic) read it; an automatic prefix cache hits
-    either way. Takes effect only while ``tokenWise.cacheOptimization`` places
+    rolling mark there. Only breakpoint-style caches (Anthropic) read it; an
+    automatic prefix cache hits either way. Takes effect only while ``tokenWise.cacheOptimization`` places
     the marks.
+
+    Off by default. The flag takes the rolling window's oldest slot, and on a
+    turn's first request that slot holds the last history message -- the only
+    mark the next turn can read its history back through, since the turn's own
+    message is filed in a different form from the one sent. On Anthropic every
+    turn past the target then writes its history to cache again; a review
+    measured 1.07x to 2.0x the cost across window sizes, with or without a
+    summary ever firing. Turn it on once the mark has a slot of its own.
     """
 
 

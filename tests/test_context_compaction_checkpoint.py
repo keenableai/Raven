@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from raven.config.raven import (
+    ContextCacheConfig,
     ContextCompactionConfig,
     ContextConfig,
     ContextHistoryConfig,
@@ -441,7 +442,9 @@ class TestPrefixReuse:
         cache optimizer marking what the loop sends: each summary has to carry
         that mark, deep enough that most of what it replays is cacheable."""
         provider = _RecordingProvider()
-        builder = _builder(tmp_path, provider)
+        builder = _builder(
+            tmp_path, provider, config=ContextConfig(cache=ContextCacheConfig(compaction_breakpoint=True))
+        )
         optimizer = CacheOptimizer(supports_caching=lambda _model: True)
         for exchanges in range(UNDER, 140, 2):
             segment = await builder.build(_ctx(_session(exchanges)))
