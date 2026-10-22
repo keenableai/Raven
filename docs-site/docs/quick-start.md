@@ -61,8 +61,11 @@ stands in only when none of them can be reached. The LibreOffice and font
 downloads, checked against a pinned digest, try the mirror after their usual
 hosts.
 
-A mirror you configured yourself is kept: `HF_ENDPOINT`, a uv index in
-`UV_DEFAULT_INDEX` or `uv.toml`, or an npm registry set anywhere npm reads one.
+A host you configured yourself is kept: `HF_ENDPOINT`, a uv index in
+`UV_DEFAULT_INDEX` or `uv.toml`, a download source for uv's installer or for
+the Pythons uv installs (such as `UV_INSTALLER_GITHUB_BASE_URL` or
+`UV_PYTHON_INSTALL_MIRROR`), `PLAYWRIGHT_DOWNLOAD_HOST`, or an npm registry set
+anywhere npm reads one.
 An `npx` or `uvx` launch switches only when the mirror can be reached, so a
 package already in its cache still starts offline, and an agent started
 through `npx` this way keeps the npm mirror for the npm commands it runs

@@ -53,8 +53,10 @@ HTTP 错误或证书校验失败时都不会切换。uv 自带的安装脚本和
 说不清失败原因，所以会再探测它们下载用的那几个地址，全都连不上时才改从镜像下载；
 LibreOffice 和字体文件有固定的摘要校验，默认地址都失败后会改从镜像下载。
 
-你自己配置的镜像会保留：`HF_ENDPOINT`，写在 `UV_DEFAULT_INDEX` 或 `uv.toml` 里的 uv
-索引，以及 npm 能读到的任何一处 registry 设置。`npx` 和 `uvx` 只在镜像连得上时才切换，
+你自己配置的下载地址会保留：`HF_ENDPOINT`，写在 `UV_DEFAULT_INDEX` 或 `uv.toml` 里的 uv
+索引，为 uv 安装脚本或 uv 安装的 Python 指定的下载源（如 `UV_INSTALLER_GITHUB_BASE_URL`、
+`UV_PYTHON_INSTALL_MIRROR`），`PLAYWRIGHT_DOWNLOAD_HOST`，以及 npm 能读到的任何一处
+registry 设置。`npx` 和 `uvx` 只在镜像连得上时才切换，
 所以缓存里已有的包离线时照样能启动；这样通过 `npx` 启动的智能体，自己运行的 npm 命令也会
 沿用 npm 镜像。设置 `RAVEN_NO_MIRROR=1` 可让所有下载都只使用默认地址。Raven 自己的发布
 文件来自 GitHub Releases，没有镜像。
