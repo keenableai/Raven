@@ -114,21 +114,22 @@ async def test_every_answered_request_is_reported_to_the_engine(workspace, monke
         ]
     )
     agent = _agent(workspace, provider, monkeypatch)
-    heard: list[tuple[str, int, str]] = []
+    heard: list[tuple[str, int, str, object]] = []
     monkeypatch.setattr(
         agent.context_engine,
         "note_request",
-        lambda key, messages, *, model: heard.append((key, len(messages), model)),
+        lambda key, messages, *, model, tools=None: heard.append((key, len(messages), model, tools)),
         raising=False,
     )
 
     await agent._run_agent_loop(_prompt(10), session_key="s1")
 
-    assert [(k, n) for k, n, _ in heard] == [
+    assert [(k, n) for k, n, _, _ in heard] == [
         ("s1", len(provider.calls[0]["messages"])),
         ("s1", len(provider.calls[1]["messages"])),
     ]
-    assert all(model for _, _, model in heard)
+    assert all(model for _, _, model, _ in heard)
+    assert [tools for _, _, _, tools in heard] == [provider.calls[0]["tools"], provider.calls[1]["tools"]]
 
 
 def _overflow() -> LLMResponse:

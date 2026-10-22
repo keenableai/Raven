@@ -241,11 +241,17 @@ class RequestRecord:
 
     ``model`` is what the request went out under. A cache entry belongs to one
     model, so a record from another one is a prefix of nothing.
+
+    ``tools`` is the tool list it carried, ``None`` when the sender did not
+    say. Tools head a breakpoint-style cache key, and the list a turn sends is
+    not the registry's: tool search drops ``tool_search`` itself at small
+    catalogues, so a summary sent with the registry's list reads nothing back.
     """
 
     messages: tuple[dict[str, Any], ...] = ()
     keys: tuple[MessageKey, ...] = ()
     model: str = ""
+    tools: tuple[dict[str, Any], ...] | None = None
 
     @property
     def usable(self) -> bool:

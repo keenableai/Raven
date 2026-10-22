@@ -520,6 +520,30 @@ class TestPrefixReuse:
         assert provider.models == ["stub"]
         assert provider.tools == [tools]
 
+    async def test_it_goes_out_with_the_tool_list_the_turn_sent_not_the_registrys(self, tmp_path: Path) -> None:
+        """Tools head a breakpoint-style cache key, and tool search drops
+        ``tool_search`` from a small catalogue on the way out: a summary sent
+        with the registry's list is a prefix of nothing the turn cached."""
+        provider = _RecordingProvider()
+        sent_tools = [{"type": "function", "function": {"name": "read_file", "parameters": {}}}]
+        registry = [*sent_tools, {"type": "function", "function": {"name": "tool_search", "parameters": {}}}]
+        builder = _builder(tmp_path, provider, tools=registry)
+        segment = await builder.build(_ctx(_session(UNDER), tools=registry))
+        builder.note_request("s1", _request(segment.history), "stub", tools=sent_tools)
+        await builder.build(_ctx(_session(OVER), tools=registry))
+
+        assert provider.tools == [sent_tools]
+
+    async def test_a_record_without_a_tool_list_falls_back_to_the_registrys(self, tmp_path: Path) -> None:
+        provider = _RecordingProvider()
+        registry = [{"type": "function", "function": {"name": "read_file", "parameters": {}}}]
+        builder = _builder(tmp_path, provider, tools=registry)
+        segment = await builder.build(_ctx(_session(UNDER), tools=registry))
+        builder.note_request("s1", _request(segment.history), "stub")
+        await builder.build(_ctx(_session(OVER), tools=registry))
+
+        assert provider.tools == [registry]
+
     async def test_a_second_model_turns_prefix_reuse_off_and_says_so(self, tmp_path: Path) -> None:
         provider = _RecordingProvider()
         builder = _builder(tmp_path, provider, config=_summary_config(model="some/other-model"))

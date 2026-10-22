@@ -272,7 +272,14 @@ class ContextAssembler(ContextEngine):
             if hook is not None:
                 await hook(session_key, outcome, usage)
 
-    def note_request(self, session_key: str, messages: list[dict[str, Any]], *, model: str) -> None:
+    def note_request(
+        self,
+        session_key: str,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> None:
         # Duck-typed like ``set_provider``: only a history builder that replays
         # requests keeps them.
         for builder in self._phase_b:
@@ -280,7 +287,7 @@ class ContextAssembler(ContextEngine):
             if hook is None:
                 continue
             try:
-                hook(session_key, messages, model=model)
+                hook(session_key, messages, model=model, tools=tools)
             except Exception:
                 # Bookkeeping for a later summary; a failure here must not undo
                 # a call that was already answered.

@@ -67,9 +67,9 @@ class MemoryContext(ContextEngine):
     def mints_source_refs(self):
         return self.base.mints_source_refs if self.base is not None else False
 
-    def note_request(self, session_key, messages, *, model):
+    def note_request(self, session_key, messages, *, model, tools=None):
         if self.base is not None:
-            self.base.note_request(session_key, messages, model=model)
+            self.base.note_request(session_key, messages, model=model, tools=tools)
 
     async def on_context_overflow(self, session_key, messages, *, attempt, window):
         if self.base is None:

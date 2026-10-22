@@ -207,7 +207,14 @@ class CompactingHistoryBuilder:
     # The request the loop actually sent
     # ------------------------------------------------------------------
 
-    def note_request(self, session_key: str, messages: list[dict[str, Any]], model: str = "") -> None:
+    def note_request(
+        self,
+        session_key: str,
+        messages: list[dict[str, Any]],
+        model: str = "",
+        *,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Keep a request the loop is sending, for the next summary to reuse.
 
         The next compaction is built out of these bytes rather than out of a
@@ -224,8 +231,10 @@ class CompactingHistoryBuilder:
         iterations of a turn append after the history, so the latest request
         that still carries it is the one kept.
 
-        ``model`` is the model the request went out under. Losing a record --
-        to a restart or an eviction -- costs one summary its cache reuse.
+        ``model`` is the model the request went out under and ``tools`` the
+        tool list it carried; the summary goes out with that list rather than
+        the registry's. Losing a record -- to a restart or an eviction -- costs
+        one summary its cache reuse.
         """
         memo = self._sessions.get(session_key)
         if memo is None or not memo.keys:
@@ -239,7 +248,12 @@ class CompactingHistoryBuilder:
         for sent, built in zip(head[1:-1], memo.view):
             if sent != built and _comparable(sent) != built:
                 return
-        memo.record = RequestRecord(messages=tuple(head), keys=memo.keys, model=model or "")
+        memo.record = RequestRecord(
+            messages=tuple(head),
+            keys=memo.keys,
+            model=model or "",
+            tools=None if tools is None else tuple(dict(tool) for tool in tools),
+        )
 
     # ------------------------------------------------------------------
     # One turn
@@ -762,7 +776,9 @@ class CompactingHistoryBuilder:
                 keys=keys,
                 fresh=fresh,
                 record=memo.record,
-                tool_defs=prefix.tool_defs,
+                tool_defs=(
+                    memo.record.tools if memo.record is not None and memo.record.tools is not None else prefix.tool_defs
+                ),
                 folded_messages=folded_messages,
                 folded_tokens=folded_tokens,
             )

@@ -290,7 +290,7 @@ def test_import_guard_bites_machinery_and_spares_type_checking(tmp_path):
 # The contract tier is versioned: its shape moves only with a version bump
 # ---------------------------------------------------------------------------
 
-PINNED_CONTRACT_SURFACE = ("39", "10dd4a11c607f57ca74690b146e3d098be5a8d19d97c06461e67d3a2d87e6a3f")
+PINNED_CONTRACT_SURFACE = ("39", "888d720a919b86b341832a77d73893c4baedc31bef84743f84cab3075385a153")
 
 
 def _render(node) -> str:

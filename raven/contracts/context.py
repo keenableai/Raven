@@ -272,13 +272,21 @@ class ContextEngine(ABC):
         """
         return None
 
-    def note_request(self, session_key: str, messages: list[dict[str, Any]], *, model: str) -> None:
+    def note_request(
+        self,
+        session_key: str,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Hear about a request the loop actually sent for ``session_key``.
 
-        ``messages`` is the payload as it went out and ``model`` the id it went
-        out under. A history strategy that summarises by replaying the previous
-        request -- so the summarising call can reuse its cached prefix -- keeps
-        the last one here. Default is no-op.
+        ``messages`` is the payload as it went out, ``model`` the id it went
+        out under and ``tools`` the tool list it carried (``None`` when the
+        caller does not say). A history strategy that summarises by replaying
+        the previous request -- so the summarising call can reuse its cached
+        prefix -- keeps the last one here. Default is no-op.
         """
         return None
 

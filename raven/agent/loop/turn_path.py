@@ -1285,7 +1285,7 @@ class TurnPathMixin:
                 # What went out and was answered, for a history strategy that
                 # summarises by replaying it (its prefix is what is cached).
                 try:
-                    note(session_key or "", call_messages, model=call_model or effective_model)
+                    note(session_key or "", call_messages, model=call_model or effective_model, tools=call_tools)
                 except Exception:
                     logger.opt(exception=True).error("the context engine failed to note a request")
             # Assigned, not latched: the fact this carries is that the turn's
