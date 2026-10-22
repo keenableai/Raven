@@ -289,13 +289,15 @@ refused as too long (an engine with nothing to give back returns None).
 every existing engine is unchanged; ``AssemblyContext`` and ``TurnContext``
 each append one ``session_revision`` field. On the harness paper
 ``WindowState`` appends ``session_key``, and the ``shrink`` docstring states
-the copy convention the turn record relies on. 100 lines, all of them this
+the copy convention the turn record relies on. 108 lines, all of them this
 addition: the package stood at the old ceiling, 3,700, without it. Review
 trimmed the first draft by 16: a message count on the revision, an
 ``advanced`` flag on the outcome and a ``wants_full_history`` property that
-nothing read.
+nothing read. ``note_request`` then grew an optional ``tools`` argument, the
+list a request actually carried, so a summary replays it rather than the
+registry's.
 
-Measured at 3,800.
+Measured at 3,808.
 
 """
 

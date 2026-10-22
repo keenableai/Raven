@@ -544,6 +544,18 @@ class TestPrefixReuse:
 
         assert provider.tools == [registry]
 
+    async def test_a_record_another_model_wrote_lends_neither_its_messages_nor_its_tools(self, tmp_path: Path) -> None:
+        provider = _RecordingProvider()
+        sent_tools = [{"type": "function", "function": {"name": "read_file", "parameters": {}}}]
+        registry = [*sent_tools, {"type": "function", "function": {"name": "tool_search", "parameters": {}}}]
+        builder = _builder(tmp_path, provider, config=_summary_config(model="some/other-model"), tools=registry)
+        segment = await builder.build(_ctx(_session(UNDER), tools=registry))
+        builder.note_request("s1", _request(segment.history), "stub", tools=sent_tools)
+        second = await builder.build(_ctx(_session(OVER), tools=registry))
+
+        assert second.meta["byte_prefix_reused"] is False
+        assert provider.tools == [registry]
+
     async def test_a_second_model_turns_prefix_reuse_off_and_says_so(self, tmp_path: Path) -> None:
         provider = _RecordingProvider()
         builder = _builder(tmp_path, provider, config=_summary_config(model="some/other-model"))
