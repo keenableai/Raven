@@ -190,13 +190,22 @@ function Ensure-Uv {
     }
     Remove-Item $installer -Force -ErrorAction SilentlyContinue
     $uv = Find-Uv
-    if (-not $uv -and (Test-MirrorsAllowed) -and (Test-UvUnreachable $fetched)) { $uv = Install-UvFromMirror }
+    if (-not $uv -and (Test-MirrorsAllowed) -and -not (Test-UvHostChosen) -and (Test-UvUnreachable $fetched)) {
+        $uv = Install-UvFromMirror
+    }
     if (-not $uv) {
         Fail "uv could not be installed, or is not where it was put. Check PATH (expected ~/.local/bin)."
     }
     Add-ProcessPath (Split-Path $uv -Parent)
     Write-Ok "uv installed"
     return $uv
+}
+
+# Whether the user chose where uv's installer downloads uv from. It reads these
+# four, in this order, before its own two hosts, and the host chosen keeps its
+# say: its answer, or its silence, is final, and the mirror never replaces it.
+function Test-UvHostChosen {
+    return [bool]($env:UV_DOWNLOAD_URL -or $env:INSTALLER_DOWNLOAD_URL -or $env:UV_INSTALLER_GHE_BASE_URL -or $env:UV_INSTALLER_GITHUB_BASE_URL)
 }
 
 # Whether uv's installer failed for want of a connection, the one failure a

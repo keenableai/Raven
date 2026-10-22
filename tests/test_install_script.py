@@ -1814,6 +1814,7 @@ _UV_STEP = (
     "reachable",
     "resolve_href",
     "install_uv_from_mirror",
+    "uv_host_chosen",
     "uv_unreachable",
     "ensure_uv",
 )
@@ -1987,6 +1988,39 @@ def test_an_installer_that_works_is_all_uv_takes(tmp_path: Path) -> None:
     assert asked == [_UV_INSTALLER_URL], "no host is asked about once uv is in place"
 
 
+# What uv's installers read, in this order and before their own two hosts, for
+# where to download uv from (as of 0.13.4).
+_UV_HOST_SETTINGS = [
+    "UV_DOWNLOAD_URL",
+    "INSTALLER_DOWNLOAD_URL",
+    "UV_INSTALLER_GHE_BASE_URL",
+    "UV_INSTALLER_GITHUB_BASE_URL",
+]
+
+
+@POSIX_SH_ONLY
+@pytest.mark.parametrize("name", _UV_HOST_SETTINGS)
+@pytest.mark.parametrize("installer", ["left-no-uv", "unreachable"])
+def test_a_host_the_user_chose_for_uvs_installer_is_never_replaced(tmp_path: Path, name: str, installer: str) -> None:
+    """uv's two hosts out of reach, as on a network that blocks them, and the
+    host the user named for uv in their place: its answer, or its silence, is
+    final, the same with no installer to run."""
+    page, served = _uv_index(tmp_path, _UV_LINUX_TAG)
+    if installer == "left-no-uv":
+        served[_UV_INSTALLER_URL] = _uv_installer(tmp_path, works=False)
+    down = ("https://releases.astral.sh/", "https://github.com/")
+    if installer == "unreachable":
+        down += ("https://astral.sh/",)
+
+    result, bin_dir, asked = _run_uv_step(
+        tmp_path, {_UV_PAGE: page, **served}, env={name: "https://uv.example.internal"}, down=down
+    )
+
+    assert result.returncode != 0 and "DIE " in result.stderr, result.stdout + result.stderr
+    assert not (bin_dir / "uv").exists()
+    assert not any("tuna" in url for url in asked)
+
+
 _PS1_UV_STEP = r"""
 foreach ($text in (Get-Install @("Find-Uv", "Install-UvFromMirror", "Test-MirrorsAllowed"))) {
     Invoke-Expression $text
@@ -2064,7 +2098,7 @@ def test_a_windows_uv_comes_from_the_index_the_user_named(tmp_path: Path) -> Non
 
 
 _PS1_ENSURE_UV_STEP = r"""
-$names = @("Ensure-Uv", "Test-UvUnreachable", "Test-Reachable", "Test-MirrorsAllowed")
+$names = @("Ensure-Uv", "Test-UvHostChosen", "Test-UvUnreachable", "Test-Reachable", "Test-MirrorsAllowed")
 foreach ($text in (Get-Install $names)) { Invoke-Expression $text }
 function Write-Info([string]$Message) { }
 function Write-Ok([string]$Message) { }
@@ -2191,6 +2225,28 @@ def test_a_windows_uv_comes_from_the_mirror_only_when_its_installer_could_not_be
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
 def test_the_windows_opt_out_leaves_uv_to_its_own_installer(tmp_path: Path) -> None:
     result, lines = _run_ps1_ensure_uv_step(tmp_path, down=("https://astral.sh/",), env={"RAVEN_NO_MIRROR": "1"})
+
+    assert "MIRROR" not in lines, result.stdout + result.stderr
+    assert any(line.startswith("FAIL uv could not be installed") for line in lines)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+@pytest.mark.parametrize("name", _UV_HOST_SETTINGS)
+@pytest.mark.parametrize("installer", ["left-no-uv", "unreachable"])
+def test_a_host_the_user_chose_for_the_windows_uv_installer_is_never_replaced(
+    tmp_path: Path, name: str, installer: str
+) -> None:
+    down = ("https://releases.astral.sh/", "https://github.com/")
+    if installer == "unreachable":
+        down += ("https://astral.sh/",)
+
+    result, lines = _run_ps1_ensure_uv_step(
+        tmp_path,
+        installer=_PS1_UV_INSTALLER_FAILS if installer == "left-no-uv" else None,
+        down=down,
+        env={name: "https://uv.example.internal"},
+    )
 
     assert "MIRROR" not in lines, result.stdout + result.stderr
     assert any(line.startswith("FAIL uv could not be installed") for line in lines)

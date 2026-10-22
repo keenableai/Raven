@@ -157,9 +157,16 @@ ensure_uv() {
   # uv installs to ~/.local/bin (or $XDG_BIN_HOME) -- make it visible for the
   # rest of this script even before the shell profile is re-sourced.
   export PATH="$HOME/.local/bin:$PATH"
-  if ! have uv && mirrors_allowed && uv_unreachable "$uv_fetch"; then install_uv_from_mirror || true; fi
+  if ! have uv && mirrors_allowed && ! uv_host_chosen && uv_unreachable "$uv_fetch"; then install_uv_from_mirror || true; fi
   have uv || die "uv could not be installed, or is not where it was put; check PATH (expected in ~/.local/bin)"
   ok "uv installed"
+}
+
+# Whether the user chose where uv's installer downloads uv from. It reads these
+# four, in this order, before its own two hosts, and the host chosen keeps its
+# say: its answer, or its silence, is final, and the mirror never replaces it.
+uv_host_chosen() {
+  [ -n "${UV_DOWNLOAD_URL:-}${INSTALLER_DOWNLOAD_URL:-}${UV_INSTALLER_GHE_BASE_URL:-}${UV_INSTALLER_GITHUB_BASE_URL:-}" ]
 }
 
 # Whether uv's installer failed for want of a connection, the one failure a
