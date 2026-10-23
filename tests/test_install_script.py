@@ -741,6 +741,13 @@ def _run_ps1(tmp_path: Path, name: str, body: str, *, env: dict[str, str] | None
         check=False,
         env={
             "PATH": os.environ.get("PATH", ""),
+            # A trimmed environment loses the system directory and the executable
+            # extensions with it: without PATHEXT the child pwsh reads a bare
+            # powershell.exe as a document and refuses to run it in a pipeline.
+            "PATHEXT": os.environ.get("PATHEXT", ""),
+            "SYSTEMROOT": os.environ.get("SYSTEMROOT", os.environ.get("WINDIR", "")),
+            "WINDIR": os.environ.get("WINDIR", os.environ.get("SYSTEMROOT", "")),
+            "PSModulePath": os.environ.get("PSModulePath", ""),
             "HOME": str(tmp_path),
             "TMPDIR": str(staging),
             "TMP": str(staging),
