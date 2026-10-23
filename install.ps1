@@ -100,16 +100,24 @@ function Test-MirrorsAllowed {
     return -not ($env:RAVEN_NO_MIRROR -match '^\s*(1|true|yes|on)\s*$')
 }
 
-# False only when no connection to $Url completed: the name did not resolve,
-# the connection was refused, reset or timed out, or TLS never got going. Any
-# HTTP answer, an error status included, carries a response and is the host
-# being there, and so is a certificate that fails verification: whatever
-# re-signs this host's traffic re-signs a mirror's too.
+# False only when no connection to $Url completed: the name did not resolve, no
+# route led to the host, the connection was refused, reset or timed out, or TLS
+# never got going. Any HTTP answer, an error status included, carries a
+# response and is the host being there, and so is a certificate that fails
+# verification: whatever re-signs this host's traffic re-signs a mirror's too.
+# A proxy's answer to the request for a tunnel speaks for the host: a 5xx says
+# it could not reach it, while any other refusal is final -- the mirror would be
+# asked through the same proxy, and would only route around its rules. A SOCKS
+# proxy that could not connect gives no status, and counts as not reached. The
+# rule raven/utils/mirrors.py states in full; a test runs every copy of it
+# against the same hosts and proxies.
 function Test-Reachable([string]$Url) {
     try {
         $null = Invoke-WebRequest $Url -Method Head -UseBasicParsing -TimeoutSec 10
         return $true
     } catch {
+        $tunnel = Get-TunnelStatus $_.Exception $Url
+        if ($null -ne $tunnel) { return ($tunnel -gt 0 -and $tunnel -lt 500) }
         if ($_.Exception.Response) { return $true }
         # Windows PowerShell names a refused certificate outright.
         if ("$($_.Exception.Status)" -eq "TrustFailure") { return $true }
@@ -124,6 +132,28 @@ function Test-Reachable([string]$Url) {
     } catch {
         return [bool]$_.Exception.Response
     }
+}
+
+# What a proxy refused the tunnel to $Url with, when that refusal is why
+# $Failure was raised: its status, or 0 from a SOCKS proxy, which gives none;
+# $null for any other failure. PowerShell 7.4 and later name the failure and
+# carry an HTTP proxy's status. Windows PowerShell hands back the proxy's own
+# response, which comes from the proxy's address rather than $Url's.
+function Get-TunnelStatus($Failure, [string]$Url) {
+    if ("$($Failure.HttpRequestError)" -eq "ProxyTunnelError") {
+        if ($Failure.StatusCode) { return [int]$Failure.StatusCode }
+        return 0
+    }
+    $response = $Failure.Response
+    if ($response -and $response.ResponseUri) {
+        $target = [uri]$Url
+        $proxy = [System.Net.WebRequest]::DefaultWebProxy
+        $through = if ($proxy) { $proxy.GetProxy($target) } else { $null }
+        if ($through -and $through.Authority -ne $target.Authority -and $response.ResponseUri.Authority -eq $through.Authority) {
+            return [int]$response.StatusCode
+        }
+    }
+    return $null
 }
 
 function Set-MirrorEnv([string]$Name, [string]$Value) {

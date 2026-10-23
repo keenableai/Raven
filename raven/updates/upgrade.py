@@ -243,10 +243,8 @@ MIRROR_ENV = None
 
 def answers(url):
     # Any HTTP answer, an error included, proves the host is there. Only a
-    # connection that never completed does not: a fault of ours must not move
-    # an install off the host it belongs to. Nor does a certificate that fails
-    # verification, since whatever re-signs this host re-signs the mirror too.
-    import ssl
+    # connection that never completed does not (connection_failed): a fault of
+    # ours must not move an install off the host it belongs to.
     import urllib.error
     import urllib.request
 
@@ -255,12 +253,45 @@ def answers(url):
             return True
     except urllib.error.HTTPError:
         return True
-    except OSError as exc:
-        return isinstance(exc, ssl.SSLCertVerificationError) or isinstance(
-            getattr(exc, "reason", None), ssl.SSLCertVerificationError
-        )
-    except Exception:
-        return True
+    except Exception as exc:
+        return not connection_failed(exc)
+
+
+def connection_failed(exc):
+    # The rule raven.utils.mirrors.unreachable keeps, and a test runs both
+    # against the same hosts and proxies: no name, no route, a connection
+    # refused, reset or left unanswered, or a TLS that never got going. A
+    # certificate that fails verification is an answer, since whatever
+    # re-signs this host re-signs the mirror too. A proxy's answer to the
+    # request for a tunnel speaks for the host: a 5xx says it could not reach
+    # it, any other refusal is final, as the host's own error is.
+    import errno
+    import re
+    import socket
+    import ssl
+
+    no_route = {getattr(errno, name) for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN") if hasattr(errno, name)}
+    network = (ConnectionError, TimeoutError, socket.gaierror, ssl.SSLError)
+    # exc and every error it was raised from or wraps, the nearest first.
+    chain = []
+    seen = set()
+    pending = [exc]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        pending += [e for e in (current.__cause__, current.__context__, getattr(current, "reason", None)) if isinstance(e, BaseException)]
+    if any(isinstance(error, ssl.SSLCertVerificationError) for error in chain):
+        return False
+    for error in chain:
+        refused = re.match(r"Tunnel connection failed: (\d{3})\b", str(error)) if type(error) is OSError else None
+        if refused:
+            return int(refused.group(1)) >= 500
+        if isinstance(error, network) or (isinstance(error, OSError) and error.errno in no_route):
+            return True
+    return False
 
 
 def uv_configs():

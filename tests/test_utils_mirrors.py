@@ -8,6 +8,7 @@ line, and the one switch that turns the whole fallback off.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.server
 import json
@@ -73,10 +74,31 @@ class TestWhatCountsAsUnreachable:
             ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
             urllib.error.URLError(ConnectionRefusedError(111, "connection refused")),
             urllib.error.URLError(TimeoutError("timed out")),
+            OSError(errno.EHOSTUNREACH, "No route to host"),
+            urllib.error.URLError(OSError(errno.ENETUNREACH, "Network is unreachable")),
         ],
     )
     def test_a_connection_that_never_completed_is_unreachable(self, error: BaseException) -> None:
         assert mirrors.unreachable(error)
+
+    @pytest.mark.parametrize(
+        ("error", "reached"),
+        [
+            (httpx.ProxyError("403 Forbidden"), False),
+            (httpx.ProxyError("407 Proxy Authentication Required"), False),
+            (urllib.error.URLError(OSError("Tunnel connection failed: 403 Forbidden")), False),
+            (httpx.ProxyError("503 Service Unavailable"), True),
+            (urllib.error.URLError(OSError("Tunnel connection failed: 504 Gateway Timeout")), True),
+            (httpx.ProxyError("Proxy Server could not connect: Connection not allowed by ruleset."), True),
+        ],
+        ids=["refused", "credentials", "refused-urllib", "unavailable", "timeout-urllib", "socks"],
+    )
+    def test_a_proxys_refusal_of_the_tunnel_answers_for_the_host(self, error: BaseException, reached: bool) -> None:
+        """A 5xx says the proxy could not reach the host either; any other
+        refusal is final, the mirror being asked through the same proxy. A
+        SOCKS proxy gives a reason few clients can read, and counts as not
+        reached whatever it is."""
+        assert mirrors.unreachable(error) is reached
 
     def test_the_question_needs_no_httpx(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A Raven node runs with loguru and pillow and nothing else, and starts
@@ -107,6 +129,7 @@ class TestWhatCountsAsUnreachable:
             httpx.UnsupportedProtocol("Request URL has an unsupported protocol 'ftp://'"),
             urllib.error.HTTPError("https://example.org/f", 404, "Not Found", None, None),
             ValueError("not a network problem"),
+            OSError(errno.EMFILE, "Too many open files"),
         ],
     )
     def test_an_answer_is_not_unreachable(self, error: BaseException) -> None:

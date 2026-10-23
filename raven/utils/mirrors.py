@@ -8,20 +8,23 @@ download hosts the installers and the package runners rely on.
 
 A mirror is only ever a second attempt. The default host is asked first, and an
 answer from it, an error included, is final. Only a failure to reach it -- a
-name that does not resolve, a connection refused, reset or left unanswered --
-moves a download on (:func:`unreachable`). A host the operator chose, such as
-``HF_ENDPOINT``, ``UV_DEFAULT_INDEX`` or an npm registry, is never replaced.
-``RAVEN_NO_MIRROR=1`` turns all of it off.
+name that does not resolve, no route to it, a connection refused, reset or left
+unanswered, a proxy that could not reach it either -- moves a download on
+(:func:`unreachable`, which states the rule in full). A host the operator
+chose, such as ``HF_ENDPOINT``, ``UV_DEFAULT_INDEX`` or an npm registry, is
+never replaced. ``RAVEN_NO_MIRROR=1`` turns all of it off.
 
 install.sh, install.ps1 and the upgrade helper cannot import this module, so
-each one carries its own copy of the hosts it needs. A test holds the copies
-equal.
+each one carries its own copy of the hosts it needs, and of the rule. Tests
+hold the copies equal: the hosts by value, the rule by running every copy
+against the same hosts and proxies.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -72,18 +75,36 @@ def enabled() -> bool:
     return os.environ.get(OPT_OUT_ENV, "").strip().lower() not in _TRUTHY
 
 
+#: What a socket says of a host no route leads to; Python raises these as a
+#: plain OSError, where a refused or reset connection is a ConnectionError.
+_NO_ROUTE = frozenset(
+    getattr(errno, name) for name in ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EHOSTDOWN") if hasattr(errno, name)
+)
+
+
 def unreachable(exc: BaseException) -> bool:
     """Whether ``exc`` says a host could not be reached, rather than that it answered.
 
-    A connection that was refused, reset or never completed counts, as does a
-    name that did not resolve. An HTTP error does not, because the host spoke,
-    and a mirror would only repeat the answer or serve something the host has
-    withdrawn. A certificate that fails verification does not either: whatever
-    re-signs this host's traffic re-signs the mirror's too, so falling back
-    would only hide the reason. The cause chain is walked because libraries
-    re-raise a failed connection as an error of their own (huggingface_hub's
-    LocalEntryNotFoundError, httpx's ConnectError over the socket's, urllib's
-    URLError with the socket's error as its reason).
+    A connection that was refused, reset or never completed counts, as do a
+    name that did not resolve and a network with no route to the host. An HTTP
+    error does not, because the host spoke, and a mirror would only repeat the
+    answer or serve something the host has withdrawn. A certificate that fails
+    verification does not either: whatever re-signs this host's traffic
+    re-signs the mirror's too, so falling back would only hide the reason.
+
+    Through a proxy the same holds for the proxy, and its answer to the request
+    for a tunnel speaks for the host. A 5xx says the proxy could not reach the
+    host, which counts. Any other refusal -- a 403 for a host its rules block,
+    a 407 for credentials it was not given -- is final, like an error from the
+    host itself: the mirror would be asked through the same proxy, and would
+    only route around its rules. A SOCKS proxy that could not connect counts,
+    whatever reason it gives: PowerShell has the reason only in an exception's
+    text, and urllib and Windows PowerShell 5.1 cannot use a SOCKS proxy at all.
+
+    The cause chain is walked because libraries re-raise a failed connection
+    as an error of their own (huggingface_hub's LocalEntryNotFoundError, httpx's
+    ConnectError over the socket's, urllib's URLError with the socket's error as
+    its reason).
 
     Standard library only, with httpx's errors added once a caller has loaded
     httpx: no other process can have raised one, and a Raven node runs without
@@ -94,12 +115,28 @@ def unreachable(exc: BaseException) -> bool:
 
     from raven.security.tls import is_untrusted_certificate
 
-    if is_untrusted_certificate(exc):
+    chain = _chain(exc)
+    # Before anything else: httpx reports a refused certificate as a
+    # ConnectError, which on its own would read as a connection that failed.
+    if any(is_untrusted_certificate(error) for error in chain):
         return False
     network: tuple[type[BaseException], ...] = (ConnectionError, TimeoutError, socket.gaierror, ssl.SSLError)
     httpx = sys.modules.get("httpx")
     if httpx is not None:
         network += (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError)
+    for error in chain:
+        status = _tunnel_status(error)
+        if status is not None:
+            return status >= 500
+        if isinstance(error, network) or (isinstance(error, OSError) and error.errno in _NO_ROUTE):
+            return True
+    return False
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    """``exc`` and every error it was raised from or wraps, the nearest first:
+    its cause and context, and urllib's reason."""
+    chain: list[BaseException] = []
     seen: set[int] = set()
     pending: list[BaseException] = [exc]
     while pending:
@@ -107,11 +144,28 @@ def unreachable(exc: BaseException) -> bool:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        if isinstance(current, network):
-            return True
+        chain.append(current)
         reason = getattr(current, "reason", None)
         pending += [e for e in (current.__cause__, current.__context__, reason) if isinstance(e, BaseException)]
-    return False
+    return chain
+
+
+def _tunnel_status(exc: BaseException) -> int | None:
+    """The status a proxy refused a tunnel with, when that refusal is what ``exc`` reports.
+
+    Each library words it its own way: http.client, under urllib, raises a
+    plain OSError reading ``Tunnel connection failed: 403 Forbidden``, and
+    httpx a ProxyError whose message is the proxy's status line. A ProxyError
+    without one is a SOCKS proxy's.
+    """
+    httpx = sys.modules.get("httpx")
+    if httpx is not None and isinstance(exc, httpx.ProxyError):
+        found = re.match(r"(\d{3}) ", str(exc))
+    elif type(exc) is OSError:
+        found = re.match(r"Tunnel connection failed: (\d{3})\b", str(exc))
+    else:
+        return None
+    return int(found.group(1)) if found else None
 
 
 #: How long a probe's verdict stands. A gateway starts many agents, and each

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import errno
 import io
 import json
 import os
@@ -2753,6 +2754,43 @@ class TestTheHelperFallsBackToAMirror:
         assert namespace["PYPI_MIRROR"] == mirrors.PYPI_INDEX
         assert namespace["PYTHON_DEFAULT_DOWNLOADS"] == mirrors.PYTHON_DEFAULT_DOWNLOADS
         assert namespace["PYTHON_MIRROR"] == mirrors.PYTHON_DOWNLOADS
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+            urllib.error.URLError(TimeoutError("timed out")),
+            urllib.error.URLError(OSError(errno.EHOSTUNREACH, "No route to host")),
+            OSError(errno.ENETUNREACH, "Network is unreachable"),
+            urllib.error.URLError(OSError("Tunnel connection failed: 403 Forbidden")),
+            urllib.error.URLError(OSError("Tunnel connection failed: 502 Bad Gateway")),
+            urllib.error.URLError(ssl.SSLCertVerificationError(1, "certificate verify failed")),
+            urllib.error.URLError(ssl.SSLEOFError(8, "EOF occurred in violation of protocol")),
+            OSError(errno.EMFILE, "Too many open files"),
+            ValueError("not a network problem"),
+        ],
+        ids=[
+            "refused",
+            "timed-out",
+            "no-route",
+            "no-network",
+            "tunnel-refused",
+            "tunnel-bad-gateway",
+            "certificate",
+            "tls",
+            "ours",
+            "not-the-network",
+        ],
+    )
+    def test_the_helper_draws_the_runtimes_line_where_no_test_host_can_take_it(self, error: BaseException) -> None:
+        """No loopback host can be made to have no route; the copies are held
+        equal on those failures by asking both about the same error."""
+        from raven.utils import mirrors
+
+        connection_failed = _load_upgrade_helper_namespace()["connection_failed"]
+        assert callable(connection_failed)
+
+        assert connection_failed(error) == mirrors.unreachable(error)
 
 
 class TestTheHelperVerifiesAgainstTheSystemStore:

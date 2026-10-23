@@ -98,9 +98,20 @@ mirrors_allowed() {
 }
 
 # Whether curl's exit code $1 says no connection completed: the name did not
-# resolve, the connection -- or a proxy's, to the host -- was refused, reset or
-# timed out, or TLS never got going.
+# resolve, no route led to the host, the connection -- or a proxy's -- was
+# refused, reset or timed out, or TLS never got going. $2 is what a proxy
+# answered the request for a tunnel with (curl's %{http_connect}, 000 for none):
+# a 5xx says the proxy could not reach the host either, while any other refusal
+# is final, as the host's own HTTP error is -- the mirror would be asked through
+# the same proxy, and would only route around its rules. The rule
+# raven/utils/mirrors.py states in full; a test runs every copy of it against
+# the same hosts and proxies.
 connection_failed() {
+  case "${2:-000}" in
+    000|2??) ;;
+    5??) return 0 ;;
+    *) return 1 ;;
+  esac
   case "$1" in
     6|7|28|35|52|56|97) return 0 ;;
   esac
@@ -113,8 +124,8 @@ connection_failed() {
 # re-signs a mirror's too.
 reachable() {
   code=0
-  curl -sS -o /dev/null --connect-timeout 5 --max-time 10 -IL "$1" 2>/dev/null || code=$?
-  ! connection_failed "$code"
+  tunnel="$(curl -sS -o /dev/null --connect-timeout 5 --max-time 10 -IL -w '%{http_connect}' "$1" 2>/dev/null)" || code=$?
+  ! connection_failed "$code" "$tunnel"
 }
 
 # use_mirror <variable> <value>: export it for the rest of this install, and
@@ -151,13 +162,13 @@ ensure_uv() {
   # answered with an error from one that could not be reached.
   uv_fetch=0
   uv_installer="$(mktemp "${TMPDIR:-/tmp}/raven-uv-installer.XXXXXX")" || die "Could not create a file for uv's installer."
-  curl -fsSL --connect-timeout 15 "$UV_INSTALLER" -o "$uv_installer" || uv_fetch=$?
+  uv_tunnel="$(curl -fsSL --connect-timeout 15 -w '%{http_connect}' "$UV_INSTALLER" -o "$uv_installer")" || uv_fetch=$?
   if [ "$uv_fetch" -eq 0 ]; then sh "$uv_installer" || true; fi
   rm -f "$uv_installer"
   # uv installs to ~/.local/bin (or $XDG_BIN_HOME) -- make it visible for the
   # rest of this script even before the shell profile is re-sourced.
   export PATH="$HOME/.local/bin:$PATH"
-  if ! have uv && mirrors_allowed && ! uv_host_chosen && uv_unreachable "$uv_fetch"; then install_uv_from_mirror || true; fi
+  if ! have uv && mirrors_allowed && ! uv_host_chosen && uv_unreachable "$uv_fetch" "$uv_tunnel"; then install_uv_from_mirror || true; fi
   have uv || die "uv could not be installed, or is not where it was put; check PATH (expected in ~/.local/bin)"
   ok "uv installed"
 }
@@ -171,13 +182,14 @@ uv_host_chosen() {
 
 # Whether uv's installer failed for want of a connection, the one failure a
 # mirror stands in for: astral.sh could not be reached for the installer ($1 is
-# curl's exit code fetching it), or the installer ran and neither host it
-# downloads uv from could be reached. Any answer -- an HTTP error, a
-# certificate that fails verification, a failure inside the installer -- is
-# final, and installing uv from another host would hide it.
+# curl's exit code fetching it, $2 what a proxy answered the tunnel with), or
+# the installer ran and neither host it downloads uv from could be reached. Any
+# answer -- an HTTP error, a certificate that fails verification, a failure
+# inside the installer -- is final, and installing uv from another host would
+# hide it.
 uv_unreachable() {
   if [ "$1" -ne 0 ]; then
-    connection_failed "$1"
+    connection_failed "$1" "${2:-000}"
     return
   fi
   ! reachable "$PYTHON_DOWNLOADS" && ! reachable "$UV_GITHUB_RELEASE"

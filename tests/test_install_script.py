@@ -31,13 +31,18 @@ has, and neither the stop nor the page's own exit code becomes the script's.
 
 from __future__ import annotations
 
+import contextlib
+import http.server
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -461,20 +466,29 @@ def _fake_curl(
     *,
     down: tuple[str, ...] = (),
     codes: dict[str, int] | None = None,
+    tunnels: dict[str, tuple[str, int]] | None = None,
     log: Path | None = None,
 ) -> None:
     """A curl that answers each URL in ``served`` from its file and every other
     URL with an HTTP error (exit 22), never connects to a URL under ``down``
     (exit 7, the code for a connection that was refused or timed out), and
-    ends with the given code for a URL under a prefix in ``codes``."""
+    ends with the given code for a URL under a prefix in ``codes``. A URL
+    under a prefix in ``tunnels`` gets a proxy's refusal of the tunnel: the
+    status it answered, as %{http_connect} writes it, and curl's exit code."""
     refused = "".join(f"  '{prefix}'*) exit {code} ;;\n" for prefix, code in (codes or {}).items())
+    # The status is written only where %{http_connect} asks for it, as curl does.
+    refused += "".join(
+        f"  '{prefix}'*) case \"$wout\" in *http_connect*) printf '%s' {status} ;; esac; exit {code} ;;\n"
+        for prefix, (status, code) in (tunnels or {}).items()
+    )
     refused += "".join(f"  '{prefix}'*) exit 7 ;;\n" for prefix in down)
     answers = "".join(f"  '{url}') src='{path}' ;;\n" for url, path in served.items())
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "curl").write_text(
         "#!/bin/sh\n"
-        'out=""\n'
-        'while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; http*|file*) url="$1"; shift ;; *) shift ;; esac; done\n'
+        'out=""\nwout=""\n'
+        'while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; -w) wout="$2"; shift 2 ;; '
+        'http*|file*) url="$1"; shift ;; *) shift ;; esac; done\n'
         + (f"echo \"$url\" >> '{log}'\n" if log is not None else "")
         + 'case "$url" in\n'
         + refused
@@ -661,7 +675,7 @@ function Invoke-WebRequest {
 """
 
 _PS1_NODE_STEP = r"""
-foreach ($text in (Get-Install @("Fail", "Install-PrivateNode", "Get-NodeDist", "Test-MirrorsAllowed", "Test-Reachable"))) {
+foreach ($text in (Get-Install @("Fail", "Install-PrivateNode", "Get-NodeDist", "Test-MirrorsAllowed", "Test-Reachable", "Get-TunnelStatus"))) {
     Invoke-Expression $text
 }
 function Write-Info([string]$Message) { }
@@ -1607,6 +1621,309 @@ def test_the_installers_fall_back_to_the_hosts_the_runtime_does() -> None:
         assert _sh_value(sh_name) == _ps1_value(ps1_name), sh_name
 
 
+# --- One rule for a host that answered -------------------------------------------
+# Five places decide whether a download's host could be reached before a
+# fallback moves it: the runtime (urllib for the launches it starts, httpx for
+# the files it fetches), the upgrade helper, install.sh (curl) and install.ps1
+# (PowerShell). Each runs here with the client it really uses, against the same
+# loopback hosts and proxies, and has to answer every case alike.
+
+
+@contextlib.contextmanager
+def _listening(handle: Callable[[socket.socket], None]) -> Iterator[str]:
+    """Hand every connection to 127.0.0.1 on a port of its own to ``handle``;
+    yield ``host:port``."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.2)
+    stopped = threading.Event()
+
+    def serve(client: socket.socket) -> None:
+        with client, contextlib.suppress(OSError):
+            handle(client)
+
+    def accept() -> None:
+        while not stopped.is_set():
+            try:
+                client, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=serve, args=(client,), daemon=True).start()
+
+    acceptor = threading.Thread(target=accept, daemon=True)
+    acceptor.start()
+    try:
+        yield f"127.0.0.1:{listener.getsockname()[1]}"
+    finally:
+        stopped.set()
+        acceptor.join()
+        listener.close()
+
+
+def _read_request(client: socket.socket) -> None:
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = client.recv(4096)
+        if not chunk:
+            return
+        head += chunk
+
+
+def _tunnel_refused(status: int, reason: str) -> Callable[[socket.socket], None]:
+    """An HTTP proxy that answers every request for a tunnel with ``status``."""
+
+    def handle(client: socket.socket) -> None:
+        _read_request(client)
+        extra = 'Proxy-Authenticate: Basic realm="corp"\r\n' if status == 407 else ""
+        client.sendall(f"HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n{extra}\r\n".encode("ascii"))
+
+    return handle
+
+
+def _tunnel_then_closed(client: socket.socket) -> None:
+    """An HTTP proxy that opens every tunnel and then drops it, the way one
+    that answers at once and dials afterwards reports a host it cannot reach."""
+    _read_request(client)
+    client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+
+
+def _socks_refused(reply: int) -> Callable[[socket.socket], None]:
+    """A SOCKS5 proxy that answers every CONNECT with ``reply``."""
+
+    def handle(client: socket.socket) -> None:
+        greeting = client.recv(2)
+        if len(greeting) < 2 or greeting[0] != 5:
+            return
+        client.recv(greeting[1])
+        client.sendall(b"\x05\x00")
+        head = client.recv(4)
+        if len(head) < 4:
+            return
+        # The address asked for: IPv4, a name of the length that leads it, or IPv6; then the port.
+        length = 4 if head[3] == 1 else 16 if head[3] == 4 else client.recv(1)[0]
+        client.recv(length + 2)
+        client.sendall(bytes([5, reply, 0, 1, 0, 0, 0, 0, 0, 0]))
+
+    return handle
+
+
+def _closed_at_once(client: socket.socket) -> None:
+    """A host that takes the connection and closes it before TLS begins."""
+
+
+class _AnswerHead(http.server.BaseHTTPRequestHandler):
+    status = 200
+
+    def do_HEAD(self) -> None:  # noqa: N802 - the name http.server dispatches on
+        self.send_response(self.status)
+        self.end_headers()
+
+    def log_message(self, *_args: object) -> None:
+        return None
+
+
+class _AnswerHeadWithAnError(_AnswerHead):
+    status = 503
+
+
+def _closed_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+#: Each case's id, then whether a host that answers like that has answered.
+_REACHABILITY = {
+    # Direct.
+    "an-http-error": True,
+    "a-certificate-that-fails": True,
+    "refused": False,
+    "closed-before-tls": False,
+    # Through an HTTP proxy.
+    "a-tunnel-to-a-certificate-that-fails": True,
+    "tunnel-refused-403": True,
+    "tunnel-refused-407": True,
+    "tunnel-refused-500": False,
+    "tunnel-refused-502": False,
+    "tunnel-refused-503": False,
+    "tunnel-refused-504": False,
+    "tunnel-closed-before-tls": False,
+    "proxy-not-listening": False,
+    # Through a SOCKS proxy.
+    "socks-refused-by-its-rules": False,
+    "socks-host-unreachable": False,
+}
+
+
+@pytest.fixture(scope="module")
+def reachability_cases(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, tuple[str, str]]]:
+    """Each case of :data:`_REACHABILITY`: the URL asked about, and the proxy
+    it is asked through, "" for none."""
+    from tests._tls import connect_proxy, https_endpoint, private_ca
+
+    far = "https://pypi.example.invalid/simple/"
+    with contextlib.ExitStack() as stack:
+
+        def proxy(handle: Callable[[socket.socket], None], scheme: str = "http") -> str:
+            return f"{scheme}://{stack.enter_context(_listening(handle))}"
+
+        failing = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _AnswerHeadWithAnError)
+        threading.Thread(target=failing.serve_forever, daemon=True).start()
+        stack.callback(failing.server_close)
+        stack.callback(failing.shutdown)
+        refused_certificate = stack.enter_context(
+            https_endpoint(private_ca(tmp_path_factory.mktemp("ca")).server, _AnswerHead)
+        )
+        reasons = {403: "Forbidden", 407: "Proxy Authentication Required", 500: "Internal Server Error"}
+        reasons |= {502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout"}
+        cases = {
+            "an-http-error": (f"http://127.0.0.1:{failing.server_address[1]}/", ""),
+            "a-certificate-that-fails": (f"{refused_certificate}/", ""),
+            "refused": (f"https://127.0.0.1:{_closed_port()}/", ""),
+            "closed-before-tls": (f"https://{stack.enter_context(_listening(_closed_at_once))}/", ""),
+            "a-tunnel-to-a-certificate-that-fails": (f"{refused_certificate}/", stack.enter_context(connect_proxy())),
+            **{
+                f"tunnel-refused-{status}": (far, proxy(_tunnel_refused(status, reason)))
+                for status, reason in reasons.items()
+            },
+            "tunnel-closed-before-tls": (far, proxy(_tunnel_then_closed)),
+            "proxy-not-listening": (far, f"http://127.0.0.1:{_closed_port()}"),
+            # socks5h: curl looks a name up itself under socks5.
+            "socks-refused-by-its-rules": (far, proxy(_socks_refused(2), "socks5h")),
+            "socks-host-unreachable": (far, proxy(_socks_refused(4), "socks5h")),
+        }
+        assert cases.keys() == _REACHABILITY.keys()
+        yield cases
+
+
+def _proxy_env(proxy: str) -> dict[str, str]:
+    """The variables that send every client through ``proxy``, or past every proxy."""
+    names = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+    if not proxy:
+        # A variable of their own, so no client reads the system's proxy instead.
+        return {**dict.fromkeys(names, ""), "NO_PROXY": "*", "no_proxy": "*"}
+    return {**dict.fromkeys(names, proxy), "NO_PROXY": "", "no_proxy": ""}
+
+
+def _python_verdicts(
+    cases: dict[str, tuple[str, str]], monkeypatch: pytest.MonkeyPatch, answers: Callable[[str], bool]
+) -> dict[str, bool]:
+    import urllib.request
+
+    said = {}
+    for name, (url, proxy) in cases.items():
+        with monkeypatch.context() as patch:
+            for key, value in _proxy_env(proxy).items():
+                patch.setenv(key, value)
+            # urlopen keeps the proxies it read first, for the whole process.
+            patch.setattr(urllib.request, "_opener", None)
+            said[name] = answers(url)
+    return said
+
+
+def _runtime_launches(cases: dict[str, tuple[str, str]], monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
+    from raven.utils import mirrors
+
+    return _python_verdicts(cases, monkeypatch, mirrors._answers)
+
+
+def _runtime_downloads(cases: dict[str, tuple[str, str]], monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
+    import httpx
+
+    from raven.utils import mirrors
+
+    def answers(url: str) -> bool:
+        try:
+            with httpx.Client(timeout=5) as client:
+                client.head(url)
+        except Exception as exc:  # noqa: BLE001 - what is raised is the question
+            return not mirrors.unreachable(exc)
+        return True
+
+    return _python_verdicts(cases, monkeypatch, answers)
+
+
+def _upgrade_helper(cases: dict[str, tuple[str, str]], monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
+    from raven.updates import upgrade
+
+    namespace: dict[str, object] = {"__name__": "raven_upgrade_helper_test"}
+    exec(upgrade._UPGRADE_HELPER_SOURCE, namespace)
+    answers = namespace["answers"]
+    assert callable(answers)
+    return _python_verdicts(cases, monkeypatch, answers)
+
+
+def _install_sh(cases: dict[str, tuple[str, str]], tmp_path: Path) -> dict[str, bool]:
+    if sys.platform == "win32" or shutil.which("sh") is None or shutil.which("curl") is None:
+        pytest.skip("POSIX sh and curl")
+    body = ""
+    for name, (url, proxy) in cases.items():
+        settings = " ".join(f"export {key}={shlex.quote(value)};" for key, value in _proxy_env(proxy).items())
+        body += f"( {settings} if reachable {shlex.quote(url)}; then echo {name}=True; else echo {name}=False; fi )\n"
+    harness = tmp_path / "reachable.sh"
+    harness.write_text(_SH_PREAMBLE + _sh_functions(("connection_failed", "reachable")) + body, encoding="utf-8")
+    result = subprocess.run(
+        ["sh", str(harness)], capture_output=True, text=True, check=False, env={"PATH": os.environ["PATH"]}
+    )
+    return {name: value == "True" for name, value in (line.split("=", 1) for line in result.stdout.split())}
+
+
+_PS1_TABLE_STEP = r"""
+foreach ($text in (Get-Install @("Test-Reachable", "Get-TunnelStatus"))) { Invoke-Expression $text }
+foreach ($line in (Get-Content $CasesFile)) {
+    $name, $url, $proxy = $line -split " "
+    # .NET has no socks5h, and hands the name to a SOCKS5 proxy under socks5.
+    $proxy = $proxy -replace "^socks5h:", "socks5:"
+    [System.Net.Http.HttpClient]::DefaultProxy = if ($proxy) { [System.Net.WebProxy]::new($proxy) } else { [System.Net.WebProxy]::new() }
+    [Console]::Out.WriteLine("$name=$(Test-Reachable $url)")
+}
+"""
+
+
+def _install_ps1(cases: dict[str, tuple[str, str]], tmp_path: Path) -> dict[str, bool]:
+    if shutil.which("pwsh") is None:
+        pytest.skip("needs PowerShell")
+    listed = tmp_path / "cases.txt"
+    lines = [f"{name} {url} {proxy}".rstrip() for name, (url, proxy) in cases.items()]
+    listed.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    step = _ps1_settings("ErrorActionPreference") + _PS1_TABLE_STEP
+    result = _run_ps1(tmp_path, "reachable-table", step, CasesFile=str(listed))
+    said = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    assert said.keys() == cases.keys(), result.stdout + result.stderr
+    return {name: value == "True" for name, value in said.items()}
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "decider",
+    ["runtime-launches", "runtime-downloads", "upgrade-helper", "install.sh", "install.ps1"],
+)
+def test_every_copy_of_the_rule_answers_each_case_alike(
+    reachability_cases: dict[str, tuple[str, str]], decider: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host that answered -- with an HTTP error, or with a certificate that
+    fails -- keeps the download, and so does a proxy's refusal of the tunnel:
+    a 403 for a host its rules block, a 407 for credentials it was not given.
+    The mirror would be asked through that same proxy, and would only route
+    around its rules. A host no connection reached moves it, and so does a
+    proxy's 5xx, which says the proxy could not reach the host either, and a
+    SOCKS proxy that could not connect, whatever its reason: PowerShell has
+    that only in an exception's text."""
+    if decider == "runtime-launches":
+        said = _runtime_launches(reachability_cases, monkeypatch)
+    elif decider == "runtime-downloads":
+        said = _runtime_downloads(reachability_cases, monkeypatch)
+    elif decider == "upgrade-helper":
+        said = _upgrade_helper(reachability_cases, monkeypatch)
+    elif decider == "install.sh":
+        said = _install_sh(reachability_cases, tmp_path)
+    else:
+        said = _install_ps1(reachability_cases, tmp_path)
+
+    assert said == _REACHABILITY
+
+
 def test_both_installers_say_how_to_keep_every_download_where_it_was() -> None:
     for script in (INSTALL_SH, INSTALL_PS1):
         header = script.read_text(encoding="utf-8").split("\n\n", 1)[0]
@@ -1683,6 +2000,39 @@ def test_only_a_connection_that_never_completed_is_unreachable(tmp_path: Path, c
 
 
 @POSIX_SH_ONLY
+@pytest.mark.parametrize(
+    ("code", "tunnel", "reached"),
+    [(56, "403", True), (7, "403", True), (7, "407", True), (56, "502", False), (7, "504", False), (35, "200", False)],
+    ids=["refused-curl-7", "refused-curl-8", "credentials", "bad-gateway", "gateway-timeout", "opened-then-dropped"],
+)
+def test_a_proxys_refusal_of_the_tunnel_is_read_from_its_status(
+    tmp_path: Path, code: int, tunnel: str, reached: bool
+) -> None:
+    """curl 7 ends a refused tunnel with 56, curl 8 with 7, so its exit code
+    cannot tell a refusal from a connection that never completed; the status
+    the proxy answered with can (%{http_connect})."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # The status is written only where %{http_connect} asks for it, as curl does.
+    (bin_dir / "curl").write_text(
+        f'#!/bin/sh\ncase "$*" in *http_connect*) printf {tunnel} ;; esac\nexit {code}\n', encoding="utf-8"
+    )
+    (bin_dir / "curl").chmod(0o755)
+    harness = tmp_path / "reachable.sh"
+    harness.write_text(
+        _SH_PREAMBLE
+        + _sh_functions(("connection_failed", "reachable"))
+        + "if reachable https://example.org/; then echo YES; else echo NO; fi\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["sh", str(harness)], capture_output=True, text=True, check=False, env={"PATH": f"{bin_dir}:/usr/bin:/bin"}
+    )
+
+    assert result.stdout.strip() == ("YES" if reached else "NO"), result.stderr
+
+
+@POSIX_SH_ONLY
 def test_a_host_is_reached_where_its_redirects_end(tmp_path: Path) -> None:
     """GitHub answers a release file's address with a redirect to the host that
     serves it, and from mainland China that second host is the one that times
@@ -1710,15 +2060,26 @@ def test_a_host_is_reached_where_its_redirects_end(tmp_path: Path) -> None:
 
 
 _PS1_REACHABLE_STEP = r"""
-foreach ($text in (Get-Install @("Test-Reachable"))) { Invoke-Expression $text }
+foreach ($text in (Get-Install @("Test-Reachable", "Get-TunnelStatus"))) { Invoke-Expression $text }
 function New-Failure($Kind) {
     switch ($Kind) {
         "refused" { [System.Net.Http.HttpRequestException]::new([System.Net.Http.HttpRequestError]::ConnectionError, "refused", $null, $null) }
         "tls" { [System.Net.Http.HttpRequestException]::new([System.Net.Http.HttpRequestError]::SecureConnectionError, "The SSL connection could not be established", $null, $null) }
         "trust" { [System.Net.WebException]::new("Could not establish trust relationship", [System.Net.WebExceptionStatus]::TrustFailure) }
         "refused-5.1" { [System.Net.WebException]::new("Unable to connect", [System.Net.WebExceptionStatus]::ConnectFailure) }
+        "tunnel-403" { [System.Net.Http.HttpRequestException]::new([System.Net.Http.HttpRequestError]::ProxyTunnelError, "The proxy tunnel request failed with status code '403'.", $null, [System.Net.HttpStatusCode]::Forbidden) }
+        "tunnel-503" { [System.Net.Http.HttpRequestException]::new([System.Net.Http.HttpRequestError]::ProxyTunnelError, "The proxy tunnel request failed with status code '503'.", $null, [System.Net.HttpStatusCode]::ServiceUnavailable) }
+        "socks" { [System.Net.Http.HttpRequestException]::new([System.Net.Http.HttpRequestError]::ProxyTunnelError, "An error occurred while establishing a connection to the proxy tunnel.", $null, $null) }
     }
 }
+# What Windows PowerShell raises for an answer: the response, from wherever it
+# came -- the proxy's own address when the proxy refused the tunnel.
+function New-Answer([int]$Status, [string]$From) {
+    $failure = [System.Exception]::new("($Status)")
+    $failure | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = $Status; ResponseUri = [uri]$From })
+    $failure
+}
+[System.Net.WebRequest]::DefaultWebProxy = [System.Net.WebProxy]::new("http://proxy.test:3128", $false, @("direct-502-5-1\.test"))
 # PowerShell 7 reports a refused certificate as it does any failed handshake;
 # only asking again without the check tells the two apart.
 function Invoke-WebRequest {
@@ -1734,9 +2095,17 @@ function Invoke-WebRequest {
     if ($hostName -eq "no-tls.test") { throw (New-Failure "tls") }
     if ($hostName -eq "re-signed-5-1.test") { throw (New-Failure "trust") }
     if ($hostName -eq "refused-5-1.test") { throw (New-Failure "refused-5.1") }
+    if ($hostName -in @("tunnel-403", "tunnel-503", "socks")) { throw (New-Failure $hostName) }
+    if ($hostName -eq "tunnel-403-5-1.test") { throw (New-Answer 403 "http://proxy.test:3128/") }
+    if ($hostName -eq "tunnel-502-5-1.test") { throw (New-Answer 502 "http://proxy.test:3128/") }
+    if ($hostName -eq "error-502-5-1.test") { throw (New-Answer 502 $Uri) }
+    if ($hostName -eq "direct-502-5-1.test") { throw (New-Answer 502 $Uri) }
 }
-foreach ($name in @("answers", "refused", "missing", "re-signed", "no-tls", "re-signed-5-1", "refused-5-1")) {
-    [Console]::Out.WriteLine("$name=$(Test-Reachable "https://$name.test/")")
+$names = @("answers", "refused", "missing", "re-signed", "no-tls", "re-signed-5-1", "refused-5-1")
+$names += @("tunnel-403", "tunnel-503", "socks", "tunnel-403-5-1", "tunnel-502-5-1", "error-502-5-1", "direct-502-5-1")
+foreach ($name in $names) {
+    $url = if ($name -in @("tunnel-403", "tunnel-503", "socks")) { "https://$name/" } else { "https://$name.test/" }
+    [Console]::Out.WriteLine("$name=$(Test-Reachable $url)")
 }
 """
 
@@ -1747,7 +2116,13 @@ def test_the_windows_installer_draws_the_same_line(tmp_path: Path) -> None:
     """The line install.sh draws with curl's exit codes, drawn from what
     PowerShell raises: Windows PowerShell names a refused certificate outright
     (TrustFailure); PowerShell 7 calls it a failed handshake, like a TLS that
-    never got going, until the host is asked again without the check."""
+    never got going, until the host is asked again without the check.
+
+    A proxy's refusal of the tunnel is read from its status. PowerShell 7
+    names it (ProxyTunnelError, with the status beside it, and none from a
+    SOCKS proxy); Windows PowerShell, which no CI job runs, hands the proxy's
+    response back as it would the host's, and only where it came from tells
+    the two apart (measured with 5.1 through a loopback proxy)."""
     result = _run_ps1(tmp_path, "reachable-step", _ps1_settings("ErrorActionPreference") + _PS1_REACHABLE_STEP)
 
     said = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
@@ -1759,6 +2134,13 @@ def test_the_windows_installer_draws_the_same_line(tmp_path: Path) -> None:
         "no-tls": "False",
         "re-signed-5-1": "True",
         "refused-5-1": "False",
+        "tunnel-403": "True",
+        "tunnel-503": "False",
+        "socks": "False",
+        "tunnel-403-5-1": "True",
+        "tunnel-502-5-1": "False",
+        "error-502-5-1": "True",
+        "direct-502-5-1": "True",
     }, result.stdout + result.stderr
 
 
@@ -1850,12 +2232,13 @@ def _run_uv_step(
     env: dict[str, str] | None = None,
     down: tuple[str, ...] = ("https://astral.sh/",),
     codes: dict[str, int] | None = None,
+    tunnels: dict[str, tuple[str, int]] | None = None,
     uv_toml: str | None = None,
     machine_uv_toml: str | None = None,
 ):
     bin_dir = tmp_path / "bin"
     log = tmp_path / "curl.log"
-    _fake_curl(bin_dir, served, down=down, codes=codes, log=log)
+    _fake_curl(bin_dir, served, down=down, codes=codes, tunnels=tunnels, log=log)
     _fake_unzip(bin_dir)
     for root, text in (("config", uv_toml), ("xdg", machine_uv_toml)):
         if text is not None:
@@ -2092,6 +2475,25 @@ def test_an_installer_that_left_no_uv_hands_over_to_the_mirror_only_when_its_hos
 
 
 @POSIX_SH_ONLY
+@pytest.mark.parametrize(
+    ("tunnel", "mirrored"), [(("403", 56), False), (("407", 7), False), (("502", 56), True)], ids=["403", "407", "502"]
+)
+def test_a_proxy_that_refused_the_tunnel_to_astral_sh_answered_for_it(
+    tmp_path: Path, tunnel: tuple[str, int], mirrored: bool
+) -> None:
+    """Fetching uv's installer through a proxy that will not open a tunnel to
+    astral.sh: a refusal is final, as astral.sh's own error would be; a 5xx
+    says the proxy could not reach it either."""
+    page, served = _uv_index(tmp_path, _UV_LINUX_TAG)
+
+    result, bin_dir, _asked = _run_uv_step(
+        tmp_path, {_UV_PAGE: page, **served}, down=(), tunnels={"https://astral.sh/": tunnel}
+    )
+
+    assert (bin_dir / "uv").exists() is mirrored, result.stdout + result.stderr
+
+
+@POSIX_SH_ONLY
 def test_an_installer_that_works_is_all_uv_takes(tmp_path: Path) -> None:
     installer = _uv_installer(tmp_path, works=True)
 
@@ -2278,7 +2680,7 @@ def test_a_windows_uv_toml_index_read_unreadably_keeps_the_mirror_away(tmp_path:
 
 
 _PS1_ENSURE_UV_STEP = r"""
-$names = @("Ensure-Uv", "Test-UvHostChosen", "Test-UvUnreachable", "Test-Reachable", "Test-MirrorsAllowed")
+$names = @("Ensure-Uv", "Test-UvHostChosen", "Test-UvUnreachable", "Test-Reachable", "Get-TunnelStatus", "Test-MirrorsAllowed")
 foreach ($text in (Get-Install $names)) { Invoke-Expression $text }
 function Write-Info([string]$Message) { }
 function Write-Ok([string]$Message) { }
@@ -2636,7 +3038,7 @@ def test_both_installers_choose_the_package_hosts_before_the_first_install() -> 
 
 _PS1_PACKAGE_STEP = r"""
 $names = @(
-    "Test-MirrorsAllowed", "Test-Reachable", "Set-MirrorEnv", "Restore-MirrorEnv",
+    "Test-MirrorsAllowed", "Test-Reachable", "Get-TunnelStatus", "Set-MirrorEnv", "Restore-MirrorEnv",
     "Get-UvConfigFiles", "Test-UvConfigHas", "Test-UvIndexChosen", "Use-PackageMirrors"
 )
 foreach ($text in (Get-Install $names)) { Invoke-Expression $text }
@@ -2865,7 +3267,7 @@ def test_both_installers_choose_the_registry_before_npm_ci() -> None:
 
 
 _PS1_NPM_STEP = r"""
-foreach ($text in (Get-Install @("Test-MirrorsAllowed", "Test-Reachable", "Set-MirrorEnv", "Use-NpmMirror"))) {
+foreach ($text in (Get-Install @("Test-MirrorsAllowed", "Test-Reachable", "Get-TunnelStatus", "Set-MirrorEnv", "Use-NpmMirror"))) {
     Invoke-Expression $text
 }
 function Write-Warn([string]$Message) { [Console]::Out.WriteLine("WARN $Message") }
@@ -3052,7 +3454,7 @@ def test_a_chromium_download_that_reached_playwrights_hosts_is_not_retried(
 
 
 _PS1_BROWSER_STEP = r"""
-$names = @("Test-MirrorsAllowed", "Test-Reachable", "Set-MirrorEnv", "Install-Chromium")
+$names = @("Test-MirrorsAllowed", "Test-Reachable", "Get-TunnelStatus", "Set-MirrorEnv", "Install-Chromium")
 foreach ($text in (Get-Install $names)) { Invoke-Expression $text }
 function Write-Warn([string]$Message) { [Console]::Out.WriteLine("WARN $Message") }
 $Served = @{}
