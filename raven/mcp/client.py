@@ -196,12 +196,14 @@ async def open_mcp_transport(
         from mcp.client.streamable_http import streamable_http_client
 
         if transport_type == "stdio":
-            # `uvx <server>` fetches the server on first start. The index goes on
-            # this launch's command line only: written into the entry, it would
-            # be the choice of index PlugHub's vetting refuses a catalogue entry
-            # (see market/vetting.py).
+            # `uvx <server>` and `npx <server>` fetch the server on first start.
+            # The mirror goes into this launch only: written into the entry, it
+            # would be the choice of registry PlugHub's vetting refuses a
+            # catalogue entry (see market/vetting.py). A server the sandbox
+            # starts is fetched in there, so only its command line can carry one.
+            sandboxed = executor is not None and executor.supports_process_spawning
             command, *args = await mirrors.package_launch_async(
-                [cfg.command, *cfg.args], {**os.environ, **(cfg.env or {})}
+                [cfg.command, *cfg.args], {**os.environ, **(cfg.env or {})}, local=not sandboxed
             )
             if executor is not None and executor.supports_process_spawning:
                 read, write = await executor.start_process(command, args, env=cfg.env or None)

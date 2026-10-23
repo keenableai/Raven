@@ -46,16 +46,16 @@ async def _reported(observed) -> dict:
 
 @pytest.mark.asyncio
 async def test_a_stdio_server_starts_the_way_the_mirror_fallback_says(tmp_path, monkeypatch):
-    """`uvx <server>` fetches the server on first start. Asked with the command
-    line and the environment the server would see, and started with the
-    answer; nothing is written to the server's configuration."""
+    """`uvx <server>` and `npx <server>` fetch the server on first start. Asked
+    with the command line and the environment the server would see, and
+    started with the answer; nothing is written to the server's configuration."""
     from raven.utils import mirrors
 
     observed = tmp_path / "observed.json"
-    asked: list[tuple[list[str], dict[str, str]]] = []
+    asked: list[tuple[list[str], dict[str, str], bool]] = []
 
-    def package_launch(argv, env):
-        asked.append((list(argv), dict(env)))
+    def package_launch(argv, env, cwd=None, *, local=True):
+        asked.append((list(argv), dict(env), local))
         return [*argv, "--as-the-answer-says"]
 
     monkeypatch.setattr(mirrors, "package_launch", package_launch)
@@ -66,8 +66,9 @@ async def test_a_stdio_server_starts_the_way_the_mirror_fallback_says(tmp_path, 
         arrived = await _reported(observed)
 
     assert arrived == {"args": ["--as-the-answer-says"]}
-    (argv, env), *_ = asked
+    (argv, env, local), *_ = asked
     assert argv == [sys.executable, *args] and env["FROM_CONFIG"] == "yes"
+    assert local, "the server starts on this machine, where an install for it may be made"
     assert cfg.args == args and cfg.env == {"FROM_CONFIG": "yes"}, "the configuration is left as it was"
 
 
@@ -88,12 +89,18 @@ class _SpawningExecutor:
 async def test_a_sandboxed_stdio_server_starts_the_same_way(monkeypatch):
     """The index goes on the command line and nowhere else: a server with no
     ``env`` of its own still gets none, which the SDK reads as its own
-    default environment -- the launch every server got before the mirror."""
+    default environment -- the launch every server got before the mirror.
+    Nothing is installed on this machine for a server the sandbox fetches in
+    there."""
     from raven.utils import mirrors
 
-    monkeypatch.setattr(
-        mirrors, "package_launch", lambda argv, env: [argv[0], "--default-index", mirrors.PYPI_INDEX, *argv[1:]]
-    )
+    asked: list[bool] = []
+
+    def package_launch(argv, env, cwd=None, *, local=True):
+        asked.append(local)
+        return [argv[0], "--default-index", mirrors.PYPI_INDEX, *argv[1:]]
+
+    monkeypatch.setattr(mirrors, "package_launch", package_launch)
     executor = _SpawningExecutor()
 
     async with open_mcp_transport(
@@ -102,6 +109,7 @@ async def test_a_sandboxed_stdio_server_starts_the_same_way(monkeypatch):
         pass
 
     assert executor.started == [("uvx", ["--default-index", mirrors.PYPI_INDEX, "mcp-server-fetch"], None)]
+    assert asked == [False]
 
 
 @pytest.mark.asyncio

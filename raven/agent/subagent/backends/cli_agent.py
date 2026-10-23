@@ -547,9 +547,9 @@ class CliAgentBackend:
             # is the way to hand one agent back its full registry. A third-party
             # CLI reads none of these; a ``raven`` one does.
             env = {**env_base, **host_identity_env(), **subagent_role_env(), **(runtime_env or {}), **self.env}
-            # An agent started through uvx fetches itself first, from the index
-            # this names on its command line when pypi.org cannot be reached.
-            argv = await mirrors.package_launch_async(argv, env)
+            # An agent started through uvx or npx fetches itself first, and from
+            # the mirror when its registry cannot be reached.
+            argv = await mirrors.package_launch_async(argv, env, cwd)
             argv = resolve_program(argv, env)
             logger.info("Subagent [{}] CLI agent {!r}: {}", task_id, self.name, argv[:1])
             proc = await asyncio.create_subprocess_exec(

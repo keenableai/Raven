@@ -467,11 +467,12 @@ class AcpClient:
         # These agents need the login shell's PATH, not raven's -- the same
         # reason the cli transport does it.
         base_env = await asyncio.to_thread(login_shell_env)
-        # A ``uvx <agent>`` launch fetches the agent on first run, so an index
-        # that cannot be reached is a launch that never starts. Asked here rather
-        # than before the pool: the pool keys on the launch as configured, and a
-        # verdict that flips must not restart the agents already running.
-        argv = await mirrors.package_launch_async(argv, {**base_env, **(env or {})})
+        # A ``uvx`` or ``npx`` launch fetches the agent on first run, so a
+        # registry that cannot be reached is a launch that never starts. Asked
+        # here rather than before the pool: the pool keys on the launch as
+        # configured, and a verdict that flips must not restart the agents
+        # already running.
+        argv = await mirrors.package_launch_async(argv, {**base_env, **(env or {})}, cwd)
         # The role goes on before the caller's own map, so a config ``env`` entry
         # is the way to hand one agent back its full registry. The mark goes on
         # last, so no entry can make an agent pass for another host's.

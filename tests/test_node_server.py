@@ -644,15 +644,16 @@ async def _what_the_agent_saw(host: "_Host", cwd: str, agent, env: dict[str, str
 @pytest.mark.slow
 async def test_an_agent_starts_the_way_this_machine_s_mirror_fallback_says(tmp_path, agent, monkeypatch):
     """Decided here, on the machine the agent runs on: whether the host can reach
-    an index says nothing about whether this machine can. Asked with the
-    environment the agent starts with, and started with the answer."""
+    a registry says nothing about whether this machine can. Asked with the
+    environment the agent starts with and the directory it starts in, and
+    started with the answer."""
     from raven.utils import mirrors
 
     monkeypatch.setattr(server, "capture_login_env", lambda: {**os.environ, "FROM_LOGIN": "yes"})
-    asked: list[tuple[list[str], object, object]] = []
+    asked: list[tuple[list[str], object, object, object]] = []
 
-    def package_launch(argv, env):
-        asked.append((list(argv), env.get("FROM_LOGIN"), env.get("FROM_ENTRY")))
+    def package_launch(argv, env, cwd=None, *, local=True):
+        asked.append((list(argv), env.get("FROM_LOGIN"), env.get("FROM_ENTRY"), cwd))
         return [*argv, "--as-the-answer-says"]
 
     monkeypatch.setattr(mirrors, "package_launch", package_launch)
@@ -660,9 +661,10 @@ async def test_an_agent_starts_the_way_this_machine_s_mirror_fallback_says(tmp_p
     seen = await _what_the_agent_saw(_Host(), str(tmp_path), agent, {"FROM_ENTRY": "1"})
 
     assert seen["args"] == ["--as-the-answer-says"]
-    (argv, login, entry), *_ = asked
+    (argv, login, entry, cwd), *_ = asked
     assert argv[0] == sys.executable
     assert (login, entry) == ("yes", "1"), "asked with the environment the agent starts with"
+    assert cwd == str(tmp_path), "and where it starts, where npx would look for what the project has"
 
 
 @pytest.mark.slow

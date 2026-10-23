@@ -1247,13 +1247,13 @@ class Daemon:
         try:
             argv = _argv(params)
             env = {**await self.env(), **_env(params)}
-            # Asked here rather than by the host: whether an index answers from
-            # this machine is not something the host's network can tell.
-            argv = await mirrors.package_launch_async(argv, env)
+            cwd = Path(_text(params, "cwd")).expanduser()
+            # Asked here rather than by the host: whether a registry answers
+            # from this machine is not something the host's network can tell.
+            argv = await mirrors.package_launch_async(argv, env, str(cwd))
             found = shutil.which(argv[0], path=env.get("PATH"))
             if found is None:
                 raise _RefusedError(protocol.NOT_FOUND, f"{argv[0]!r} is not on this machine's PATH")
-            cwd = Path(_text(params, "cwd")).expanduser()
             record = self.record_dir(task_id)
             try:
                 cwd.mkdir(parents=True, exist_ok=True)

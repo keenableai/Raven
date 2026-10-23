@@ -21,16 +21,21 @@ equal.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
+import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 from loguru import logger
@@ -39,9 +44,9 @@ OPT_OUT_ENV = "RAVEN_NO_MIRROR"
 _TRUTHY = {"1", "true", "yes", "on"}
 
 #: The default hosts asked before anything is redirected: npm's registry for
-#: raven's own npm installs, PyPI for uvx, and the Python builds the installers
-#: and the upgrade helper fetch through uv. Any HTTP answer from one proves it
-#: can be reached.
+#: npx launches and raven's own npm installs, PyPI for uvx, and the Python
+#: builds the installers and the upgrade helper fetch through uv. Any HTTP
+#: answer from one proves it can be reached.
 NPM_DEFAULT_REGISTRY = "https://registry.npmjs.org/"
 PYPI_DEFAULT_INDEX = "https://pypi.org/simple/"
 PYTHON_DEFAULT_DOWNLOADS = "https://releases.astral.sh/"
@@ -203,15 +208,18 @@ def _set(env: Mapping[str, str], *names: str) -> bool:
     return any(key.lower() in wanted and value.strip() for key, value in env.items())
 
 
+def _user_npmrc(env: Mapping[str, str]) -> Path:
+    return Path(env["NPM_CONFIG_USERCONFIG"]) if env.get("NPM_CONFIG_USERCONFIG") else _home(env) / ".npmrc"
+
+
 def _npm_registry_chosen(env: Mapping[str, str]) -> bool:
     """Whether the environment or the user's npmrc names a default registry,
     which settles it without asking anything. A scoped ``@corp:registry`` is
     not a default."""
     if _set(env, "npm_config_registry"):
         return True
-    npmrc = Path(env["NPM_CONFIG_USERCONFIG"]) if env.get("NPM_CONFIG_USERCONFIG") else _home(env) / ".npmrc"
     try:
-        text = npmrc.read_text(encoding="utf-8", errors="replace")
+        text = _user_npmrc(env).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
     return re.search(r"^\s*registry\s*=\s*\S", text, re.MULTILINE) is not None
@@ -230,6 +238,12 @@ def _npm_registry(env: Mapping[str, str], cwd: str | None) -> str | None:
     directory not made yet is asked about from the nearest one that is:
     nothing below it can name a registry before it exists.
     """
+    return (_npm_config(env, cwd, ("registry",)) or {}).get("registry")
+
+
+def _npm_config(env: Mapping[str, str], cwd: str | None, names: Sequence[str]) -> dict[str, str] | None:
+    """What npm, run in ``cwd`` with ``env``, holds for each of ``names``, or
+    None when it cannot say; see :func:`_npm_registry`."""
     npm = shutil.which("npm", path=env.get("PATH") or os.environ.get("PATH", os.defpath))
     if npm is None:
         return None
@@ -238,7 +252,7 @@ def _npm_registry(env: Mapping[str, str], cwd: str | None) -> str | None:
         where = where.parent if where.parent != where else None
     try:
         done = subprocess.run(
-            [npm, "config", "get", "registry"],
+            [npm, "config", "get", *names],
             cwd=where,
             env=dict(env),
             stdin=subprocess.DEVNULL,
@@ -250,7 +264,17 @@ def _npm_registry(env: Mapping[str, str], cwd: str | None) -> str | None:
         return None
     if done.returncode != 0:
         return None
-    return done.stdout.decode("utf-8", "replace").strip() or None
+    text = done.stdout.decode("utf-8", "replace").strip()
+    if len(names) == 1:
+        # Asked for one setting, npm prints its value alone; for several,
+        # each as ``name=value``.
+        return {names[0]: text} if text else None
+    values = {}
+    for line in text.splitlines():
+        name, equals, value = line.partition("=")
+        if equals and name.strip() in names and value.strip():
+            values[name.strip()] = value.strip()
+    return values
 
 
 def npm_registry_env(env: Mapping[str, str], cwd: str | None = None) -> dict[str, str]:
@@ -260,7 +284,7 @@ def npm_registry_env(env: Mapping[str, str], cwd: str | None = None) -> dict[str
 
     For an npm raven runs in a directory of its own, whose lockfile is raven's,
     and which starts nothing that outlives it; :func:`package_launch` says why
-    an npx launch is not given one. May block for a probe and for npm itself,
+    an npx launch is never given one. May block for a probe and for npm itself,
     and never raises: a fault while deciding leaves npm as it is.
     """
     if not enabled():
@@ -285,6 +309,376 @@ def _npm_registry_env(env: Mapping[str, str], cwd: str | None) -> dict[str, str]
         OPT_OUT_ENV,
     )
     return {"npm_config_registry": NPM_REGISTRY}
+
+
+#: How long npm may take to install what an npx launch asks for. The launch
+#: waits for it, as it would have waited for npx to fetch the same packages.
+_NPX_INSTALL_TIMEOUT = 600.0
+
+#: A spec npx looks up on the registry: a package name, scoped or not, and a
+#: version, a range or a tag. Paths, URLs, git and aliases are not fetched from
+#: it, or not from it alone, and keep the launch as configured.
+_REGISTRY_SPEC = re.compile(
+    r"((?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*)(?:@([A-Za-z0-9.^~*<>=|+_-]+))?"
+)
+#: One version and nothing else; npm reads a leading ``v`` or ``=`` as part of it.
+_EXACT_VERSION = re.compile(r"[v=]?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?")
+#: What npx runs when told which packages to fetch: one of their bins, by name.
+_BIN_NAME = re.compile(r"[A-Za-z0-9@._+-]+")
+#: A script's first line as npm's Windows shims read it (cmd-shim), nothing
+#: else on Windows reading it at all: the variables ``env`` would set, the
+#: program, and the arguments it takes before the script.
+_SHEBANG = re.compile(r"#!\s*(?:/usr/bin/env\s+(?:-S\s+)?((?:[^ \t=]+=[^ \t=]+\s+)*))?([^ \t]+)(.*)")
+
+
+class _NpxRequest(NamedTuple):
+    """What an npx command line asks for."""
+
+    #: Each package spec, as written.
+    specs: list[str]
+    #: The same, as (name, version range or tag), the second empty for none.
+    packages: list[tuple[str, str]]
+    #: The bin to run; None for the one package's own.
+    command: str | None
+    args: list[str]
+
+
+def _npx_request(words: Sequence[str]) -> _NpxRequest | None:
+    """``npx [-y] [-p SPEC]... [--] FIRST ARGS...``, read the way npx reads it,
+    or None for any other shape.
+
+    Without ``-p``, FIRST is the package and its own bin is run; with one,
+    FIRST is the bin to run from the packages named. Any other option is a
+    choice of how npx works -- ``--registry``, ``--no``, ``-c``, a cache or a
+    config of its own -- which a launch that does without npx would not keep,
+    so the launch stays as configured.
+    """
+    specs: list[str] = []
+    rest = list(words)
+    while rest and rest[0].startswith("-"):
+        word = rest.pop(0)
+        if word == "--":
+            break
+        if word in ("-y", "--yes"):
+            continue
+        if word in ("-p", "--package") and rest:
+            specs.append(rest.pop(0))
+        elif word.startswith(("-p=", "--package=")):
+            specs.append(word.partition("=")[2])
+        else:
+            return None
+    if not rest:
+        return None
+    first, args = rest[0], rest[1:]
+    command = first if specs else None
+    if command is not None and not _BIN_NAME.fullmatch(command):
+        return None
+    specs = specs or [first]
+    packages = []
+    for spec in specs:
+        found = _REGISTRY_SPEC.fullmatch(spec)
+        if found is None:
+            return None
+        packages.append((found.group(1), found.group(2) or ""))
+    if len({name for name, _ in packages}) != len(packages):
+        return None
+    return _NpxRequest(specs, packages, command, args)
+
+
+def _read_json(path: Path) -> dict:
+    """The object in the JSON file at ``path``; empty when there is none to read."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _bins(manifest: Mapping[str, object], name: str) -> dict[str, str]:
+    """A package.json's bins by name; one given as a bare path is named after the package."""
+    bins = manifest.get("bin")
+    if isinstance(bins, str):
+        return {name.rpartition("/")[2]: bins}
+    if isinstance(bins, dict):
+        return {key: value for key, value in bins.items() if isinstance(key, str) and isinstance(value, str)}
+    return {}
+
+
+def _default_bin(name: str, bins: Mapping[str, str]) -> str | None:
+    """The bin npx runs from a package named without ``-p``: its only one, or the one named after it."""
+    if len(set(bins.values())) == 1:
+        return next(iter(bins))
+    unscoped = name.rpartition("/")[2]
+    return unscoped if unscoped in bins else None
+
+
+def _project_roots(where: Path) -> Iterator[Path]:
+    """``where``, then each folder above it that npm could take for the
+    project's root, or a workspace's: one holding a package.json or a
+    node_modules. npm takes the nearest, or a workspace root above it, and
+    ``where`` itself when there is none; asking every one of them finds more
+    than npm would, and leaves one more launch as configured, not one fewer."""
+    yield where
+    for folder in where.parents:
+        if (folder / "package.json").is_file() or (folder / "node_modules").is_dir():
+            yield folder
+
+
+def _npx_finds_locally(request: _NpxRequest, where: Path) -> bool:
+    """Whether npx would start this from what the project already has, without
+    asking a registry: a bin by that name -- the project's own, or one in a
+    node_modules/.bin above ``where`` -- or a package it names, installed in
+    the project. Those stay npx's to start."""
+    first = request.specs[0] if request.command is None else None
+    for folder in _project_roots(where):
+        modules = folder / "node_modules"
+        if any((modules / name / "package.json").is_file() for name, _ in request.packages):
+            return True
+        if first is not None:
+            if (modules / ".bin" / first).is_file():
+                return True
+            manifest = _read_json(folder / "package.json")
+            if first in _bins(manifest, str(manifest.get("name", ""))):
+                return True
+    return False
+
+
+def _project_npmrc_names_a_registry(where: Path, env: Mapping[str, str]) -> bool:
+    """Whether the project's .npmrc names a registry, scoped or not. npx reads
+    it; the install it is replaced by runs in a directory of Raven's, which
+    reads only the user's npmrc and npm's own, so a registry the project names
+    would be passed over there. The user's own npmrc is no project's, as npm
+    takes it."""
+    user = os.path.normcase(os.path.abspath(_user_npmrc(env)))
+    for folder in _project_roots(where):
+        npmrc = folder / ".npmrc"
+        if os.path.normcase(os.path.abspath(npmrc)) == user:
+            continue
+        try:
+            text = npmrc.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if re.search(r"^\s*(?:@[^\s:=]+:)?registry\s*=", text, re.MULTILINE):
+            return True
+    return False
+
+
+def _global_bin(prefix: str) -> Path:
+    """Where npm links the bins of what it installs globally, under its ``prefix``."""
+    return Path(prefix) if os.name == "nt" else Path(prefix) / "bin"
+
+
+def _npx_launch(argv: list[str], env: Mapping[str, str], cwd: str | None) -> list[str]:
+    request = _npx_request(argv[1:])
+    if request is None or _npm_registry_chosen(env):
+        return argv
+    where = Path(cwd) if cwd else Path.cwd()
+    if _npx_finds_locally(request, where) or not _moved({NPM_DEFAULT_REGISTRY: NPM_REGISTRY}):
+        return argv
+    if _project_npmrc_names_a_registry(where, env):
+        return argv
+    config = _npm_config(env, str(where), ("registry", "prefix")) or {}
+    if config.get("registry", "").rstrip("/") != NPM_DEFAULT_REGISTRY.rstrip("/"):
+        return argv
+    if request.command is None and "prefix" in config and (_global_bin(config["prefix"]) / request.specs[0]).is_file():
+        return argv
+    prefix = _npx_install(request, env)
+    started = _npx_started(prefix, request, env) if prefix is not None else None
+    if started is None:
+        logger.warning(
+            "{} could not be reached, and {} could not be installed from {} and started; npx starts as configured",
+            _host(NPM_DEFAULT_REGISTRY),
+            " ".join(request.specs),
+            _host(NPM_REGISTRY),
+        )
+        return argv
+    logger.info(
+        "{} could not be reached; {} is installed from {} into {} and starts from there ({}=1 turns this off)",
+        _host(NPM_DEFAULT_REGISTRY),
+        " ".join(request.specs),
+        _host(NPM_REGISTRY),
+        prefix,
+        OPT_OUT_ENV,
+    )
+    return started
+
+
+def _npx_install(request: _NpxRequest, env: Mapping[str, str]) -> Path | None:
+    """Raven's own install of the packages ``request`` names, from the mirror:
+    its directory, or None when there is none to start.
+
+    One directory per set of specs, as npx keeps one, under Raven's cache. An
+    exact version is installed once. Anything else -- a range, a tag, a bare
+    name -- is brought up to date at each launch (``npm update``), as npx asks
+    the registry each time what it means now; when that fails, the install
+    made before still starts. Launches of the same specs take turns.
+    """
+    from raven.home import raven_home
+
+    key = hashlib.sha256("\n".join(sorted(request.specs)).encode("utf-8")).hexdigest()[:16]
+    prefix = raven_home() / "cache" / "npx" / key
+    manifest = {"private": True, "dependencies": {name: version or "latest" for name, version in request.packages}}
+    with _exclusive(prefix / ".lock", _NPX_INSTALL_TIMEOUT + 60):
+        written = _read_json(prefix / "package.json")
+        if written != manifest:
+            (prefix / "package.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        installed = written == manifest and all(
+            (prefix / "node_modules" / name / "package.json").is_file() for name, _ in request.packages
+        )
+        if installed and all(_EXACT_VERSION.fullmatch(version) for _, version in request.packages):
+            return prefix
+        if _npm_install(prefix, "update" if installed else "install", env):
+            return prefix
+        return prefix if installed else None
+
+
+def _npm_install(prefix: Path, verb: str, env: Mapping[str, str]) -> bool:
+    """Run ``npm <verb>`` in ``prefix`` against the mirror; whether it finished.
+
+    The registry goes on the command line of this npm alone, which ends with
+    the install. Run in a process group of its own, so a deadline ends npm's
+    children too: on Windows the npm found is a .cmd, and the node it starts
+    would outlive cmd.exe.
+    """
+    npm = shutil.which("npm", path=env.get("PATH") or os.environ.get("PATH", os.defpath))
+    if npm is None:
+        return False
+    try:
+        proc = subprocess.Popen(
+            [npm, verb, "--registry", NPM_REGISTRY, "--no-audit", "--no-fund"],
+            cwd=prefix,
+            env=dict(env),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=os.name != "nt",
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+    except OSError as exc:
+        logger.warning("npm could not be started in {}: {}", prefix, exc)
+        return False
+    try:
+        out, _ = proc.communicate(timeout=_NPX_INSTALL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _end_group(proc)
+        proc.communicate()
+        logger.warning("npm {} in {} did not finish in {:.0f}s", verb, prefix, _NPX_INSTALL_TIMEOUT)
+        return False
+    if proc.returncode != 0:
+        said = out.decode("utf-8", "replace").strip()[-800:]
+        logger.warning("npm {} in {} failed (exit {}): {}", verb, prefix, proc.returncode, said)
+        return False
+    return True
+
+
+def _end_group(proc: subprocess.Popen) -> None:
+    """End ``proc`` and everything it started."""
+    if os.name == "nt":
+        taskkill = shutil.which("taskkill")
+        if taskkill:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(
+                    [taskkill, "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30, check=False
+                )
+    else:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        proc.kill()
+
+
+def _npx_started(prefix: Path, request: _NpxRequest, env: Mapping[str, str]) -> list[str] | None:
+    """The command line that starts, from ``prefix``, the bin npx would have run."""
+    for name, _version in request.packages:
+        package = prefix / "node_modules" / name
+        manifest = _read_json(package / "package.json")
+        bins = _bins(manifest, name)
+        command = request.command if request.command is not None else _default_bin(name, bins)
+        if command is None or command not in bins:
+            continue
+        target = (package / bins[command]).resolve()
+        if package.resolve() not in target.parents or not target.is_file():
+            return None
+        return _script_argv(target, request.args, env)
+    return None
+
+
+def _script_argv(target: Path, args: Sequence[str], env: Mapping[str, str]) -> list[str] | None:
+    """How to start ``target``, a bin's file, the way the link npm makes to it starts it."""
+    if os.name != "nt":
+        # npm marks a bin's file executable, and its first line names what runs it.
+        return [str(target), *args] if os.access(target, os.X_OK) else None
+    try:
+        with target.open("rb") as handle:
+            first = handle.readline(1024).decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    if not first.startswith("#!"):
+        return [str(target), *args] if target.suffix.lower() == ".exe" else None
+    options = _node_options(first)
+    node = shutil.which("node", path=env.get("PATH") or os.environ.get("PATH", os.defpath))
+    if options is None or node is None:
+        return None
+    return [node, *options, str(target), *args]
+
+
+def _node_options(first_line: str) -> list[str] | None:
+    """What node is started with, before the script, for a script whose first
+    line is ``first_line``, read as npm's Windows shims read it; None for a
+    script node does not run, or one that needs variables set."""
+    found = _SHEBANG.fullmatch(first_line.strip())
+    if found is None:
+        return None
+    variables, program, options = found.groups()
+    return None if variables or _program(program) != "node" else options.split()
+
+
+@contextlib.contextmanager
+def _exclusive(path: Path, timeout: float) -> Iterator[None]:
+    """Hold ``path`` locked for the block, against every process and thread
+    doing the same; TimeoutError when another holds it past ``timeout``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + timeout
+        while not _try_lock(fd):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"{path} was held for longer than {timeout:.0f}s")
+            time.sleep(0.2)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                _unlock(fd)
+    finally:
+        os.close(fd)
+
+
+try:
+    import fcntl
+
+    def _try_lock(fd: int) -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
+    def _unlock(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+except ImportError:  # pragma: no cover - the other platform
+    import msvcrt
+
+    def _try_lock(fd: int) -> bool:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+    def _unlock(fd: int) -> None:
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 
 #: Where uv looks for the machine's uv.toml after the XDG directories.
@@ -339,37 +733,58 @@ def _uv_index_named(args: Sequence[str]) -> bool:
     )
 
 
-def package_launch(argv: Sequence[str], env: Mapping[str, str]) -> list[str]:
-    """``argv``, with PyPI's mirror named on it where a ``uvx`` launch cannot
-    reach pypi.org and the mirror answers.
+def package_launch(
+    argv: Sequence[str], env: Mapping[str, str], cwd: str | None = None, *, local: bool = True
+) -> list[str]:
+    """``argv``, or a command line that fetches the same package from a
+    mirror, where a ``uvx`` or ``npx`` launch cannot reach its default
+    registry and the mirror answers.
 
-    Only uvx, and only on its command line: uv keeps a flag to itself, so the
-    choice ends with the fetch, while a variable would stay in the tool's
-    environment and outrank the index a project names for itself. npx gets
-    nothing, because npm hands its registry to everything it starts, however
-    the registry was given -- a variable, a flag, an npmrc (measured with npm
-    11.12) -- and there it would replace the registry a project names in its
-    own .npmrc. ``uv run`` and ``npm install`` resolve the project they run
-    in, and pnpm and bun read registries from files of their own; those start
-    as configured too. ``env`` is the environment the launch gets, where the
-    user's own choice of index would be found. A choice already made -- in the
+    uvx is given PyPI's mirror on its own command line: uv keeps a flag to
+    itself, so the choice ends with the fetch, while a variable would stay in
+    the tool's environment and outrank the index a project names for itself.
+
+    npx cannot be given one at all: npm hands its registry to everything npx
+    starts, however the registry was given -- a variable, a flag, an npmrc
+    (measured with npm 11.12) -- and there it would replace the registry a
+    project names in its own .npmrc. So npx does not run. The packages it would
+    fetch are installed from the mirror into a directory of Raven's own
+    (:func:`_npx_install`), and the bin it would run starts from there, with
+    the launch's own environment: the mirror ends with the install. A package
+    npx would find without asking a registry -- in the project, or among npm's
+    global bins -- stays npx's to start. Only a ``local`` launch gets this,
+    the install being made on this machine; one that runs in a sandbox gets
+    only what its command line can carry.
+
+    ``uv run`` and ``npm install`` resolve the project they run in, and pnpm and
+    bun read registries from files of their own; those start as configured
+    too. ``env`` is the environment the launch gets, where the user's own
+    choice of index or registry would be found, and ``cwd`` the directory it
+    starts in, this process's own when None. A choice already made -- in the
     environment, a configuration file, or on the command line -- stands, and
-    ``RAVEN_NO_MIRROR`` leaves every launch alone. May block for a probe; see
-    :func:`package_launch_async`. Never raises: a fault while deciding leaves
-    the launch as it was configured.
+    ``RAVEN_NO_MIRROR`` leaves every launch alone. May block for a probe and
+    for npm; see :func:`package_launch_async`. Never raises: a fault while
+    deciding leaves the launch as it was configured.
     """
     if not argv or not enabled():
         return list(argv)
     try:
-        return _package_launch(list(argv), env)
+        return _package_launch(list(argv), env, cwd, local)
     except Exception as exc:  # noqa: BLE001 - the mirror is a way around an outage, never a gate
         logger.opt(exception=exc).warning("could not decide on a mirror for {!r}; it starts as configured", argv[0])
         return list(argv)
 
 
-def _package_launch(argv: list[str], env: Mapping[str, str]) -> list[str]:
-    if _program(argv[0]) != "uvx":
-        return argv
+def _package_launch(argv: list[str], env: Mapping[str, str], cwd: str | None, local: bool) -> list[str]:
+    program = _program(argv[0])
+    if program == "uvx":
+        return _uvx_launch(argv, env)
+    if program == "npx" and local:
+        return _npx_launch(argv, env, cwd)
+    return argv
+
+
+def _uvx_launch(argv: list[str], env: Mapping[str, str]) -> list[str]:
     # A uv.toml named on the command line may choose the index, and the flag
     # added here would outrank it.
     if _names(argv[1:], ("--config-file",)) or _uv_index_named(argv[1:]) or _uv_index_chosen(env):
@@ -385,9 +800,11 @@ def _package_launch(argv: list[str], env: Mapping[str, str]) -> list[str]:
     return [argv[0], "--default-index", PYPI_INDEX, *argv[1:]]
 
 
-async def package_launch_async(argv: Sequence[str], env: Mapping[str, str]) -> list[str]:
-    """:func:`package_launch` off the event loop, since its probe blocks."""
-    return await asyncio.to_thread(package_launch, argv, env)
+async def package_launch_async(
+    argv: Sequence[str], env: Mapping[str, str], cwd: str | None = None, *, local: bool = True
+) -> list[str]:
+    """:func:`package_launch` off the event loop, since its probe and npm block."""
+    return await asyncio.to_thread(package_launch, argv, env, cwd, local=local)
 
 
 __all__ = [

@@ -130,18 +130,21 @@ def _launch_reporting_child(script: Path) -> str:
 async def test_an_acp_child_starts_the_way_the_mirror_fallback_says(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``uvx <agent>`` fetches the agent the first time it runs. The launch asks
-    with the argv it is about to start and the environment the child would get,
-    and starts the argv it is answered with."""
+    """``uvx <agent>`` and ``npx <agent>`` fetch the agent the first time it
+    runs. The launch asks with the argv it is about to start, the environment
+    the child would get and the directory it starts in, and starts the argv it
+    is answered with."""
     from raven.utils import mirrors
 
     observed = tmp_path / "observed.json"
     command = _launch_reporting_child(tmp_path / "child.py")
     monkeypatch.setattr(backend_env, "login_shell_env", lambda: {"PATH": os.environ["PATH"], "OUTPUT": str(observed)})
-    asked: list[tuple[list[str], dict[str, str]]] = []
+    asked: list[tuple[list[str], dict[str, str], str | None]] = []
 
-    def package_launch(argv: list[str], env: dict[str, str]) -> list[str]:
-        asked.append((list(argv), dict(env)))
+    def package_launch(
+        argv: list[str], env: dict[str, str], cwd: str | None = None, *, local: bool = True
+    ) -> list[str]:
+        asked.append((list(argv), dict(env), cwd))
         return [*argv, "--as-the-answer-says"]
 
     monkeypatch.setattr(mirrors, "package_launch", package_launch)
@@ -153,9 +156,10 @@ async def test_an_acp_child_starts_the_way_the_mirror_fallback_says(
         await client.close()
 
     assert arrived == {"args": ["--as-the-answer-says"]}
-    (argv, env), *_ = asked
+    (argv, env, cwd), *_ = asked
     assert argv[0] == sys.executable, "asked about the program the entry names"
     assert (env["OUTPUT"], env["FROM_ENTRY"]) == (str(observed), "1"), "asked with the environment the child gets"
+    assert cwd == str(tmp_path), "and where it starts"
 
 
 @pytest.mark.parametrize("legacy", [True, False])

@@ -8,13 +8,20 @@ line, and the one switch that turns the whole fallback off.
 
 from __future__ import annotations
 
+import hashlib
 import http.server
+import json
 import os
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import threading
+import time
 import urllib.error
+from collections.abc import Iterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -136,15 +143,19 @@ class _Network:
 
 
 class _Npm:
-    """What `npm config get registry` answers, and the directories it was asked in."""
+    """What `npm config get` answers, and the directories it was asked in."""
 
-    def __init__(self) -> None:
+    def __init__(self, global_prefix: str) -> None:
         self.registry: str | None = mirrors.NPM_DEFAULT_REGISTRY
+        self.prefix = global_prefix
         self.asked_in: list[str | None] = []
 
-    def registry_in(self, _env: object, cwd: str | None) -> str | None:
+    def config_in(self, _env: object, cwd: str | None, names: tuple[str, ...]) -> dict[str, str] | None:
         self.asked_in.append(cwd)
-        return self.registry
+        if self.registry is None:
+            return None
+        holds = {"registry": self.registry, "prefix": self.prefix}
+        return {name: holds[name] for name in names}
 
 
 class TestPackageRunners:
@@ -170,9 +181,9 @@ class TestPackageRunners:
         monkeypatch.setattr(mirrors, "_ETC", str(tmp_path / "etc"))
 
     @pytest.fixture(autouse=True)
-    def npm(self, monkeypatch: pytest.MonkeyPatch) -> _Npm:
-        npm = _Npm()
-        monkeypatch.setattr(mirrors, "_npm_registry", npm.registry_in)
+    def npm(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> _Npm:
+        npm = _Npm(str(tmp_path / "npm-global"))
+        monkeypatch.setattr(mirrors, "_npm_config", npm.config_in)
         return npm
 
     @staticmethod
@@ -232,18 +243,6 @@ class TestPackageRunners:
             mirrors.PYPI_INDEX,
             "pkg",
         ]
-
-    @pytest.mark.parametrize("program", ["npx", r"C:\Program Files\nodejs\npx.cmd", "/usr/local/bin/npx"])
-    def test_npx_is_left_alone(self, network, npm, tmp_path, program: str) -> None:
-        """npm hands its registry to everything npx starts, however it was given
-        (measured with npm 11.12), and there it outranks the registry a project
-        names in its own .npmrc: an agent's `npm install` in such a project
-        would resolve that project's private packages from a public mirror."""
-        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
-        argv = [program, "-y", "@agentclientprotocol/codex-acp@1.13.1"]
-
-        assert mirrors.package_launch(argv, self._home(tmp_path)) == argv
-        assert network.asked == [] and npm.asked_in == [], "nothing is asked for a launch left alone"
 
     @pytest.mark.parametrize(
         "argv",
@@ -443,6 +442,7 @@ class TestPackageRunners:
         monkeypatch.setenv("RAVEN_NO_MIRROR", "1")
 
         assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == ["uvx", "pkg"]
+        assert mirrors.package_launch(["npx", "-y", "pkg"], self._home(tmp_path)) == ["npx", "-y", "pkg"]
         assert mirrors.npm_registry_env(self._home(tmp_path)) == {}
         assert network.asked == []
 
@@ -469,6 +469,611 @@ class TestPackageRunners:
             mirrors.PYPI_INDEX,
             "pkg",
         ]
+
+
+#: Two packages as a registry would serve them: each one's version and bins,
+#: and the files those bins are.
+_PACKAGES = {
+    "@acme/agent": {
+        "version": "1.4.0",
+        "bin": {"acme-agent": "dist/cli.js"},
+        "files": {"dist/cli.js": "#!/usr/bin/env node\nconsole.log('agent')\n"},
+    },
+    "acme-tools": {
+        "version": "2.0.1",
+        "bin": {"acme-lint": "bin/lint.js", "acme-fmt": "bin/fmt.js"},
+        "files": {
+            "bin/lint.js": "#!/usr/bin/env node\nconsole.log('lint')\n",
+            "bin/fmt.js": "#!/usr/bin/env node\nconsole.log('fmt')\n",
+        },
+    },
+}
+
+
+class _Installs:
+    """Stands in for npm in Raven's install directory: every run it is asked
+    for, and the packages a run lays out there."""
+
+    def __init__(self) -> None:
+        self.runs: list[tuple[Path, str]] = []
+        self.fails = False
+        self.executable = True
+        self.running = 0
+        self.overlapped = False
+
+    def __call__(self, prefix: Path, verb: str, _env: object) -> bool:
+        self.runs.append((prefix, verb))
+        self.running += 1
+        self.overlapped |= self.running > 1
+        try:
+            time.sleep(0.05)
+            if self.fails:
+                return False
+            for name in json.loads((prefix / "package.json").read_text(encoding="utf-8"))["dependencies"]:
+                published = _PACKAGES[name]
+                package = prefix / "node_modules" / name
+                package.mkdir(parents=True, exist_ok=True)
+                manifest = {"name": name, "version": published["version"], "bin": published["bin"]}
+                (package / "package.json").write_text(json.dumps(manifest), encoding="utf-8")
+                for relative, text in published["files"].items():
+                    (package / relative).parent.mkdir(parents=True, exist_ok=True)
+                    (package / relative).write_text(text, encoding="utf-8")
+                    (package / relative).chmod(0o755 if self.executable else 0o644)
+            return True
+        finally:
+            self.running -= 1
+
+
+class TestNpxLaunches:
+    """npx cannot be pointed at a mirror without what it starts keeping the
+    mirror (see package_launch). So when registry.npmjs.org cannot be reached
+    and its mirror can, npx does not run: the packages it would fetch are
+    installed from the mirror into a directory of Raven's own, and the bin it
+    would have run starts from there, with the launch's own environment."""
+
+    @pytest.fixture(autouse=True)
+    def _setting(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        monkeypatch.delenv("RAVEN_NO_MIRROR", raising=False)
+        monkeypatch.setenv("RAVEN_HOME", str(tmp_path / "raven"))
+
+    @pytest.fixture
+    def network(self, monkeypatch: pytest.MonkeyPatch) -> _Network:
+        network = _Network()
+        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
+        monkeypatch.setattr(mirrors, "_reachable", network.reachable)
+        return network
+
+    @pytest.fixture(autouse=True)
+    def npm(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> _Npm:
+        npm = _Npm(str(tmp_path / "npm-global"))
+        monkeypatch.setattr(mirrors, "_npm_config", npm.config_in)
+        return npm
+
+    @pytest.fixture(autouse=True)
+    def installs(self, monkeypatch: pytest.MonkeyPatch) -> _Installs:
+        installs = _Installs()
+        monkeypatch.setattr(mirrors, "_npm_install", installs)
+        return installs
+
+    @pytest.fixture
+    def project(self, tmp_path) -> Path:
+        project = tmp_path / "work" / "project"
+        project.mkdir(parents=True)
+        return project
+
+    @staticmethod
+    def _env(tmp_path) -> dict[str, str]:
+        """An empty home, and a PATH holding a node: Windows starts a bin through one."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        (bin_dir / "node.exe").write_bytes(b"")
+        return {"HOME": str(tmp_path / "home"), "USERPROFILE": str(tmp_path / "home"), "PATH": str(bin_dir)}
+
+    @staticmethod
+    def _installed(tmp_path, specs: list[str], name: str, relative: str, args: list[str]) -> list[str]:
+        """How a bin of Raven's install of ``specs`` starts, on this platform."""
+        key = hashlib.sha256("\n".join(sorted(specs)).encode("utf-8")).hexdigest()[:16]
+        target = str((tmp_path / "raven" / "cache" / "npx" / key / "node_modules" / name / relative).resolve())
+        if os.name != "nt":
+            return [target, *args]
+        return [shutil.which("node", path=str(tmp_path / "bin")) or "", target, *args]
+
+    def test_the_package_starts_from_ravens_own_install_of_it(self, network, installs, project, tmp_path) -> None:
+        env = self._env(tmp_path)
+        before = dict(env)
+
+        argv = mirrors.package_launch(["npx", "-y", "@acme/agent", "--acp"], env, str(project))
+
+        assert argv == self._installed(tmp_path, ["@acme/agent"], "@acme/agent", "dist/cli.js", ["--acp"])
+        assert [verb for _prefix, verb in installs.runs] == ["install"]
+        assert env == before, "nothing of the mirror reaches the launch's environment"
+
+    @pytest.mark.parametrize("program", ["npx", r"C:\Program Files\nodejs\npx.cmd", "/usr/local/bin/npx"])
+    def test_npx_is_recognised_wherever_it_lives(self, network, project, tmp_path, program: str) -> None:
+        argv = mirrors.package_launch([program, "-y", "@acme/agent"], self._env(tmp_path), str(project))
+
+        assert argv == self._installed(tmp_path, ["@acme/agent"], "@acme/agent", "dist/cli.js", [])
+
+    def test_npx_is_left_alone_when_the_registry_answers(self, network, npm, installs, project, tmp_path) -> None:
+        network.down.clear()
+        argv = ["npx", "-y", "@acme/agent"]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == argv
+        assert network.asked == [mirrors.NPM_DEFAULT_REGISTRY], "the mirror is not asked about"
+        assert npm.asked_in == [] and installs.runs == [], "nor is npm, on a network that works"
+
+    def test_npx_is_left_alone_when_the_mirror_cannot_be_reached_either(
+        self, network, installs, project, tmp_path
+    ) -> None:
+        """npx starts a package it fetched before out of its own cache when
+        the registry is down; a mirror that is down too would only stop it."""
+        network.down.add(mirrors.NPM_REGISTRY)
+        argv = ["npx", "-y", "@acme/agent"]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == argv
+        assert installs.runs == []
+
+    @pytest.mark.parametrize(
+        ("words", "specs", "name", "relative", "args"),
+        [
+            (["@acme/agent"], ["@acme/agent"], "@acme/agent", "dist/cli.js", []),
+            (["--yes", "--", "@acme/agent", "--flag"], ["@acme/agent"], "@acme/agent", "dist/cli.js", ["--flag"]),
+            (["@acme/agent@1.4.0", "-y"], ["@acme/agent@1.4.0"], "@acme/agent", "dist/cli.js", ["-y"]),
+            (["-p", "acme-tools", "acme-fmt", "src"], ["acme-tools"], "acme-tools", "bin/fmt.js", ["src"]),
+            (
+                ["--package=@acme/agent", "-p=acme-tools", "acme-lint"],
+                ["@acme/agent", "acme-tools"],
+                "acme-tools",
+                "bin/lint.js",
+                [],
+            ),
+        ],
+        ids=["bare", "yes-and-dashes", "pinned", "package-and-bin", "two-packages"],
+    )
+    def test_each_shape_npx_takes_starts_the_bin_npx_would_run(
+        self, network, project, tmp_path, words, specs, name, relative, args
+    ) -> None:
+        """Without -p the package's own bin runs, with -p the one named, and
+        whatever follows the first word is that bin's own."""
+        argv = mirrors.package_launch(["npx", *words], self._env(tmp_path), str(project))
+
+        assert argv == self._installed(tmp_path, specs, name, relative, args)
+
+    @pytest.mark.parametrize(
+        "words",
+        [
+            ["--registry", "https://registry.example.internal/", "@acme/agent"],
+            ["--no", "@acme/agent"],
+            ["-c", "acme-agent --acp"],
+            ["--cache", "/srv/npm-cache", "@acme/agent"],
+            ["-q", "@acme/agent"],
+            ["github:acme/agent"],
+            ["./agent"],
+            ["https://example.org/agent.tgz"],
+            ["agent@npm:@acme/agent@1"],
+            ["-p", "acme-tools", "-p", "acme-tools@2", "acme-fmt"],
+            ["-p", "acme-tools", "./bin/acme-fmt"],
+            ["-y"],
+            [],
+        ],
+        ids=[
+            "registry",
+            "no",
+            "call",
+            "cache",
+            "quiet",
+            "git",
+            "path",
+            "tarball",
+            "alias",
+            "one-package-twice",
+            "a-path-to-run",
+            "no-package",
+            "bare-npx",
+        ],
+    )
+    def test_any_other_shape_starts_as_configured(self, network, installs, project, tmp_path, words) -> None:
+        """An option is a choice of how npx works, which a launch without npx
+        would drop, and a spec that is not a registry's is not fetched from one."""
+        argv = ["npx", *words]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == argv
+        assert installs.runs == []
+
+    def test_an_exact_version_is_installed_once(self, network, installs, project, tmp_path) -> None:
+        argv = ["npx", "-y", "@acme/agent@1.4.0"]
+        first = mirrors.package_launch(argv, self._env(tmp_path), str(project))
+        again = mirrors.package_launch(argv, self._env(tmp_path), str(project))
+
+        assert first == again != argv
+        assert [verb for _prefix, verb in installs.runs] == ["install"]
+
+    def test_anything_else_is_brought_up_to_date_at_each_launch(self, network, installs, project, tmp_path) -> None:
+        """As npx asks the registry each time what a tag or a range means now."""
+        for _ in range(2):
+            mirrors.package_launch(["npx", "-y", "@acme/agent@^1"], self._env(tmp_path), str(project))
+
+        assert [verb for _prefix, verb in installs.runs] == ["install", "update"]
+
+    def test_a_failed_update_starts_the_install_made_before(self, network, installs, project, tmp_path) -> None:
+        argv = ["npx", "-y", "@acme/agent"]
+        first = mirrors.package_launch(argv, self._env(tmp_path), str(project))
+        installs.fails = True
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == first != argv
+
+    def test_a_failed_install_starts_npx_as_configured(self, network, installs, project, tmp_path) -> None:
+        installs.fails = True
+        argv = ["npx", "-y", "@acme/agent"]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == argv
+
+    def test_a_bin_npx_could_not_pick_starts_npx_as_configured(self, network, project, tmp_path) -> None:
+        """acme-tools has two bins and neither is named after it: npx would ask
+        which, and so would this."""
+        argv = ["npx", "-y", "acme-tools"]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == argv
+
+    def test_launches_of_the_same_packages_take_turns(self, network, installs, project, tmp_path) -> None:
+        argv = ["npx", "-y", "@acme/agent"]
+        started: list[list[str]] = []
+        workers = [
+            threading.Thread(
+                target=lambda: started.append(mirrors.package_launch(argv, self._env(tmp_path), str(project)))
+            )
+            for _ in range(4)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        assert len(started) == 4 and all(argv_ == started[0] != argv for argv_ in started)
+        assert not installs.overlapped, "two npm runs in one directory at once"
+
+    @pytest.mark.parametrize("where", ["the-project", "a-folder-above"], ids=["in-the-project", "above-the-project"])
+    @pytest.mark.parametrize("has", ["bin", "package", "own-bin"])
+    def test_what_the_project_has_stays_npxs_to_start(
+        self, network, npm, installs, project, tmp_path, where: str, has: str
+    ) -> None:
+        """npx runs a bin or a package the project already has without asking a
+        registry; that is not a launch that needs a mirror."""
+        folder = project if where == "the-project" else project.parent
+        if has == "bin":
+            (folder / "node_modules" / ".bin").mkdir(parents=True)
+            (folder / "node_modules" / ".bin" / "acme-agent").write_text("", encoding="utf-8")
+        elif has == "package":
+            (folder / "node_modules" / "@acme" / "agent").mkdir(parents=True)
+            (folder / "node_modules" / "@acme" / "agent" / "package.json").write_text("{}", encoding="utf-8")
+        else:
+            manifest = {"name": "acme-workspace", "bin": {"acme-agent": "cli.js"}}
+            (folder / "package.json").write_text(json.dumps(manifest), encoding="utf-8")
+        spec = "acme-agent" if has != "package" else "@acme/agent"
+        argv = ["npx", "-y", spec]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == argv
+        assert network.asked == [] and npm.asked_in == [] and installs.runs == []
+
+    def test_a_bin_npm_installed_globally_stays_npxs_to_start(self, network, npm, installs, project, tmp_path) -> None:
+        bin_dir = Path(npm.prefix) if os.name == "nt" else Path(npm.prefix) / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "acme-agent").write_text("", encoding="utf-8")
+        argv = ["npx", "-y", "acme-agent"]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == argv
+        assert installs.runs == []
+
+    @pytest.mark.parametrize(
+        "npmrc", ["@acme:registry=https://registry.example.internal/\n", "registry=https://registry.npmjs.org/\n"]
+    )
+    @pytest.mark.parametrize("where", ["the-launch-folder", "the-project-root-above-it"])
+    def test_a_registry_the_projects_npmrc_names_keeps_npx(
+        self, network, installs, project, tmp_path, npmrc: str, where: str
+    ) -> None:
+        """npx reads the project's .npmrc; Raven's install directory does not,
+        and would fetch from the mirror what the project gets elsewhere."""
+        if where == "the-launch-folder":
+            (project / ".npmrc").write_text(npmrc, encoding="utf-8")
+        else:
+            (project.parent / "package.json").write_text("{}", encoding="utf-8")
+            (project.parent / ".npmrc").write_text(npmrc, encoding="utf-8")
+        argv = ["npx", "-y", "@acme/agent"]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == argv
+        assert installs.runs == []
+
+    def test_an_npmrc_npm_reads_for_no_project_is_passed_over(self, network, project, tmp_path) -> None:
+        """Above the project's root, in a folder that is no project's, npm reads
+        no .npmrc either."""
+        (project / "package.json").write_text("{}", encoding="utf-8")
+        (project.parent / ".npmrc").write_text("@acme:registry=https://registry.example.internal/\n")
+        argv = ["npx", "-y", "@acme/agent"]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) != argv
+
+    def test_the_users_own_npmrc_is_no_projects(self, network, installs, tmp_path) -> None:
+        """Raven's install reads it as npx would, so a registry it names is kept
+        either way -- even with the home folder holding a node_modules, which
+        makes npm take it for a project's root, and npm skips it there too."""
+        env = self._env(tmp_path)
+        home = Path(env["HOME"])
+        (home / "node_modules").mkdir(parents=True)
+        (home / ".npmrc").write_text("@acme:registry=https://registry.example.internal/\n", encoding="utf-8")
+        project = home / "project"
+        project.mkdir()
+        argv = ["npx", "-y", "@acme/agent"]
+
+        assert mirrors.package_launch(argv, env, str(project)) != argv
+
+    def test_a_bin_that_points_out_of_its_package_starts_npx_as_configured(
+        self, network, project, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outside = {"bin": {"acme-agent": "../../escape.js"}, "files": {"../../escape.js": "console.log('out')\n"}}
+        monkeypatch.setitem(_PACKAGES, "@acme/agent", {**_PACKAGES["@acme/agent"], **outside})
+        argv = ["npx", "-y", "@acme/agent"]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == argv
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows starts a bin through the program its first line names")
+    def test_a_bin_npm_did_not_mark_executable_starts_npx_as_configured(
+        self, network, installs, project, tmp_path
+    ) -> None:
+        installs.executable = False
+        argv = ["npx", "-y", "@acme/agent"]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project)) == argv
+
+    @pytest.mark.parametrize("chosen", ["environment", "users-npmrc", "npm-elsewhere", "npm-cannot-say"])
+    def test_a_registry_already_chosen_keeps_npx(self, network, npm, installs, project, tmp_path, chosen: str) -> None:
+        env = self._env(tmp_path)
+        if chosen == "environment":
+            env["npm_config_registry"] = "https://registry.example.internal/"
+        elif chosen == "users-npmrc":
+            Path(env["HOME"]).mkdir()
+            (Path(env["HOME"]) / ".npmrc").write_text("registry=https://registry.example.internal/\n")
+        elif chosen == "npm-elsewhere":
+            npm.registry = "https://registry.example.internal/"
+        else:
+            npm.registry = None
+        argv = ["npx", "-y", "@acme/agent"]
+
+        assert mirrors.package_launch(argv, env, str(project)) == argv
+        assert installs.runs == []
+
+    def test_npm_is_asked_where_the_launch_runs(self, network, npm, project, tmp_path) -> None:
+        mirrors.package_launch(["npx", "-y", "@acme/agent"], self._env(tmp_path), str(project))
+
+        assert npm.asked_in == [str(project)]
+
+    def test_a_launch_that_runs_in_a_sandbox_is_left_alone(self, network, installs, project, tmp_path) -> None:
+        """The install would be made on this machine, and the sandbox starts
+        what it has in there."""
+        argv = ["npx", "-y", "@acme/agent"]
+
+        assert mirrors.package_launch(argv, self._env(tmp_path), str(project), local=False) == argv
+        assert installs.runs == []
+
+    async def test_the_async_form_answers_the_same(self, network, project, tmp_path) -> None:
+        argv = await mirrors.package_launch_async(["npx", "-y", "@acme/agent"], self._env(tmp_path), str(project))
+
+        assert argv == self._installed(tmp_path, ["@acme/agent"], "@acme/agent", "dist/cli.js", [])
+
+
+class TestTheBinNpxWouldRun:
+    @pytest.mark.parametrize(
+        ("bins", "picked"),
+        [
+            ({"one": "cli.js"}, "one"),
+            ({"one": "cli.js", "alias": "cli.js"}, "one"),
+            ({"agent": "a.js", "other": "b.js"}, "agent"),
+            ({"x": "a.js", "y": "b.js"}, None),
+            ({}, None),
+        ],
+        ids=["only-one", "aliases", "named-after-it", "cannot-tell", "none"],
+    )
+    def test_without_p_the_package_names_it(self, bins: dict[str, str], picked: str | None) -> None:
+        assert mirrors._default_bin("@acme/agent", bins) == picked
+
+    def test_a_bin_given_as_a_path_is_named_after_the_package(self) -> None:
+        assert mirrors._bins({"bin": "cli.js"}, "@acme/agent") == {"agent": "cli.js"}
+
+    @pytest.mark.parametrize(
+        ("line", "options"),
+        [
+            ("#!/usr/bin/env node", []),
+            ("#!/usr/bin/env -S node --no-warnings", ["--no-warnings"]),
+            ("#!/usr/local/bin/node --harmony\r", ["--harmony"]),
+            ("#!node", []),
+            ("#!/usr/bin/env NODE_ENV=production node", None),
+            ("#!/bin/sh", None),
+            ("#!/usr/bin/env python3", None),
+            ("console.log('no first line to read')", None),
+        ],
+        ids=["env", "env-S", "absolute", "bare", "variables", "sh", "python", "none"],
+    )
+    def test_windows_starts_a_bin_through_the_program_its_first_line_names(
+        self, line: str, options: list[str] | None
+    ) -> None:
+        """As npm's own shims do there (cmd-shim): node and the options it is
+        given, and nothing a .cmd would set up first, such as variables."""
+        assert mirrors._node_options(line) == options
+
+
+def _ended(pid: int) -> bool:
+    """Whether ``pid`` is gone, or a zombie no one has reaped yet: either way it runs nothing."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        return Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a POSIX process group; Windows ends the tree with taskkill")
+def test_an_npm_past_its_deadline_is_ended_with_what_it_started(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """npm runs install scripts of its own; one that hangs must not outlive the
+    install it belongs to, still writing into the directory the next launch
+    installs into."""
+    monkeypatch.setattr(mirrors, "_NPX_INSTALL_TIMEOUT", 0.5)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    started = tmp_path / "started.pid"
+    (bin_dir / "npm").write_text(f"#!/bin/sh\nsleep 30 &\necho $! > '{started}'\nwait\n", encoding="utf-8")
+    (bin_dir / "npm").chmod(0o755)
+
+    began = time.monotonic()
+    assert not mirrors._npm_install(tmp_path, "install", {"PATH": f"{bin_dir}:/usr/bin:/bin"})
+    assert time.monotonic() - began < 10, "the deadline waited for what npm started, which holds its output open"
+    child = int(started.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 5
+    while not _ended(child) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert _ended(child), "the script npm started is still running"
+
+
+class TestTheInstallDirectoryLock:
+    def test_a_second_holder_waits_for_the_first(self, tmp_path) -> None:
+        lock = tmp_path / "npx" / ".lock"
+        order: list[str] = []
+
+        def wait() -> None:
+            with mirrors._exclusive(lock, 5):
+                order.append("second")
+
+        with mirrors._exclusive(lock, 5):
+            waiter = threading.Thread(target=wait)
+            waiter.start()
+            time.sleep(0.3)
+            order.append("first done")
+        waiter.join(5)
+
+        assert order == ["first done", "second"]
+
+    def test_a_holder_that_never_lets_go_is_given_up_on(self, tmp_path) -> None:
+        lock = tmp_path / "npx" / ".lock"
+        with mirrors._exclusive(lock, 5):
+            failed: list[BaseException] = []
+
+            def wait() -> None:
+                try:
+                    with mirrors._exclusive(lock, 0.3):
+                        pass
+                except TimeoutError as exc:
+                    failed.append(exc)
+
+            waiter = threading.Thread(target=wait)
+            waiter.start()
+            waiter.join(5)
+
+        assert failed
+
+
+class _Registry(http.server.BaseHTTPRequestHandler):
+    """An npm registry serving one package whose bin reports what it was given:
+    its arguments, and the registry npm left in its environment."""
+
+    published: dict[str, bytes] = {}
+
+    def do_GET(self) -> None:  # noqa: N802 - the name http.server dispatches on
+        body = self.published.get(self.path.split("?", 1)[0])
+        if body is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header(
+            "Content-Type", "application/json" if not self.path.endswith(".tgz") else "application/octet-stream"
+        )
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args: object) -> None:
+        return None
+
+
+@pytest.fixture
+def npm_registry() -> Iterator[str]:
+    import base64
+    import io
+    import tarfile
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Registry)
+    origin = f"http://127.0.0.1:{server.server_address[1]}"
+    manifest = {"name": "raven-npx-probe", "version": "1.0.0", "bin": {"raven-npx-probe": "cli.js"}}
+    cli = (
+        "#!/usr/bin/env node\n"
+        "console.log(JSON.stringify({args: process.argv.slice(2), registry: process.env.npm_config_registry || null}))\n"
+    )
+    packed = io.BytesIO()
+    with tarfile.open(fileobj=packed, mode="w:gz") as tar:
+        for name, text in (("package/package.json", json.dumps(manifest)), ("package/cli.js", cli)):
+            data = text.encode("utf-8")
+            entry = tarfile.TarInfo(name)
+            entry.size, entry.mode, entry.mtime = len(data), 0o755, int(time.time())
+            tar.addfile(entry, io.BytesIO(data))
+    tarball = packed.getvalue()
+    dist = {
+        "tarball": f"{origin}/raven-npx-probe/-/raven-npx-probe-1.0.0.tgz",
+        "integrity": "sha512-" + base64.b64encode(hashlib.sha512(tarball).digest()).decode("ascii"),
+        "shasum": hashlib.sha1(tarball).hexdigest(),
+    }
+    packument = {
+        "name": "raven-npx-probe",
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {"1.0.0": {**manifest, "dist": dist}},
+    }
+    _Registry.published = {
+        "/raven-npx-probe": json.dumps(packument).encode("utf-8"),
+        "/raven-npx-probe/-/raven-npx-probe-1.0.0.tgz": tarball,
+    }
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield origin
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("npm") is None or shutil.which("node") is None, reason="needs node and npm")
+def test_an_npx_launch_starts_from_the_mirror_with_nothing_of_it_left_behind(
+    npm_registry: str, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real npm, against a registry on 127.0.0.1 standing in for the mirror:
+    the bin starts, takes its arguments, and finds no registry in its
+    environment; the lockfile Raven's install wrote names the mirror."""
+    monkeypatch.setattr(mirrors, "NPM_REGISTRY", npm_registry)
+    monkeypatch.setattr(mirrors, "_reachable", lambda url: url != mirrors.NPM_DEFAULT_REGISTRY)
+    monkeypatch.delenv("RAVEN_NO_MIRROR", raising=False)
+    monkeypatch.setenv("RAVEN_HOME", str(tmp_path / "raven"))
+    home = tmp_path / "home"
+    home.mkdir()
+    proxies = {"http_proxy", "https_proxy", "all_proxy", "no_proxy", "npm_config_registry"}
+    env = {key: value for key, value in os.environ.items() if key.lower() not in proxies}
+    env |= {
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "APPDATA": str(home / "AppData" / "Roaming"),
+        "LOCALAPPDATA": str(home / "AppData" / "Local"),
+        "npm_config_cache": str(tmp_path / "npm-cache"),
+        "NO_PROXY": "127.0.0.1,localhost",
+    }
+    project = tmp_path / "project"
+    project.mkdir()
+
+    argv = mirrors.package_launch(["npx", "-y", "raven-npx-probe", "one", "two words"], env, str(project))
+
+    assert argv[0] != "npx", "the launch was left as configured"
+    started = subprocess.run(argv, env=env, cwd=project, capture_output=True, text=True, timeout=60, check=False)
+    assert started.returncode == 0, started.stderr
+    assert json.loads(started.stdout) == {"args": ["one", "two words"], "registry": None}
+    key = hashlib.sha256(b"raven-npx-probe").hexdigest()[:16]
+    lock = json.loads((tmp_path / "raven" / "cache" / "npx" / key / "package-lock.json").read_text(encoding="utf-8"))
+    assert lock["packages"]["node_modules/raven-npx-probe"]["resolved"].startswith(npm_registry)
 
 
 class TestAskingNpm:
