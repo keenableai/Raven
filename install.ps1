@@ -711,7 +711,7 @@ function Get-UvConfigFiles {
 # Whether a uv.toml uv reads -- the user's, or the machine's -- matches $Pattern.
 function Test-UvConfigHas([string]$Pattern) {
     foreach ($path in @(Get-UvConfigFiles)) {
-        if ((Test-Path $path) -and ((Get-Content -Raw $path) -match $Pattern)) { return $true }
+        if ((Test-Path -LiteralPath $path) -and ((Get-Content -LiteralPath $path -Raw -Encoding UTF8) -match $Pattern)) { return $true }
     }
     return $false
 }
@@ -722,11 +722,11 @@ function Test-UvConfigHas([string]$Pattern) {
 function Get-UvConfigIndex {
     $quoted = '\s*=\s*(?:"([^"]*)"|''([^'']*)'')'
     foreach ($path in @(Get-UvConfigFiles)) {
-        if (-not (Test-Path $path)) { continue }
+        if (-not (Test-Path -LiteralPath $path)) { continue }
         $table = $false
         $url = $null
         $isDefault = $false
-        foreach ($line in @(Get-Content $path)) {
+        foreach ($line in @(Get-Content -LiteralPath $path -Encoding UTF8)) {
             if ($line -match '^\s*\[') {
                 $table = $line -match '^\s*\[\[\s*index\s*\]\]'
                 $url = $null

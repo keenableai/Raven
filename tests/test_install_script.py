@@ -3046,7 +3046,7 @@ def test_both_installers_choose_the_package_hosts_before_the_first_install() -> 
 _PS1_PACKAGE_STEP = r"""
 $names = @(
     "Test-MirrorsAllowed", "Test-Reachable", "Get-TunnelStatus", "Set-MirrorEnv", "Restore-MirrorEnv",
-    "Get-UvConfigFiles", "Test-UvConfigHas", "Test-UvIndexChosen", "Use-PackageMirrors"
+    "Get-UvConfigFiles", "Test-UvConfigHas", "Get-UvConfigIndex", "Test-UvIndexChosen", "Use-PackageMirrors"
 )
 foreach ($text in (Get-Install $names)) { Invoke-Expression $text }
 function Write-Warn([string]$Message) { [Console]::Out.WriteLine("WARN $Message") }
@@ -3069,11 +3069,14 @@ def _run_ps1_package_step(
 ):
     dist = tmp_path / "dist"
     dist.mkdir(exist_ok=True)
-    # Each written as <root>\uv\uv.toml: "appdata" and "programdata" are the
-    # user's and the machine's, any other root a file UV_CONFIG_FILE can name.
+    # A bare root is uv's own location under tmp_path ("appdata" and
+    # "programdata" are the user's and the machine's, any other root a file
+    # UV_CONFIG_FILE can name). An absolute root is the file itself.
     for root, text in (uv_tomls or {}).items():
-        (tmp_path / root / "uv").mkdir(parents=True)
-        (tmp_path / root / "uv" / "uv.toml").write_text(text, encoding="utf-8")
+        given = Path(root)
+        target = given if given.is_absolute() else tmp_path / given / "uv" / "uv.toml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
     settings = _ps1_settings("ErrorActionPreference", "PypiIndex", "PypiMirror", "PythonDownloads", "PythonMirror")
     result = _run_ps1(
         tmp_path,
@@ -3140,6 +3143,41 @@ def test_a_windows_install_keeps_an_index_in_a_uv_toml(tmp_path: Path, root: str
 def test_a_windows_install_keeps_an_inline_default_index(tmp_path: Path, text: str) -> None:
     _result, said = _run_ps1_package_step(tmp_path, down=("https://pypi.org/",), uv_tomls={"appdata": text})
 
+    assert said["INDEX"] == ""
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+def test_a_windows_install_reads_a_uv_config_file_with_brackets(tmp_path: Path) -> None:
+    """Test-Path and Get-Content treat brackets as wildcards; uv does not."""
+    chosen = tmp_path / "selected [config] data"
+    named = {"UV_CONFIG_FILE": str(chosen / "uv.toml")}
+    _result, said = _run_ps1_package_step(
+        tmp_path,
+        down=("https://pypi.org/",),
+        env=named,
+        uv_tomls={str(chosen / "uv.toml"): 'index-url = "https://pypi.example.internal/simple"\n'},
+    )
+
+    assert said["INDEX"] == ""
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+def test_a_windows_install_decodes_a_uv_config_file_as_utf8(tmp_path: Path) -> None:
+    """Windows PowerShell 5.1 reads BOM-less files through the ANSI code page
+    unless told otherwise, which corrupts a non-ASCII index URL."""
+    chosen = tmp_path / "utf8"
+    chosen.mkdir()
+    url = "https://pypi.example.internal/caf\u00e9/simple"
+    (chosen / "uv.toml").write_bytes(f'index-url = "{url}"\n'.encode("utf-8"))
+    result, said = _run_ps1_package_step(
+        tmp_path,
+        down=("https://pypi.org/",),
+        env={"UV_CONFIG_FILE": str(chosen / "uv.toml")},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
     assert said["INDEX"] == ""
 
 
