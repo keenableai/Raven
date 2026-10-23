@@ -21,16 +21,15 @@ async def test_stdio_transport_yields_streams_without_initialize():
 
 
 def _reporting_server(observed) -> list[str]:
-    """Args for a server that writes the registry it was handed and the
-    arguments it got to ``observed``, then waits.
+    """Args for a server that writes the arguments it got to ``observed``,
+    then waits.
 
     Staged and renamed so the file existing means its content is whole.
     """
     partial = observed.with_name(observed.name + ".partial")
     code = (
         "import json, os, sys\n"
-        "seen = {'registry': os.environ.get('npm_config_registry', '<missing>'), 'args': sys.argv[1:]}\n"
-        f"open({str(partial)!r}, 'w').write(json.dumps(seen))\n"
+        f"open({str(partial)!r}, 'w').write(json.dumps({{'args': sys.argv[1:]}}))\n"
         f"os.replace({str(partial)!r}, {str(observed)!r})\n"
         "sys.stdin.read()\n"
     )
@@ -47,17 +46,17 @@ async def _reported(observed) -> dict:
 
 @pytest.mark.asyncio
 async def test_a_stdio_server_starts_the_way_the_mirror_fallback_says(tmp_path, monkeypatch):
-    """`npx -y <server>` and `uvx <server>` fetch the server on first start.
-    Asked with the command line and the environment the server would see, and
-    started with the answer; nothing is written to the server's configuration."""
+    """`uvx <server>` fetches the server on first start. Asked with the command
+    line and the environment the server would see, and started with the
+    answer; nothing is written to the server's configuration."""
     from raven.utils import mirrors
 
     observed = tmp_path / "observed.json"
     asked: list[tuple[list[str], dict[str, str]]] = []
 
-    def package_launch(argv, env, cwd=None):
+    def package_launch(argv, env):
         asked.append((list(argv), dict(env)))
-        return [*argv, "--as-the-answer-says"], {"npm_config_registry": mirrors.NPM_REGISTRY}
+        return [*argv, "--as-the-answer-says"]
 
     monkeypatch.setattr(mirrors, "package_launch", package_launch)
     args = _reporting_server(observed)
@@ -66,32 +65,10 @@ async def test_a_stdio_server_starts_the_way_the_mirror_fallback_says(tmp_path, 
     async with open_mcp_transport(cfg, "stdio"):
         arrived = await _reported(observed)
 
-    assert arrived == {"registry": mirrors.NPM_REGISTRY, "args": ["--as-the-answer-says"]}
+    assert arrived == {"args": ["--as-the-answer-says"]}
     (argv, env), *_ = asked
     assert argv == [sys.executable, *args] and env["FROM_CONFIG"] == "yes"
     assert cfg.args == args and cfg.env == {"FROM_CONFIG": "yes"}, "the configuration is left as it was"
-
-
-@pytest.mark.asyncio
-async def test_a_stdio_servers_own_registry_wins_over_the_mirror(tmp_path, monkeypatch):
-    from raven.utils import mirrors
-
-    observed = tmp_path / "observed.json"
-    monkeypatch.setattr(
-        mirrors,
-        "package_launch",
-        lambda argv, env, cwd=None: (list(argv), {"npm_config_registry": mirrors.NPM_REGISTRY}),
-    )
-    cfg = MCPServerConfig(
-        command=sys.executable,
-        args=_reporting_server(observed),
-        env={"npm_config_registry": "https://registry.example.internal/"},
-    )
-
-    async with open_mcp_transport(cfg, "stdio"):
-        arrived = await _reported(observed)
-
-    assert arrived["registry"] == "https://registry.example.internal/"
 
 
 class _SpawningExecutor:
@@ -109,15 +86,13 @@ class _SpawningExecutor:
 
 @pytest.mark.asyncio
 async def test_a_sandboxed_stdio_server_starts_the_same_way(monkeypatch):
+    """The index goes on the command line and nowhere else: a server with no
+    ``env`` of its own still gets none, which the SDK reads as its own
+    default environment -- the launch every server got before the mirror."""
     from raven.utils import mirrors
 
     monkeypatch.setattr(
-        mirrors,
-        "package_launch",
-        lambda argv, env, cwd=None: (
-            [argv[0], "--default-index", mirrors.PYPI_INDEX, *argv[1:]],
-            {"UV_PYTHON_INSTALL_MIRROR": mirrors.PYTHON_DOWNLOADS},
-        ),
+        mirrors, "package_launch", lambda argv, env: [argv[0], "--default-index", mirrors.PYPI_INDEX, *argv[1:]]
     )
     executor = _SpawningExecutor()
 
@@ -126,28 +101,7 @@ async def test_a_sandboxed_stdio_server_starts_the_same_way(monkeypatch):
     ):
         pass
 
-    assert executor.started == [
-        (
-            "uvx",
-            ["--default-index", mirrors.PYPI_INDEX, "mcp-server-fetch"],
-            {"UV_PYTHON_INSTALL_MIRROR": mirrors.PYTHON_DOWNLOADS},
-        )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_a_server_whose_registry_answers_starts_as_it_always_did(monkeypatch):
-    """No overlay means no env at all, which the SDK reads as its own default
-    environment -- the launch every server got before the mirror existed."""
-    from raven.utils import mirrors
-
-    monkeypatch.setattr(mirrors, "package_launch", lambda argv, env, cwd=None: (list(argv), {}))
-    executor = _SpawningExecutor()
-
-    async with open_mcp_transport(MCPServerConfig(command="npx", args=["-y", "pkg"]), "stdio", executor=executor):
-        pass
-
-    assert executor.started == [("npx", ["-y", "pkg"], None)]
+    assert executor.started == [("uvx", ["--default-index", mirrors.PYPI_INDEX, "mcp-server-fetch"], None)]
 
 
 @pytest.mark.asyncio

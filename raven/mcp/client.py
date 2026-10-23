@@ -196,20 +196,17 @@ async def open_mcp_transport(
         from mcp.client.streamable_http import streamable_http_client
 
         if transport_type == "stdio":
-            # `npx -y <server>` and `uvx <server>` fetch the server on first
-            # start. The mirror goes under the entry's own env, so a registry the
-            # entry names wins, and into this launch only: written into the
-            # entry, it would be the choice of registry PlugHub's vetting refuses
-            # a catalogue entry (see market/vetting.py).
-            argv, mirror_env = await mirrors.package_launch_async(
+            # `uvx <server>` fetches the server on first start. The index goes on
+            # this launch's command line only: written into the entry, it would
+            # be the choice of index PlugHub's vetting refuses a catalogue entry
+            # (see market/vetting.py).
+            command, *args = await mirrors.package_launch_async(
                 [cfg.command, *cfg.args], {**os.environ, **(cfg.env or {})}
             )
-            command, args = argv[0], argv[1:]
-            env = {**mirror_env, **(cfg.env or {})} or None
             if executor is not None and executor.supports_process_spawning:
-                read, write = await executor.start_process(command, args, env=env)
+                read, write = await executor.start_process(command, args, env=cfg.env or None)
             else:
-                params = StdioServerParameters(command=command, args=args, env=env)
+                params = StdioServerParameters(command=command, args=args, env=cfg.env or None)
                 read, write = await stack.enter_async_context(stdio_client(params))
         elif transport_type == "sse":
 

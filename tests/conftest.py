@@ -860,8 +860,8 @@ def _no_codex_version_network(monkeypatch):
 def _no_mirror_fallback(monkeypatch):
     """Keep the mirror fallback, and the probes it makes, off the network.
 
-    Every launch of an npx or uvx agent, MCP server or bridge build, and the
-    upgrade helper's uv, first asks whether the default registry answers, so an
+    Every launch of a uvx agent or MCP server, every bridge build, and the
+    upgrade helper's uv first ask whether the default registry answers, so an
     un-mocked test would reach registry.npmjs.org or pypi.org and wait on
     whatever the runner's network does. Opted out by env for the whole suite,
     which is the launch each test was written against; tests that exercise a

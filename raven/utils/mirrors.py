@@ -38,8 +38,10 @@ from loguru import logger
 OPT_OUT_ENV = "RAVEN_NO_MIRROR"
 _TRUTHY = {"1", "true", "yes", "on"}
 
-#: The default hosts the package runners fetch from, asked before anything is
-#: redirected. Any HTTP answer from one proves it can be reached.
+#: The default hosts asked before anything is redirected: npm's registry for
+#: raven's own npm installs, PyPI for uvx, and the Python builds the installers
+#: and the upgrade helper fetch through uv. Any HTTP answer from one proves it
+#: can be reached.
 NPM_DEFAULT_REGISTRY = "https://registry.npmjs.org/"
 PYPI_DEFAULT_INDEX = "https://pypi.org/simple/"
 PYTHON_DEFAULT_DOWNLOADS = "https://releases.astral.sh/"
@@ -181,7 +183,7 @@ def _host(url: str) -> str:
 
 
 def _program(word: str) -> str:
-    """``npx`` for ``npx``, ``/usr/bin/npx`` and ``C:\\...\\npx.cmd`` alike."""
+    """``uvx`` for ``uvx``, ``/usr/bin/uvx`` and ``C:\\...\\uvx.exe`` alike."""
     name = re.split(r"[\\/]", word)[-1].lower()
     stem, dot, suffix = name.rpartition(".")
     return stem if dot and suffix in {"cmd", "exe", "bat", "ps1"} else name
@@ -256,9 +258,10 @@ def npm_registry_env(env: Mapping[str, str], cwd: str | None = None) -> dict[str
     mirror; empty unless the registry npm would use is its default, which
     cannot be reached while the mirror can.
 
-    For an npm raven runs in a directory of its own, whose lockfile is raven's;
-    a launch goes through :func:`package_launch`. May block for a probe and for
-    npm itself, and never raises: a fault while deciding leaves npm as it is.
+    For an npm raven runs in a directory of its own, whose lockfile is raven's,
+    and which starts nothing that outlives it; :func:`package_launch` says why
+    an npx launch is not given one. May block for a probe and for npm itself,
+    and never raises: a fault while deciding leaves npm as it is.
     """
     if not enabled():
         return {}
@@ -324,24 +327,9 @@ def _uv_index_chosen(env: Mapping[str, str]) -> bool:
     return False
 
 
-def _uv_python_source_chosen(env: Mapping[str, str]) -> bool:
-    """Whether the user named where uv fetches a Python from, in any form uv
-    reads: a mirror it is given outranks a copy of releases.astral.sh, and
-    fails outright beside a list of downloads that live elsewhere."""
-    if _set(env, "UV_PYTHON_INSTALL_MIRROR", "UV_PYTHON_DOWNLOADS_JSON_URL", "UV_ASTRAL_MIRROR_URL"):
-        return True
-    return any(c.get("python-install-mirror") or c.get("python-downloads-json-url") for c in _uv_settings(env))
-
-
 def _names(args: Sequence[str], flags: Sequence[str]) -> bool:
     """Whether any of ``flags`` is among ``args``, as a word of its own or with ``=value``."""
     return any(arg in flags or arg.startswith(tuple(f"{flag}=" for flag in flags)) for arg in args)
-
-
-#: npm's own words for its registry and for the files it reads one from. A
-#: launch that carries one has chosen, and `npm config get registry`, asked
-#: without them, would answer for a different npm.
-_NPM_CONFIG_FLAGS = ("--registry", "--userconfig", "--globalconfig")
 
 
 def _uv_index_named(args: Sequence[str]) -> bool:
@@ -351,80 +339,55 @@ def _uv_index_named(args: Sequence[str]) -> bool:
     )
 
 
-def package_launch(
-    argv: Sequence[str], env: Mapping[str, str], cwd: str | None = None
-) -> tuple[list[str], dict[str, str]]:
-    """``argv`` and the variables to lay under the caller's own env, for a
-    launch that fetches from a mirror where its default registry cannot be
-    reached and the mirror can.
+def package_launch(argv: Sequence[str], env: Mapping[str, str]) -> list[str]:
+    """``argv``, with PyPI's mirror named on it where a ``uvx`` launch cannot
+    reach pypi.org and the mirror answers.
 
-    Only npx and uvx: each fetches a package into a cache of its own and starts
-    it, writing no project's files. ``uv run`` and ``npm install`` resolve the
-    project they run in and write its lockfile, where a mirror would land, and
-    pnpm and bun read registries from files of their own; those start as
-    configured. ``env`` is the environment the launch gets and ``cwd`` where it
-    runs, which is where the user's own choice of registry would be found. A
-    choice already made -- in the environment, a configuration file, or on the
-    command line -- stands, and ``RAVEN_NO_MIRROR`` leaves every launch alone.
-    May block for a probe; see :func:`package_launch_async`. Never raises: a
-    fault while deciding leaves the launch as it was configured.
+    Only uvx, and only on its command line: uv keeps a flag to itself, so the
+    choice ends with the fetch, while a variable would stay in the tool's
+    environment and outrank the index a project names for itself. npx gets
+    nothing, because npm hands its registry to everything it starts, however
+    the registry was given -- a variable, a flag, an npmrc (measured with npm
+    11.12) -- and there it would replace the registry a project names in its
+    own .npmrc. ``uv run`` and ``npm install`` resolve the project they run
+    in, and pnpm and bun read registries from files of their own; those start
+    as configured too. ``env`` is the environment the launch gets, where the
+    user's own choice of index would be found. A choice already made -- in the
+    environment, a configuration file, or on the command line -- stands, and
+    ``RAVEN_NO_MIRROR`` leaves every launch alone. May block for a probe; see
+    :func:`package_launch_async`. Never raises: a fault while deciding leaves
+    the launch as it was configured.
     """
     if not argv or not enabled():
-        return list(argv), {}
+        return list(argv)
     try:
-        return _package_launch(list(argv), env, cwd)
+        return _package_launch(list(argv), env)
     except Exception as exc:  # noqa: BLE001 - the mirror is a way around an outage, never a gate
         logger.opt(exception=exc).warning("could not decide on a mirror for {!r}; it starts as configured", argv[0])
-        return list(argv), {}
+        return list(argv)
 
 
-def _package_launch(argv: list[str], env: Mapping[str, str], cwd: str | None) -> tuple[list[str], dict[str, str]]:
-    program = _program(argv[0])
-    if program == "npx":
-        # A variable, though it reaches what npx starts: npm hands the registry
-        # down whichever way it is given, a flag included (measured with npm
-        # 11.12), so an agent's own npm commands use the mirror as well.
-        if _names(argv[1:], _NPM_CONFIG_FLAGS):
-            return argv, {}
-        return argv, _npm_registry_env(env, cwd)
-    if program != "uvx":
-        return argv, {}
-    # A uv.toml named on the command line may choose either host, and what is
-    # added here -- a flag, a variable -- would outrank both.
-    if _names(argv[1:], ("--config-file",)):
-        return argv, {}
-    mirror_of: dict[str, str] = {}
-    if not _uv_index_named(argv[1:]) and not _uv_index_chosen(env):
-        mirror_of[PYPI_DEFAULT_INDEX] = PYPI_INDEX
-    if not _uv_python_source_chosen(env):
-        mirror_of[PYTHON_DEFAULT_DOWNLOADS] = PYTHON_DOWNLOADS
-    moved = _moved(mirror_of) if mirror_of else set()
-    extra: dict[str, str] = {}
-    if PYPI_DEFAULT_INDEX in moved:
-        # On the command line rather than as UV_DEFAULT_INDEX: uv hands its
-        # environment down to the tool, and every `uv run` the tool then made in
-        # a project would write the mirror into that project's uv.lock.
-        argv[1:1] = ["--default-index", PYPI_INDEX]
-    if PYTHON_DEFAULT_DOWNLOADS in moved:
-        # uvx has no flag for this. It reaches the tool too, where it only
-        # changes where an interpreter comes from, each checked against a digest
-        # uv carries.
-        extra["UV_PYTHON_INSTALL_MIRROR"] = PYTHON_DOWNLOADS
-    for url in moved:
-        logger.info(
-            "{} could not be reached; uvx fetches from {} instead ({}=1 turns this off)",
-            _host(url),
-            _host(mirror_of[url]),
-            OPT_OUT_ENV,
-        )
-    return argv, extra
+def _package_launch(argv: list[str], env: Mapping[str, str]) -> list[str]:
+    if _program(argv[0]) != "uvx":
+        return argv
+    # A uv.toml named on the command line may choose the index, and the flag
+    # added here would outrank it.
+    if _names(argv[1:], ("--config-file",)) or _uv_index_named(argv[1:]) or _uv_index_chosen(env):
+        return argv
+    if not _moved({PYPI_DEFAULT_INDEX: PYPI_INDEX}):
+        return argv
+    logger.info(
+        "{} could not be reached; uvx fetches from {} instead ({}=1 turns this off)",
+        _host(PYPI_DEFAULT_INDEX),
+        _host(PYPI_INDEX),
+        OPT_OUT_ENV,
+    )
+    return [argv[0], "--default-index", PYPI_INDEX, *argv[1:]]
 
 
-async def package_launch_async(
-    argv: Sequence[str], env: Mapping[str, str], cwd: str | None = None
-) -> tuple[list[str], dict[str, str]]:
+async def package_launch_async(argv: Sequence[str], env: Mapping[str, str]) -> list[str]:
     """:func:`package_launch` off the event loop, since its probe blocks."""
-    return await asyncio.to_thread(package_launch, argv, env, cwd)
+    return await asyncio.to_thread(package_launch, argv, env)
 
 
 __all__ = [

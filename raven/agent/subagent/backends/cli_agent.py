@@ -545,20 +545,11 @@ class CliAgentBackend:
             # simply never arrives.
             # ``subagent_role_env`` before ``self.env``, so a config ``env`` entry
             # is the way to hand one agent back its full registry. A third-party
-            # CLI reads none of these; a ``raven`` one does. An agent started
-            # through npx or uvx fetches itself first, and a registry mirror goes
-            # under the entry's own ``env`` for the same reason.
-            argv, mirror_env = await mirrors.package_launch_async(
-                argv, {**env_base, **(runtime_env or {}), **self.env}, cwd
-            )
-            env = {
-                **env_base,
-                **host_identity_env(),
-                **subagent_role_env(),
-                **mirror_env,
-                **(runtime_env or {}),
-                **self.env,
-            }
+            # CLI reads none of these; a ``raven`` one does.
+            env = {**env_base, **host_identity_env(), **subagent_role_env(), **(runtime_env or {}), **self.env}
+            # An agent started through uvx fetches itself first, from the index
+            # this names on its command line when pypi.org cannot be reached.
+            argv = await mirrors.package_launch_async(argv, env)
             argv = resolve_program(argv, env)
             logger.info("Subagent [{}] CLI agent {!r}: {}", task_id, self.name, argv[:1])
             proc = await asyncio.create_subprocess_exec(

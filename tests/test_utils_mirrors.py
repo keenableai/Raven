@@ -148,10 +148,11 @@ class _Npm:
 
 
 class TestPackageRunners:
-    """npx and uvx fetch a package the first time it is asked for, from the
-    registry their configuration names. When that registry cannot be reached
-    and its mirror can, the launch is pointed at the mirror -- the launch only:
-    nothing is written to the user's configuration."""
+    """uvx fetches a package the first time it is asked for, from the index its
+    configuration names. When pypi.org cannot be reached and its mirror can, the
+    launch names the mirror on its own command line -- the launch only: nothing
+    is written to the user's configuration, and nothing stays in the
+    environment of the tool it starts."""
 
     @pytest.fixture(autouse=True)
     def _no_opt_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -186,35 +187,63 @@ class TestPackageRunners:
             "PROGRAMDATA": str(tmp_path / "ProgramData"),
         }
 
-    def test_npx_fetches_from_the_mirror_when_npm_cannot_be_reached(self, network, tmp_path) -> None:
+    def test_uvx_resolves_against_the_mirror_named_on_its_command_line(self, network, tmp_path) -> None:
+        """On the command line, not in the environment: uv keeps a flag to
+        itself, while a UV_DEFAULT_INDEX would stay in the tool's environment
+        and reach every `uv run` it makes in a project of the user's, which
+        writes the mirror into that project's uv.lock."""
+        network.down.add(mirrors.PYPI_DEFAULT_INDEX)
+
+        assert mirrors.package_launch(["uvx", "mcp-server-fetch"], self._home(tmp_path)) == [
+            "uvx",
+            "--default-index",
+            mirrors.PYPI_INDEX,
+            "mcp-server-fetch",
+        ]
+
+    def test_uvx_is_left_alone_when_pypi_answers(self, network, tmp_path) -> None:
+        assert mirrors.package_launch(["uvx", "mcp-server-fetch"], self._home(tmp_path)) == ["uvx", "mcp-server-fetch"]
+        assert network.asked == [mirrors.PYPI_DEFAULT_INDEX], "the mirror is not asked about"
+
+    def test_uvx_is_left_alone_when_the_mirror_cannot_be_reached_either(self, network, tmp_path) -> None:
+        """uvx keeps a cached tool for the index it was resolved against, and
+        re-resolves under any other (measured with uv 0.13): offline, the
+        mirror would turn a launch that works into one that cannot."""
+        network.down |= {mirrors.PYPI_DEFAULT_INDEX, mirrors.PYPI_INDEX}
+
+        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == ["uvx", "pkg"]
+
+    def test_uvx_is_given_no_python_mirror(self, network, tmp_path) -> None:
+        """uvx has no flag for one, and a UV_PYTHON_INSTALL_MIRROR would stay in
+        the tool's environment, where it outranks the Python mirror a project
+        names in its own uv.toml (measured with uv 0.13)."""
+        network.down.add(mirrors.PYTHON_DEFAULT_DOWNLOADS)
+
+        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == ["uvx", "pkg"]
+        assert mirrors.PYTHON_DEFAULT_DOWNLOADS not in network.asked
+
+    @pytest.mark.parametrize("program", [r"C:\Users\me\.local\bin\uvx.exe", "/usr/local/bin/uvx", "UVX.EXE"])
+    def test_uvx_is_recognised_wherever_it_lives(self, network, tmp_path, program: str) -> None:
+        network.down.add(mirrors.PYPI_DEFAULT_INDEX)
+
+        assert mirrors.package_launch([program, "pkg"], self._home(tmp_path)) == [
+            program,
+            "--default-index",
+            mirrors.PYPI_INDEX,
+            "pkg",
+        ]
+
+    @pytest.mark.parametrize("program", ["npx", r"C:\Program Files\nodejs\npx.cmd", "/usr/local/bin/npx"])
+    def test_npx_is_left_alone(self, network, npm, tmp_path, program: str) -> None:
+        """npm hands its registry to everything npx starts, however it was given
+        (measured with npm 11.12), and there it outranks the registry a project
+        names in its own .npmrc: an agent's `npm install` in such a project
+        would resolve that project's private packages from a public mirror."""
         network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
-        argv = ["npx", "-y", "@agentclientprotocol/codex-acp@1.13.1"]
+        argv = [program, "-y", "@agentclientprotocol/codex-acp@1.13.1"]
 
-        assert mirrors.package_launch(argv, self._home(tmp_path)) == (
-            argv,
-            {"npm_config_registry": mirrors.NPM_REGISTRY},
-        )
-
-    def test_npx_is_left_alone_when_npm_answers(self, network, npm, tmp_path) -> None:
-        assert mirrors.package_launch(["npx", "-y", "pkg"], self._home(tmp_path)) == (["npx", "-y", "pkg"], {})
-        assert network.asked == [mirrors.NPM_DEFAULT_REGISTRY], "the mirror is not asked about"
-        assert npm.asked_in == [], "nor is npm, on a network that works"
-
-    def test_npx_is_left_alone_when_the_mirror_cannot_be_reached_either(self, network, tmp_path) -> None:
-        """Offline, npx still starts a package it fetched before, out of a
-        cache kept by the registry's address. Pointed at a mirror it cannot
-        reach either, the same launch fails (measured with npm 11.12)."""
-        network.down |= {mirrors.NPM_DEFAULT_REGISTRY, mirrors.NPM_REGISTRY}
-
-        assert mirrors.package_launch(["npx", "-y", "pkg"], self._home(tmp_path)) == (["npx", "-y", "pkg"], {})
-
-    @pytest.mark.parametrize("program", [r"C:\Program Files\nodejs\npx.cmd", "/usr/local/bin/npx", "NPX.EXE"])
-    def test_npx_is_recognised_wherever_it_lives(self, network, tmp_path, program: str) -> None:
-        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
-
-        assert mirrors.package_launch([program, "pkg"], self._home(tmp_path))[1] == {
-            "npm_config_registry": mirrors.NPM_REGISTRY
-        }
+        assert mirrors.package_launch(argv, self._home(tmp_path)) == argv
+        assert network.asked == [] and npm.asked_in == [], "nothing is asked for a launch left alone"
 
     @pytest.mark.parametrize(
         "argv",
@@ -234,130 +263,16 @@ class TestPackageRunners:
         with a mirror index rewrites every package's address in uv.lock. pnpm
         and bun read registries from files of their own, which this module
         cannot ask them about."""
-        network.down |= {mirrors.NPM_DEFAULT_REGISTRY, mirrors.PYPI_DEFAULT_INDEX, mirrors.PYTHON_DEFAULT_DOWNLOADS}
+        network.down |= {mirrors.NPM_DEFAULT_REGISTRY, mirrors.PYPI_DEFAULT_INDEX}
 
-        assert mirrors.package_launch(argv, self._home(tmp_path)) == (argv, {})
+        assert mirrors.package_launch(argv, self._home(tmp_path)) == argv
         assert network.asked == []
 
     def test_a_program_that_fetches_no_packages_is_never_probed(self, network, tmp_path) -> None:
         """Most agents are a CLI of their own, and asking a registry before
         starting one would only delay it."""
-        assert mirrors.package_launch(["codex", "exec", "--json"], self._home(tmp_path)) == (
-            ["codex", "exec", "--json"],
-            {},
-        )
+        assert mirrors.package_launch(["codex", "exec", "--json"], self._home(tmp_path)) == ["codex", "exec", "--json"]
         assert network.asked == []
-
-    @pytest.mark.parametrize("name", ["npm_config_registry", "NPM_CONFIG_REGISTRY"])
-    def test_a_registry_already_in_the_environment_wins(self, network, tmp_path, name: str) -> None:
-        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
-        env = {**self._home(tmp_path), name: "https://registry.example.internal"}
-
-        assert mirrors.package_launch(["npx", "pkg"], env)[1] == {}
-        assert network.asked == [], "a choice already made is not second-guessed"
-
-    def test_a_registry_in_the_users_npmrc_wins(self, network, tmp_path) -> None:
-        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
-        (tmp_path / ".npmrc").write_text("fund=false\nregistry=https://registry.example.internal/\n", encoding="utf-8")
-
-        assert mirrors.package_launch(["npx", "pkg"], self._home(tmp_path))[1] == {}
-
-    def test_a_scoped_registry_is_not_a_choice_of_default(self, network, tmp_path) -> None:
-        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
-        (tmp_path / ".npmrc").write_text("@corp:registry=https://registry.example.internal/\n", encoding="utf-8")
-
-        assert mirrors.package_launch(["npx", "pkg"], self._home(tmp_path))[1] == {
-            "npm_config_registry": mirrors.NPM_REGISTRY
-        }
-
-    def test_a_registry_npm_reads_from_anywhere_else_wins(self, network, npm, tmp_path) -> None:
-        """A project's .npmrc and npm's global one name registries too, and the
-        variable this module would set outranks both (measured with npm 11.12),
-        so npm itself is asked what it would use, from where the launch runs."""
-        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
-        npm.registry = "https://registry.example.internal/"
-        project = str(tmp_path / "project")
-
-        assert mirrors.package_launch(["npx", "pkg"], self._home(tmp_path), project)[1] == {}
-        assert npm.asked_in == [project]
-
-    @pytest.mark.parametrize(
-        "args",
-        [
-            ["--registry", "https://registry.example.internal/", "-y", "pkg"],
-            ["--registry=https://registry.example.internal/", "-y", "pkg"],
-            ["--userconfig", "/srv/team.npmrc", "-y", "pkg"],
-            ["--globalconfig=/srv/global.npmrc", "-y", "pkg"],
-        ],
-        ids=["registry", "registry=", "userconfig", "globalconfig="],
-    )
-    def test_npm_configuration_on_the_command_line_wins(self, network, npm, tmp_path, args: list[str]) -> None:
-        """npm reads its own command line before anything else. A registry there
-        is the user's choice already, and a configuration file named there is
-        one `npm config get registry`, asked without it, would not read -- while
-        the variable set instead would outrank whatever registry that file names."""
-        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
-
-        assert mirrors.package_launch(["npx", *args], self._home(tmp_path)) == (["npx", *args], {})
-        assert network.asked == [] and npm.asked_in == [], "a choice already made is not second-guessed"
-
-    def test_an_npm_that_cannot_say_leaves_the_launch_alone(self, network, npm, tmp_path) -> None:
-        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
-        npm.registry = None
-
-        assert mirrors.package_launch(["npx", "pkg"], self._home(tmp_path))[1] == {}
-
-    def test_ravens_own_npm_install_is_pointed_at_the_mirror_by_the_same_rules(self, network, npm, tmp_path) -> None:
-        """A bridge raven builds in a directory of its own, so the lockfile
-        npm writes there is raven's."""
-        staging = str(tmp_path / "staging")
-        assert mirrors.npm_registry_env(self._home(tmp_path), staging) == {}
-
-        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
-        assert mirrors.npm_registry_env(self._home(tmp_path), staging) == {"npm_config_registry": mirrors.NPM_REGISTRY}
-        assert npm.asked_in == [staging]
-
-    def test_uvx_resolves_against_the_mirror_named_on_its_command_line(self, network, tmp_path) -> None:
-        """On the command line, not in the environment: uv hands its
-        environment down to the tool it starts, and a UV_DEFAULT_INDEX there
-        would reach every `uv run` the tool makes in a project of the user's,
-        which writes the mirror into that project's uv.lock."""
-        network.down.add(mirrors.PYPI_DEFAULT_INDEX)
-
-        assert mirrors.package_launch(["uvx", "mcp-server-fetch"], self._home(tmp_path)) == (
-            ["uvx", "--default-index", mirrors.PYPI_INDEX, "mcp-server-fetch"],
-            {},
-        )
-
-    def test_uvx_downloads_a_python_from_the_mirror(self, network, tmp_path) -> None:
-        """uvx has no flag for this one; the variable only changes where an
-        interpreter comes from, and uv checks each against a digest it ships."""
-        network.down.add(mirrors.PYTHON_DEFAULT_DOWNLOADS)
-
-        assert mirrors.package_launch(["uvx", "mcp-server-fetch"], self._home(tmp_path)) == (
-            ["uvx", "mcp-server-fetch"],
-            {"UV_PYTHON_INSTALL_MIRROR": mirrors.PYTHON_DOWNLOADS},
-        )
-
-    def test_uvx_is_left_alone_when_pypi_answers(self, network, tmp_path) -> None:
-        assert mirrors.package_launch(["uvx", "mcp-server-fetch"], self._home(tmp_path)) == (
-            ["uvx", "mcp-server-fetch"],
-            {},
-        )
-        assert set(network.asked) == {mirrors.PYPI_DEFAULT_INDEX, mirrors.PYTHON_DEFAULT_DOWNLOADS}
-
-    def test_uvx_is_left_alone_when_the_mirrors_cannot_be_reached_either(self, network, tmp_path) -> None:
-        """uvx keeps a cached tool for the index it was resolved against, and
-        re-resolves under any other (measured with uv 0.13): offline, the
-        mirror would turn a launch that works into one that cannot."""
-        network.down |= {
-            mirrors.PYPI_DEFAULT_INDEX,
-            mirrors.PYPI_INDEX,
-            mirrors.PYTHON_DEFAULT_DOWNLOADS,
-            mirrors.PYTHON_DOWNLOADS,
-        }
-
-        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == (["uvx", "pkg"], {})
 
     @pytest.mark.parametrize(
         "args",
@@ -372,7 +287,7 @@ class TestPackageRunners:
         """A second --default-index would also be one uv refuses to start with."""
         network.down.add(mirrors.PYPI_DEFAULT_INDEX)
 
-        assert mirrors.package_launch(["uvx", *args], self._home(tmp_path))[0] == ["uvx", *args]
+        assert mirrors.package_launch(["uvx", *args], self._home(tmp_path)) == ["uvx", *args]
 
     @pytest.mark.parametrize(
         "args",
@@ -380,11 +295,10 @@ class TestPackageRunners:
         ids=["config-file", "config-file="],
     )
     def test_a_uv_toml_named_on_the_command_line_wins(self, network, tmp_path, args: list[str]) -> None:
-        """That file may name an index or a Python mirror, and what this module
-        would add -- a flag, a variable -- outranks both."""
-        network.down |= {mirrors.PYPI_DEFAULT_INDEX, mirrors.PYTHON_DEFAULT_DOWNLOADS}
+        """That file may name an index, and the flag added here would outrank it."""
+        network.down.add(mirrors.PYPI_DEFAULT_INDEX)
 
-        assert mirrors.package_launch(["uvx", *args], self._home(tmp_path)) == (["uvx", *args], {})
+        assert mirrors.package_launch(["uvx", *args], self._home(tmp_path)) == ["uvx", *args]
         assert network.asked == []
 
     @pytest.mark.parametrize("name", ["UV_DEFAULT_INDEX", "UV_INDEX_URL", "UV_INDEX"])
@@ -392,7 +306,7 @@ class TestPackageRunners:
         network.down.add(mirrors.PYPI_DEFAULT_INDEX)
         env = {**self._home(tmp_path), name: "https://pypi.example.internal/simple"}
 
-        assert mirrors.package_launch(["uvx", "pkg"], env)[0] == ["uvx", "pkg"]
+        assert mirrors.package_launch(["uvx", "pkg"], env) == ["uvx", "pkg"]
 
     @staticmethod
     def _uv_toml(tmp_path, text: str, *, system: bool = False) -> None:
@@ -411,14 +325,15 @@ class TestPackageRunners:
         [
             'index-url = "https://pypi.example.internal/simple"\n',
             '[[index]]\nurl = "https://pypi.example.internal/simple"\ndefault = true\n',
+            'index = [{ url = "https://pypi.example.internal/simple", default = true }]\n',
         ],
-        ids=["index-url", "default-index"],
+        ids=["index-url", "default-index", "inline-default-index"],
     )
     def test_an_index_in_uv_toml_wins(self, network, tmp_path, text: str, system: bool) -> None:
         network.down.add(mirrors.PYPI_DEFAULT_INDEX)
         self._uv_toml(tmp_path, text, system=system)
 
-        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path))[0] == ["uvx", "pkg"]
+        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == ["uvx", "pkg"]
 
     @pytest.mark.parametrize("default_in", ["machines", "users"])
     def test_each_uv_toml_is_read_on_its_own(self, network, tmp_path, default_in: str) -> None:
@@ -429,7 +344,7 @@ class TestPackageRunners:
         self._uv_toml(tmp_path, default if default_in == "users" else extra)
         self._uv_toml(tmp_path, default if default_in == "machines" else extra, system=True)
 
-        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path))[0] == ["uvx", "pkg"]
+        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == ["uvx", "pkg"]
 
     def test_a_uv_toml_named_by_the_environment_is_the_only_one_read(self, network, tmp_path) -> None:
         """uv reads that file and no other, the user's and the machine's
@@ -439,12 +354,12 @@ class TestPackageRunners:
         named.write_text('index-url = "https://pypi.example.internal/simple"\n', encoding="utf-8")
         env = {**self._home(tmp_path), "UV_CONFIG_FILE": str(named)}
 
-        assert mirrors.package_launch(["uvx", "pkg"], env)[0] == ["uvx", "pkg"], "the named file chose"
+        assert mirrors.package_launch(["uvx", "pkg"], env) == ["uvx", "pkg"], "the named file chose"
 
         named.write_text('python-preference = "managed"\n', encoding="utf-8")
         self._uv_toml(tmp_path, 'index-url = "https://pypi.example.internal/simple"\n')
 
-        assert mirrors.package_launch(["uvx", "pkg"], env)[0] == [
+        assert mirrors.package_launch(["uvx", "pkg"], env) == [
             "uvx",
             "--default-index",
             mirrors.PYPI_INDEX,
@@ -455,45 +370,79 @@ class TestPackageRunners:
         network.down.add(mirrors.PYPI_DEFAULT_INDEX)
         self._uv_toml(tmp_path, '[[index]]\nurl = "https://pypi.example.internal/simple"\n')
 
-        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path))[0] == [
+        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == [
             "uvx",
             "--default-index",
             mirrors.PYPI_INDEX,
             "pkg",
         ]
 
-    @pytest.mark.parametrize(
-        ("variable", "uv_toml"),
-        [
-            ("UV_PYTHON_INSTALL_MIRROR", None),
-            ("UV_PYTHON_DOWNLOADS_JSON_URL", None),
-            ("UV_ASTRAL_MIRROR_URL", None),
-            (None, 'python-install-mirror = "https://python.example.internal"\n'),
-            (None, 'python-downloads-json-url = "https://python.example.internal/downloads.json"\n'),
-        ],
-        ids=["mirror", "downloads-list", "astral-copy", "uv-toml-mirror", "uv-toml-downloads-list"],
-    )
-    def test_a_python_source_the_user_chose_wins(
-        self, network, tmp_path, variable: str | None, uv_toml: str | None
-    ) -> None:
-        """uv puts a mirror it is given before a copy of releases.astral.sh, and
-        fails outright beside a list of downloads that live elsewhere."""
-        network.down.add(mirrors.PYTHON_DEFAULT_DOWNLOADS)
-        env = self._home(tmp_path)
-        if variable is not None:
-            env = {**env, variable: "https://python.example.internal"}
-        if uv_toml is not None:
-            self._uv_toml(tmp_path, uv_toml)
+    def test_ravens_own_npm_install_is_pointed_at_the_mirror(self, network, npm, tmp_path) -> None:
+        """A bridge raven builds in a directory of its own, so the lockfile npm
+        writes there is raven's, and the npm it runs starts nothing that stays."""
+        staging = str(tmp_path / "staging")
+        assert mirrors.npm_registry_env(self._home(tmp_path), staging) == {}
 
-        assert mirrors.package_launch(["uvx", "pkg"], env)[1] == {}
-        assert mirrors.PYTHON_DEFAULT_DOWNLOADS not in network.asked, "a choice already made is not second-guessed"
+        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
+        assert mirrors.npm_registry_env(self._home(tmp_path), staging) == {"npm_config_registry": mirrors.NPM_REGISTRY}
+        assert npm.asked_in == [staging]
+
+    def test_ravens_own_npm_install_is_left_alone_when_npm_answers(self, network, npm, tmp_path) -> None:
+        assert mirrors.npm_registry_env(self._home(tmp_path), str(tmp_path)) == {}
+        assert network.asked == [mirrors.NPM_DEFAULT_REGISTRY], "the mirror is not asked about"
+        assert npm.asked_in == [], "nor is npm, on a network that works"
+
+    def test_ravens_own_npm_install_is_left_alone_when_the_mirror_cannot_be_reached_either(
+        self, network, tmp_path
+    ) -> None:
+        network.down |= {mirrors.NPM_DEFAULT_REGISTRY, mirrors.NPM_REGISTRY}
+
+        assert mirrors.npm_registry_env(self._home(tmp_path), str(tmp_path)) == {}
+
+    @pytest.mark.parametrize("name", ["npm_config_registry", "NPM_CONFIG_REGISTRY"])
+    def test_a_registry_already_in_the_environment_wins(self, network, tmp_path, name: str) -> None:
+        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
+        env = {**self._home(tmp_path), name: "https://registry.example.internal"}
+
+        assert mirrors.npm_registry_env(env, str(tmp_path)) == {}
+        assert network.asked == [], "a choice already made is not second-guessed"
+
+    def test_a_registry_in_the_users_npmrc_wins(self, network, tmp_path) -> None:
+        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
+        (tmp_path / ".npmrc").write_text("fund=false\nregistry=https://registry.example.internal/\n", encoding="utf-8")
+
+        assert mirrors.npm_registry_env(self._home(tmp_path), str(tmp_path)) == {}
+
+    def test_a_scoped_registry_is_not_a_choice_of_default(self, network, tmp_path) -> None:
+        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
+        (tmp_path / ".npmrc").write_text("@corp:registry=https://registry.example.internal/\n", encoding="utf-8")
+
+        assert mirrors.npm_registry_env(self._home(tmp_path), str(tmp_path)) == {
+            "npm_config_registry": mirrors.NPM_REGISTRY
+        }
+
+    def test_a_registry_npm_reads_from_anywhere_else_wins(self, network, npm, tmp_path) -> None:
+        """A project's .npmrc and npm's global one name registries too, and the
+        variable this module would set outranks both (measured with npm 11.12),
+        so npm itself is asked what it would use, from where it runs."""
+        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
+        npm.registry = "https://registry.example.internal/"
+        project = str(tmp_path / "project")
+
+        assert mirrors.npm_registry_env(self._home(tmp_path), project) == {}
+        assert npm.asked_in == [project]
+
+    def test_an_npm_that_cannot_say_is_left_alone(self, network, npm, tmp_path) -> None:
+        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
+        npm.registry = None
+
+        assert mirrors.npm_registry_env(self._home(tmp_path), str(tmp_path)) == {}
 
     def test_the_opt_out_leaves_every_runner_alone(self, network, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
         network.down |= {mirrors.NPM_DEFAULT_REGISTRY, mirrors.PYPI_DEFAULT_INDEX}
         monkeypatch.setenv("RAVEN_NO_MIRROR", "1")
 
-        assert mirrors.package_launch(["npx", "pkg"], self._home(tmp_path)) == (["npx", "pkg"], {})
-        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == (["uvx", "pkg"], {})
+        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == ["uvx", "pkg"]
         assert mirrors.npm_registry_env(self._home(tmp_path)) == {}
         assert network.asked == []
 
@@ -508,17 +457,18 @@ class TestPackageRunners:
 
         monkeypatch.setattr(mirrors, "_moved", broken)
 
-        assert mirrors.package_launch(["npx", "-y", "pkg"], self._home(tmp_path)) == (["npx", "-y", "pkg"], {})
-        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == (["uvx", "pkg"], {})
+        assert mirrors.package_launch(["uvx", "pkg"], self._home(tmp_path)) == ["uvx", "pkg"]
         assert mirrors.npm_registry_env(self._home(tmp_path)) == {}
 
     async def test_the_async_form_answers_the_same(self, network, tmp_path) -> None:
-        network.down.add(mirrors.NPM_DEFAULT_REGISTRY)
+        network.down.add(mirrors.PYPI_DEFAULT_INDEX)
 
-        assert await mirrors.package_launch_async(["npx", "pkg"], self._home(tmp_path)) == (
-            ["npx", "pkg"],
-            {"npm_config_registry": mirrors.NPM_REGISTRY},
-        )
+        assert await mirrors.package_launch_async(["uvx", "pkg"], self._home(tmp_path)) == [
+            "uvx",
+            "--default-index",
+            mirrors.PYPI_INDEX,
+            "pkg",
+        ]
 
 
 class TestAskingNpm:

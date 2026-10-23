@@ -1246,17 +1246,10 @@ class Daemon:
         self._starting.add(task_id)
         try:
             argv = _argv(params)
-            base, entry = await self.env(), _env(params)
-            # Asked here rather than by the host: whether a registry answers
-            # from this machine is not something the host's network can tell.
-            # Where the agent will run is read loosely, since a missing one is
-            # refused below; the mirror code asks about the nearest directory
-            # that exists until the launch makes it.
-            where = params.get("cwd")
-            argv, mirror_env = await mirrors.package_launch_async(
-                argv, {**base, **entry}, str(Path(where).expanduser()) if isinstance(where, str) and where else None
-            )
-            env = {**base, **mirror_env, **entry}
+            env = {**await self.env(), **_env(params)}
+            # Asked here rather than by the host: whether an index answers from
+            # this machine is not something the host's network can tell.
+            argv = await mirrors.package_launch_async(argv, env)
             found = shutil.which(argv[0], path=env.get("PATH"))
             if found is None:
                 raise _RefusedError(protocol.NOT_FOUND, f"{argv[0]!r} is not on this machine's PATH")

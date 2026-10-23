@@ -113,14 +113,13 @@ async def _reported(observed: Path) -> str:
 
 
 def _launch_reporting_child(script: Path) -> str:
-    """A child that reports the registry it was handed and the arguments it got,
-    staged and renamed like :func:`_reporting_child`'s report."""
+    """A child that reports the arguments it got, staged and renamed like
+    :func:`_reporting_child`'s report."""
     script.write_text(
         "import json, os, pathlib, sys, time\n"
         "target = pathlib.Path(os.environ['OUTPUT'])\n"
         "partial = target.with_name(target.name + '.partial')\n"
-        "seen = {'registry': os.environ.get('npm_config_registry', '<missing>'), 'args': sys.argv[1:]}\n"
-        "partial.write_text(json.dumps(seen))\n"
+        "partial.write_text(json.dumps({'args': sys.argv[1:]}))\n"
         "os.replace(partial, target)\n"
         "time.sleep(60)\n",
         encoding="utf-8",
@@ -131,59 +130,32 @@ def _launch_reporting_child(script: Path) -> str:
 async def test_an_acp_child_starts_the_way_the_mirror_fallback_says(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``npx -y <shim>`` fetches the shim the first time it runs. The launch asks
-    with the argv it is about to start, the environment the child would
-    otherwise get and the directory it runs in, and starts the child with the
-    answer: its argv, and its variables."""
+    """``uvx <agent>`` fetches the agent the first time it runs. The launch asks
+    with the argv it is about to start and the environment the child would get,
+    and starts the argv it is answered with."""
     from raven.utils import mirrors
 
     observed = tmp_path / "observed.json"
     command = _launch_reporting_child(tmp_path / "child.py")
     monkeypatch.setattr(backend_env, "login_shell_env", lambda: {"PATH": os.environ["PATH"], "OUTPUT": str(observed)})
-    asked: list[tuple[list[str], dict[str, str], str | None]] = []
+    asked: list[tuple[list[str], dict[str, str]]] = []
 
-    def package_launch(argv: list[str], env: dict[str, str], cwd: str | None = None):
-        asked.append((list(argv), dict(env), cwd))
-        return [*argv, "--as-the-answer-says"], {"npm_config_registry": mirrors.NPM_REGISTRY}
+    def package_launch(argv: list[str], env: dict[str, str]) -> list[str]:
+        asked.append((list(argv), dict(env)))
+        return [*argv, "--as-the-answer-says"]
 
     monkeypatch.setattr(mirrors, "package_launch", package_launch)
 
-    client = await AcpClient.launch(name="mirror-probe", command=command, cwd=str(tmp_path))
+    client = await AcpClient.launch(name="mirror-probe", command=command, cwd=str(tmp_path), env={"FROM_ENTRY": "1"})
     try:
         arrived = json.loads(await _reported(observed))
     finally:
         await client.close()
 
-    assert arrived == {"registry": mirrors.NPM_REGISTRY, "args": ["--as-the-answer-says"]}
-    (argv, env, cwd), *_ = asked
+    assert arrived == {"args": ["--as-the-answer-says"]}
+    (argv, env), *_ = asked
     assert argv[0] == sys.executable, "asked about the program the entry names"
-    assert env["OUTPUT"] == str(observed), "asked with the login environment the child starts from"
-    assert cwd == str(tmp_path), "asked where the child runs, where a project's .npmrc would be"
-
-
-async def test_an_acp_entrys_own_registry_wins_over_the_mirror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A config ``env`` entry is how one agent is told where to fetch from; the
-    mirror goes in under it, never over it."""
-    from raven.utils import mirrors
-
-    observed = tmp_path / "observed.json"
-    command = _launch_reporting_child(tmp_path / "child.py")
-    monkeypatch.setattr(backend_env, "login_shell_env", lambda: {"PATH": os.environ["PATH"], "OUTPUT": str(observed)})
-    monkeypatch.setattr(
-        mirrors,
-        "package_launch",
-        lambda argv, env, cwd=None: (list(argv), {"npm_config_registry": mirrors.NPM_REGISTRY}),
-    )
-
-    client = await AcpClient.launch(
-        name="mirror-probe", command=command, env={"npm_config_registry": "https://registry.example.internal/"}
-    )
-    try:
-        arrived = json.loads(await _reported(observed))
-    finally:
-        await client.close()
-
-    assert arrived["registry"] == "https://registry.example.internal/"
+    assert (env["OUTPUT"], env["FROM_ENTRY"]) == (str(observed), "1"), "asked with the environment the child gets"
 
 
 @pytest.mark.parametrize("legacy", [True, False])
