@@ -222,27 +222,44 @@ function Test-UvUnreachable([bool]$Fetched) {
 # uv publishes the binary its installer fetches to PyPI too, as a wheel, and a
 # wheel is a zip. When uv's own installer could not reach its hosts
 # (Test-UvUnreachable), uv.exe and uvx.exe are unpacked from the newest Windows
-# wheel on the PyPI mirror, or on the index UV_DEFAULT_INDEX names when the user
-# named one, and checked against the sha256 the index publishes beside the link.
-# Returns the uv now found, if any.
+# wheel on the indexes the user named for uv, asked in uv's order
+# (Get-UvNamedIndexes), or on the PyPI mirror when they named none, and checked
+# against the sha256 the index publishes beside the link. An index named in a
+# uv.toml this cannot read keeps the mirror away all the same. Returns the uv
+# now found, if any.
 function Install-UvFromMirror {
     $tag = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "win_arm64" } else { "win_amd64" }
-    $index = if ($env:UV_DEFAULT_INDEX) { $env:UV_DEFAULT_INDEX } elseif ($env:UV_INDEX_URL) { $env:UV_INDEX_URL } else { $PypiMirror }
-    $page = $index.TrimEnd("/") + "/uv/"
-    Write-Warn "uv's installer could not reach its hosts; fetching uv from $page instead (RAVEN_NO_MIRROR=1 turns this off)."
+    $indexes = @(Get-UvNamedIndexes)
+    if ($indexes.Count -eq 0) {
+        if (Test-UvIndexChosen) {
+            Write-Warn "uv's installer could not reach its hosts, and the index a uv.toml names could not be read here, so uv does not come from the mirror; set UV_DEFAULT_INDEX to that index to fetch uv from it."
+            return $null
+        }
+        $indexes = @($PypiMirror)
+    }
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("raven-uv-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $tmp -Force | Out-Null
     try {
-        $html = (Invoke-WebRequest $page -UseBasicParsing).Content
         # The newest release, compared field by field: an index lists files in
         # name order, where 0.9.9 sorts after 0.13.4.
         $best = $null
         $link = 'href="([^"#]*?uv-(\d+)\.(\d+)\.(\d+)-py3-none-' + $tag + '\.whl)(?:#sha256=([0-9a-f]{64}))?"'
-        foreach ($match in [regex]::Matches($html, $link)) {
-            $version = [version]("{0}.{1}.{2}" -f $match.Groups[2].Value, $match.Groups[3].Value, $match.Groups[4].Value)
-            if (-not $best -or $version -gt $best.Version) {
-                $best = @{ Version = $version; Href = $match.Groups[1].Value; Sha = $match.Groups[5].Value }
+        foreach ($index in $indexes) {
+            $page = $index.TrimEnd("/") + "/uv/"
+            Write-Warn "uv's installer could not reach its hosts; fetching uv from $page instead (RAVEN_NO_MIRROR=1 turns this off)."
+            try {
+                $html = (Invoke-WebRequest $page -UseBasicParsing).Content
+            } catch {
+                Write-Warn "Could not read $page ($_)."
+                continue
             }
+            foreach ($match in [regex]::Matches($html, $link)) {
+                $version = [version]("{0}.{1}.{2}" -f $match.Groups[2].Value, $match.Groups[3].Value, $match.Groups[4].Value)
+                if (-not $best -or $version -gt $best.Version) {
+                    $best = @{ Version = $version; Href = $match.Groups[1].Value; Sha = $match.Groups[5].Value }
+                }
+            }
+            if ($best) { break }
         }
         if (-not $best) { throw "no uv wheel for $tag is listed" }
         $wheel = Join-Path $tmp "uv.zip"
@@ -654,23 +671,73 @@ function Use-NpmMirror($Registry) {
     Set-MirrorEnv "npm_config_registry" $NpmMirror
 }
 
+# The uv.toml files uv reads: the one UV_CONFIG_FILE names, or the user's,
+# then the machine's.
+function Get-UvConfigFiles {
+    if ($env:UV_CONFIG_FILE) { return @($env:UV_CONFIG_FILE) }
+    return @($env:APPDATA, $env:PROGRAMDATA) | Where-Object { $_ } | ForEach-Object { Join-Path $_ "uv\uv.toml" }
+}
+
 # Whether a uv.toml uv reads -- the user's, or the machine's -- matches $Pattern.
 function Test-UvConfigHas([string]$Pattern) {
-    $paths = @()
-    if ($env:UV_CONFIG_FILE) {
-        $paths = @($env:UV_CONFIG_FILE)
-    } else {
-        $paths = @($env:APPDATA, $env:PROGRAMDATA) | Where-Object { $_ } | ForEach-Object { Join-Path $_ "uv\uv.toml" }
-    }
-    foreach ($path in $paths) {
+    foreach ($path in @(Get-UvConfigFiles)) {
         if ((Test-Path $path) -and ((Get-Content -Raw $path) -match $Pattern)) { return $true }
     }
     return $false
 }
 
+# The address of the default index a uv.toml uv reads names: its index-url,
+# or the url of the index marked default = true, written as a table or inline.
+# The first file that names one decides, as it does for uv.
+function Get-UvConfigIndex {
+    $quoted = '\s*=\s*(?:"([^"]*)"|''([^'']*)'')'
+    foreach ($path in @(Get-UvConfigFiles)) {
+        if (-not (Test-Path $path)) { continue }
+        $table = $false
+        $url = $null
+        $isDefault = $false
+        foreach ($line in @(Get-Content $path)) {
+            if ($line -match '^\s*\[') {
+                $table = $line -match '^\s*\[\[\s*index\s*\]\]'
+                $url = $null
+                $isDefault = $false
+                continue
+            }
+            if ($line -match ('^\s*index-url' + $quoted)) { return $Matches[1] + $Matches[2] }
+            if (($line -match '[{,]\s*default\s*=\s*true') -and ($line -match ('[{,]\s*url' + $quoted))) {
+                return $Matches[1] + $Matches[2]
+            }
+            if ($table -and ($line -match ('^\s*url' + $quoted))) { $url = $Matches[1] + $Matches[2] }
+            if ($table -and ($line -match '^\s*default\s*=\s*true')) { $isDefault = $true }
+            if ($table -and $isDefault -and $url) { return $url }
+        }
+    }
+    return $null
+}
+
 function Test-UvIndexChosen {
     if ($env:UV_DEFAULT_INDEX -or $env:UV_INDEX_URL -or $env:UV_INDEX) { return $true }
-    return (Test-UvConfigHas '(?m)^\s*index-url\s*=') -or (Test-UvConfigHas '(?m)^\s*default\s*=\s*true')
+    # A default index is marked default = true, in an [[index]] table or inline.
+    return (Test-UvConfigHas '(?m)^\s*index-url\s*=') -or (Test-UvConfigHas '(?m)(^|[{,\s])default\s*=\s*true')
+}
+
+# The indexes the user named for uv, in the order uv asks them: each of
+# UV_INDEX's, then the default -- UV_DEFAULT_INDEX or UV_INDEX_URL, or else
+# the one a uv.toml names.
+function Get-UvNamedIndexes {
+    $named = @()
+    if ($env:UV_INDEX) {
+        $named += @($env:UV_INDEX -split '\s+' | Where-Object { $_ } | ForEach-Object { $_ -replace '^[A-Za-z0-9._-]*=', '' })
+    }
+    if ($env:UV_DEFAULT_INDEX) {
+        $named += $env:UV_DEFAULT_INDEX
+    } elseif ($env:UV_INDEX_URL) {
+        $named += $env:UV_INDEX_URL
+    } else {
+        $fromConfig = Get-UvConfigIndex
+        if ($fromConfig) { $named += $fromConfig }
+    }
+    return $named
 }
 
 # uv resolves Raven's dependencies from PyPI, and fetches a Python when the

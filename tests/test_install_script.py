@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -502,6 +503,15 @@ def _sh_functions(names: tuple[str, ...], settings: tuple[str, ...] = ()) -> str
         assert match is not None, name
         lines.append(match.group(0))
     return "\n".join(lines) + "\n"
+
+
+def _without_the_machines_etc(functions: str, tmp_path: Path) -> str:
+    """``functions`` with the last place uv reads a machine uv.toml from moved
+    under ``tmp_path``: a /etc/uv/uv.toml on the box running the suite would
+    otherwise decide these cases."""
+    read_last = "${XDG_CONFIG_DIRS:-/etc/xdg} /etc"
+    assert functions.count(read_last) == 1, "uv_config_files no longer reads /etc where this expects"
+    return functions.replace(read_last, f"${{XDG_CONFIG_DIRS:-/etc/xdg}} {shlex.quote(str(tmp_path / 'etc'))}")
 
 
 _SH_PREAMBLE = (
@@ -1793,10 +1803,16 @@ def _uv_index(tmp_path: Path, tag: str, *, suffix: str = "", tamper: bool = Fals
     return page, served
 
 
+def _served_from(index: str, page: Path, served: dict[str, Path]) -> dict[str, Path]:
+    """What :func:`_uv_index` serves, moved from TUNA to ``index``: its uv page
+    and the wheels its relative links lead to."""
+    host = "/".join(index.split("/")[:3])
+    moved = {url.replace("https://pypi.tuna.tsinghua.edu.cn", host): path for url, path in served.items()}
+    return {f"{index.rstrip('/')}/uv/": page, **moved}
+
+
 def _fake_unzip(bin_dir: Path) -> None:
     """unzip, for a host without one: the image this suite runs in ships none."""
-    import shlex
-
     (bin_dir / "unzip").write_text(
         "#!/bin/sh\n"
         'while [ $# -gt 0 ]; do case "$1" in -d) dir="$2"; shift 2 ;; -*) shift ;; *) zip="$1"; shift ;; esac; done\n'
@@ -1814,6 +1830,11 @@ _UV_STEP = (
     "reachable",
     "resolve_href",
     "install_uv_from_mirror",
+    "uv_config_files",
+    "uv_config_has",
+    "uv_config_index",
+    "uv_index_chosen",
+    "uv_named_indexes",
     "uv_host_chosen",
     "uv_unreachable",
     "ensure_uv",
@@ -1829,16 +1850,23 @@ def _run_uv_step(
     env: dict[str, str] | None = None,
     down: tuple[str, ...] = ("https://astral.sh/",),
     codes: dict[str, int] | None = None,
+    uv_toml: str | None = None,
+    machine_uv_toml: str | None = None,
 ):
     bin_dir = tmp_path / "bin"
     log = tmp_path / "curl.log"
     _fake_curl(bin_dir, served, down=down, codes=codes, log=log)
     _fake_unzip(bin_dir)
+    for root, text in (("config", uv_toml), ("xdg", machine_uv_toml)):
+        if text is not None:
+            (tmp_path / root / "uv").mkdir(parents=True)
+            (tmp_path / root / "uv" / "uv.toml").write_text(text, encoding="utf-8")
     harness = tmp_path / "uv-step.sh"
     # uv counts only where this step puts it: a uv the machine already has
     # (/usr/bin/uv, say) would end the step before any of it ran.
     have = 'have() { case "$1" in uv) [ -x "$HOME/.local/bin/uv" ] ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }\n'
-    harness.write_text(_SH_PREAMBLE + have + _sh_functions(_UV_STEP, _UV_SETTINGS) + "ensure_uv\n", encoding="utf-8")
+    functions = _without_the_machines_etc(_sh_functions(_UV_STEP, _UV_SETTINGS), tmp_path)
+    harness.write_text(_SH_PREAMBLE + have + functions + "ensure_uv\n", encoding="utf-8")
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     result = subprocess.run(
@@ -1852,6 +1880,8 @@ def _run_uv_step(
             "TMPDIR": str(tmp_path),
             "NODE_OS": "linux",
             "NODE_ARCH": "x64",
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "XDG_CONFIG_DIRS": str(tmp_path / "xdg"),
             **(env or {}),
         },
     )
@@ -1884,21 +1914,105 @@ def test_a_uv_wheel_that_does_not_match_its_published_digest_is_not_installed(tm
     assert not (bin_dir / "uv").exists()
 
 
-@POSIX_SH_ONLY
-def test_an_index_the_user_named_is_where_uv_comes_from(tmp_path: Path) -> None:
-    page, served = _uv_index(tmp_path, _UV_LINUX_TAG)
-    theirs = "https://pypi.example.internal/simple"
-    served = {
-        url.replace("https://pypi.tuna.tsinghua.edu.cn", "https://pypi.example.internal"): path
-        for url, path in served.items()
-    }
+_THEIRS = "https://pypi.example.internal/simple"
+# Each way a user names the index uv reads its packages from: the environment,
+# the user's uv.toml, the machine's.
+_NAMED_INDEXES = [
+    ({"UV_DEFAULT_INDEX": _THEIRS}, None, None),
+    ({"UV_INDEX_URL": _THEIRS}, None, None),
+    ({"UV_INDEX": f"corp={_THEIRS}"}, None, None),
+    ({"UV_INDEX": _THEIRS}, None, None),
+    ({}, f'index-url = "{_THEIRS}"\n', None),
+    ({}, None, f'[[index]]\nname = "corp"\nurl = "{_THEIRS}"\ndefault = true\n'),
+    ({}, f"index = [{{ url = '{_THEIRS}', default = true }}]\n", None),
+]
+_NAMED_INDEX_IDS = [
+    "default-index",
+    "index-url",
+    "named-index",
+    "index",
+    "uv-toml-index-url",
+    "machines-default-table",
+    "inline-default",
+]
 
-    result, _bin_dir, asked = _run_uv_step(
-        tmp_path, {f"{theirs}/uv/": page, **served}, env={"UV_DEFAULT_INDEX": theirs}
+
+@POSIX_SH_ONLY
+@pytest.mark.parametrize(("env", "uv_toml", "machine_uv_toml"), _NAMED_INDEXES, ids=_NAMED_INDEX_IDS)
+def test_an_index_the_user_named_is_where_uv_comes_from(
+    tmp_path: Path, env: dict[str, str], uv_toml: str | None, machine_uv_toml: str | None
+) -> None:
+    """The fallback reads the index the way uv would: from the environment, or
+    else from the uv.toml uv reads, in each form a default index takes there."""
+    page, served = _uv_index(tmp_path, _UV_LINUX_TAG)
+
+    result, bin_dir, asked = _run_uv_step(
+        tmp_path, _served_from(_THEIRS, page, served), env=env, uv_toml=uv_toml, machine_uv_toml=machine_uv_toml
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+    assert os.access(bin_dir / "uv", os.X_OK)
+    assert f"{_THEIRS}/uv/" in asked and not any("tuna" in url for url in asked)
+
+
+@POSIX_SH_ONLY
+@pytest.mark.parametrize("extra_lists_uv", [False, True], ids=["extra-lists-none", "extra-lists-uv"])
+def test_the_named_indexes_are_asked_in_uvs_order(tmp_path: Path, extra_lists_uv: bool) -> None:
+    """UV_INDEX's entries before the default, as uv asks them: the first that
+    lists uv is where it comes from, and one that lists none hands over to the
+    next."""
+    page, served = _uv_index(tmp_path, _UV_LINUX_TAG)
+    extra = "https://extra.example.internal/simple"
+    empty = tmp_path / "web" / "empty.html"
+    empty.write_text("<html></html>\n", encoding="utf-8")
+    first = _served_from(extra, page, served) if extra_lists_uv else {f"{extra}/uv/": empty}
+
+    result, _bin_dir, asked = _run_uv_step(
+        tmp_path,
+        {**_served_from(_THEIRS, page, served), **first},
+        env={"UV_INDEX": f"extra={extra}", "UV_DEFAULT_INDEX": _THEIRS},
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    if extra_lists_uv:
+        assert f"{extra}/uv/" in asked and f"{_THEIRS}/uv/" not in asked
+    else:
+        assert asked.index(f"{extra}/uv/") < asked.index(f"{_THEIRS}/uv/")
     assert not any("tuna" in url for url in asked)
+
+
+@POSIX_SH_ONLY
+def test_the_uv_toml_uv_config_file_names_is_where_the_index_is_read(tmp_path: Path) -> None:
+    page, served = _uv_index(tmp_path, _UV_LINUX_TAG)
+    named = tmp_path / "named.toml"
+    named.write_text(f'index-url = "{_THEIRS}"\n', encoding="utf-8")
+
+    result, _bin_dir, asked = _run_uv_step(
+        tmp_path,
+        _served_from(_THEIRS, page, served),
+        env={"UV_CONFIG_FILE": str(named)},
+        uv_toml='index-url = "https://other.example.internal/simple"\n',
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not any("other.example" in url or "tuna" in url for url in asked)
+
+
+@POSIX_SH_ONLY
+def test_an_index_a_uv_toml_names_unreadably_keeps_the_mirror_away(tmp_path: Path) -> None:
+    """A default index whose address this cannot read is still the user's
+    choice: uv does not come from the mirror, and the warning says how to hand
+    the index over."""
+    page, served = _uv_index(tmp_path, _UV_LINUX_TAG)
+
+    result, bin_dir, asked = _run_uv_step(
+        tmp_path, {_UV_PAGE: page, **served}, uv_toml=f'[[index]]\n"url" = "{_THEIRS}"\ndefault = true\n'
+    )
+
+    assert result.returncode != 0 and "DIE " in result.stderr
+    assert not (bin_dir / "uv").exists()
+    assert not any("tuna" in url for url in asked)
+    assert "UV_DEFAULT_INDEX" in result.stderr
 
 
 @POSIX_SH_ONLY
@@ -2022,9 +2136,11 @@ def test_a_host_the_user_chose_for_uvs_installer_is_never_replaced(tmp_path: Pat
 
 
 _PS1_UV_STEP = r"""
-foreach ($text in (Get-Install @("Find-Uv", "Install-UvFromMirror", "Test-MirrorsAllowed"))) {
-    Invoke-Expression $text
-}
+$names = @(
+    "Find-Uv", "Install-UvFromMirror", "Test-MirrorsAllowed", "Get-UvNamedIndexes", "Get-UvConfigIndex",
+    "Get-UvConfigFiles", "Test-UvConfigHas", "Test-UvIndexChosen"
+)
+foreach ($text in (Get-Install $names)) { Invoke-Expression $text }
 function Write-Info([string]$Message) { [Console]::Out.WriteLine("INFO $Message") }
 function Write-Warn([string]$Message) { [Console]::Out.WriteLine("WARN $Message") }
 # The machine's own uv is not the one this step installs.
@@ -2042,12 +2158,29 @@ $uv = Install-UvFromMirror
 """
 
 
-def _run_ps1_uv_step(tmp_path: Path, page: Path, served: dict[str, Path], *, env: dict[str, str] | None = None):
+def _run_ps1_uv_step(
+    tmp_path: Path,
+    page: Path,
+    served: dict[str, Path],
+    *,
+    env: dict[str, str] | None = None,
+    uv_tomls: dict[str, str] | None = None,
+):
+    """Install-UvFromMirror; ``uv_tomls`` as in :func:`_run_ps1_package_step`."""
+    for root, text in (uv_tomls or {}).items():
+        (tmp_path / root / "uv").mkdir(parents=True)
+        (tmp_path / root / "uv" / "uv.toml").write_text(text, encoding="utf-8")
     result = _run_ps1(
         tmp_path,
         "uv-step",
         _ps1_settings("ErrorActionPreference", "PypiMirror") + _PS1_FAKE_WEB + _PS1_UV_STEP,
-        env={"USERPROFILE": str(tmp_path / "home"), "HOME": str(tmp_path / "home"), **(env or {})},
+        env={
+            "USERPROFILE": str(tmp_path / "home"),
+            "HOME": str(tmp_path / "home"),
+            "APPDATA": str(tmp_path / "appdata"),
+            "PROGRAMDATA": str(tmp_path / "programdata"),
+            **(env or {}),
+        },
         WebRoot=str(page.parent),
         ServedList=";".join(f"{url}={path.name}" for url, path in served.items()),
     )
@@ -2081,20 +2214,67 @@ def test_a_windows_uv_wheel_that_does_not_match_its_published_digest_is_not_inst
 
 @pytest.mark.slow
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
-def test_a_windows_uv_comes_from_the_index_the_user_named(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("env", "uv_tomls"),
+    [
+        ({"UV_DEFAULT_INDEX": _THEIRS}, None),
+        ({"UV_INDEX": f"corp={_THEIRS}"}, None),
+        ({}, {"appdata": f'index-url = "{_THEIRS}"\n'}),
+        ({}, {"programdata": f'[[index]]\nname = "corp"\nurl = "{_THEIRS}"\ndefault = true\n'}),
+        ({}, {"appdata": f"index = [{{ url = '{_THEIRS}', default = true }}]\n"}),
+    ],
+    ids=["default-index", "named-index", "uv-toml-index-url", "machines-default-table", "inline-default"],
+)
+def test_a_windows_uv_comes_from_the_index_the_user_named(
+    tmp_path: Path, env: dict[str, str], uv_tomls: dict[str, str] | None
+) -> None:
     page, served = _uv_index(tmp_path, "win_amd64", suffix=".exe")
-    theirs = "https://pypi.example.internal/simple"
-    served = {
-        url.replace("https://pypi.tuna.tsinghua.edu.cn", "https://pypi.example.internal"): path
-        for url, path in served.items()
-    }
+
+    result, bin_dir = _run_ps1_uv_step(tmp_path, page, _served_from(_THEIRS, page, served), env=env, uv_tomls=uv_tomls)
+
+    assert (bin_dir / "uv.exe").is_file(), result.stdout + result.stderr
+    assert f"{_THEIRS}/uv/" in result.stdout and "tuna" not in result.stdout
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+@pytest.mark.parametrize("extra_lists_uv", [False, True], ids=["extra-lists-none", "extra-lists-uv"])
+def test_a_windows_uv_asks_the_named_indexes_in_uvs_order(tmp_path: Path, extra_lists_uv: bool) -> None:
+    page, served = _uv_index(tmp_path, "win_amd64", suffix=".exe")
+    extra = "https://extra.example.internal/simple"
+    empty = page.parent / "empty.html"
+    empty.write_text("<html></html>\n", encoding="utf-8")
+    first = _served_from(extra, page, served) if extra_lists_uv else {f"{extra}/uv/": empty}
 
     result, bin_dir = _run_ps1_uv_step(
-        tmp_path, page, {f"{theirs}/uv/": page, **served}, env={"UV_DEFAULT_INDEX": theirs}
+        tmp_path,
+        page,
+        {**_served_from(_THEIRS, page, served), **first},
+        env={"UV_INDEX": f"extra={extra}", "UV_DEFAULT_INDEX": _THEIRS},
     )
 
     assert (bin_dir / "uv.exe").is_file(), result.stdout + result.stderr
+    if extra_lists_uv:
+        assert f"{extra}/uv/" in result.stdout and f"{_THEIRS}/uv/" not in result.stdout
+    else:
+        assert result.stdout.index(f"{extra}/uv/") < result.stdout.index(f"{_THEIRS}/uv/")
     assert "tuna" not in result.stdout
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+def test_a_windows_uv_toml_index_read_unreadably_keeps_the_mirror_away(tmp_path: Path) -> None:
+    page, served = _uv_index(tmp_path, "win_amd64", suffix=".exe")
+
+    result, bin_dir = _run_ps1_uv_step(
+        tmp_path,
+        page,
+        {_UV_PAGE: page, **served},
+        uv_tomls={"appdata": f'[[index]]\n"url" = "{_THEIRS}"\ndefault = true\n'},
+    )
+
+    assert not (bin_dir / "uv.exe").exists(), result.stdout + result.stderr
+    assert "tuna" not in result.stdout and "UV_DEFAULT_INDEX" in result.stdout
 
 
 _PS1_ENSURE_UV_STEP = r"""
@@ -2266,6 +2446,7 @@ _PACKAGE_STEP = (
     "connection_failed",
     "reachable",
     "use_mirror",
+    "uv_config_files",
     "uv_config_has",
     "uv_index_chosen",
     "use_package_mirrors",
@@ -2289,7 +2470,9 @@ def _run_package_step(
             (tmp_path / root / "uv" / "uv.toml").write_text(text, encoding="utf-8")
     harness = tmp_path / "package-step.sh"
     harness.write_text(
-        _SH_PREAMBLE + _sh_functions(_PACKAGE_STEP, _PACKAGE_SETTINGS) + "use_package_mirrors\n"
+        _SH_PREAMBLE
+        + _without_the_machines_etc(_sh_functions(_PACKAGE_STEP, _PACKAGE_SETTINGS), tmp_path)
+        + "use_package_mirrors\n"
         'echo "INDEX=${UV_DEFAULT_INDEX:-}"\n'
         'echo "PYTHON=${UV_PYTHON_INSTALL_MIRROR:-}"\n'
         'echo "EXPORTED=$MIRROR_EXPORTS"\n',
@@ -2356,13 +2539,27 @@ def test_an_index_the_user_named_is_kept(tmp_path: Path, name: str) -> None:
     [
         'index-url = "https://pypi.example.internal/simple"\n',
         '[[index]]\nurl = "https://pypi.example.internal/simple"\ndefault = true\n',
+        'index = [{ url = "https://pypi.example.internal/simple", default = true }]\n',
+        'index = [\n  { name = "corp", url = "https://pypi.example.internal/simple", default = true },\n]\n',
     ],
-    ids=["index-url", "default-index"],
+    ids=["index-url", "default-index", "inline-default-index", "inline-default-index-in-a-list"],
 )
 def test_an_index_in_the_users_uv_toml_is_kept(tmp_path: Path, text: str) -> None:
     _result, said, _probes = _run_package_step(tmp_path, down=("https://pypi.org/",), uv_toml=text)
 
     assert said["INDEX"] == ""
+
+
+@POSIX_SH_ONLY
+def test_an_index_that_is_not_the_default_leaves_pypi_to_the_mirror(tmp_path: Path) -> None:
+    """uv still asks PyPI for whatever such an index does not carry."""
+    _result, said, _probes = _run_package_step(
+        tmp_path,
+        down=("https://pypi.org/",),
+        uv_toml='index = [{ url = "https://pypi.example.internal/simple", explicit = true }]\n',
+    )
+
+    assert said["INDEX"] == "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 
 @POSIX_SH_ONLY
@@ -2440,7 +2637,7 @@ def test_both_installers_choose_the_package_hosts_before_the_first_install() -> 
 _PS1_PACKAGE_STEP = r"""
 $names = @(
     "Test-MirrorsAllowed", "Test-Reachable", "Set-MirrorEnv", "Restore-MirrorEnv",
-    "Test-UvConfigHas", "Test-UvIndexChosen", "Use-PackageMirrors"
+    "Get-UvConfigFiles", "Test-UvConfigHas", "Test-UvIndexChosen", "Use-PackageMirrors"
 )
 foreach ($text in (Get-Install $names)) { Invoke-Expression $text }
 function Write-Warn([string]$Message) { [Console]::Out.WriteLine("WARN $Message") }
@@ -2517,6 +2714,22 @@ def test_a_windows_install_keeps_an_index_in_a_uv_toml(tmp_path: Path, root: str
         env=named,
         uv_tomls={root: 'index-url = "https://pypi.example.internal/simple"\n'},
     )
+
+    assert said["INDEX"] == ""
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
+@pytest.mark.parametrize(
+    "text",
+    [
+        'index = [{ url = "https://pypi.example.internal/simple", default = true }]\n',
+        'index = [\n  { name = "corp", url = "https://pypi.example.internal/simple", default = true },\n]\n',
+    ],
+    ids=["inline-default-index", "inline-default-index-in-a-list"],
+)
+def test_a_windows_install_keeps_an_inline_default_index(tmp_path: Path, text: str) -> None:
+    _result, said = _run_ps1_package_step(tmp_path, down=("https://pypi.org/",), uv_tomls={"appdata": text})
 
     assert said["INDEX"] == ""
 

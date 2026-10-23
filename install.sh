@@ -204,9 +204,10 @@ resolve_href() {
 # uv publishes the binary its installer fetches to PyPI too, as a wheel, and a
 # wheel is a zip. When uv's own installer could not reach its hosts
 # (uv_unreachable), uv and uvx are unpacked from the newest wheel for this
-# platform on the PyPI mirror, or on the index UV_DEFAULT_INDEX names when the
-# user named one, and checked against the sha256 the index publishes beside the
-# link.
+# platform on the indexes the user named for uv, asked in uv's order
+# (uv_named_indexes), or on the PyPI mirror when they named none, and checked
+# against the sha256 the index publishes beside the link. An index named in a
+# uv.toml this cannot read keeps the mirror away all the same.
 install_uv_from_mirror() {
   case "$NODE_OS-$NODE_ARCH" in
     linux-x64)
@@ -218,18 +219,31 @@ install_uv_from_mirror() {
     darwin-arm64) uv_tag="macosx_11_0_arm64" ;;
     *) return 1 ;;
   esac
-  uv_index="${UV_DEFAULT_INDEX:-${UV_INDEX_URL:-$PYPI_MIRROR}}"
-  uv_page="${uv_index%/}/uv/"
-  warn "uv's installer could not reach its hosts; fetching uv from $uv_page instead (RAVEN_NO_MIRROR=1 turns this off)."
+  uv_indexes="$(uv_named_indexes)"
+  if [ -z "$uv_indexes" ]; then
+    if uv_index_chosen; then
+      warn "uv's installer could not reach its hosts, and the index a uv.toml names could not be read here, so uv does not come from the mirror; set UV_DEFAULT_INDEX to that index to fetch uv from it."
+      return 1
+    fi
+    uv_indexes="$PYPI_MIRROR"
+  fi
   uv_work="$(mktemp -d)" || return 1
-  # The newest release, compared field by field: an index lists files in name
-  # order, where 0.9.9 sorts after 0.13.4.
-  uv_href="$(
-    curl -fsSL --connect-timeout 15 "$uv_page" 2>/dev/null | grep -o 'href="[^"]*"' | sed 's/^href="//; s/"$//' \
-      | grep "uv-[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-py3-none-[^/#]*$uv_tag[^/#]*\.whl" \
-      | sed 's|^\(.*uv-\([0-9][0-9.]*\)-py3-none-.*\)$|\2 \1|' \
-      | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1 | cut -d' ' -f2-
-  )" || uv_href=""
+  uv_href=""
+  set -f
+  for uv_index in $uv_indexes; do
+    uv_page="${uv_index%/}/uv/"
+    warn "uv's installer could not reach its hosts; fetching uv from $uv_page instead (RAVEN_NO_MIRROR=1 turns this off)."
+    # The newest release, compared field by field: an index lists files in
+    # name order, where 0.9.9 sorts after 0.13.4.
+    uv_href="$(
+      curl -fsSL --connect-timeout 15 "$uv_page" 2>/dev/null | grep -o 'href="[^"]*"' | sed 's/^href="//; s/"$//' \
+        | grep "uv-[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*-py3-none-[^/#]*$uv_tag[^/#]*\.whl" \
+        | sed 's|^\(.*uv-\([0-9][0-9.]*\)-py3-none-.*\)$|\2 \1|' \
+        | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1 | cut -d' ' -f2-
+    )" || uv_href=""
+    [ -z "$uv_href" ] || break
+  done
+  set +f
   case "$uv_href" in
     *'#sha256='*) uv_sha="${uv_href##*#sha256=}" ;;
     *) uv_sha="" ;;
@@ -512,15 +526,13 @@ is_raven_source() {
   [ -f "$1/pyproject.toml" ] && grep -q '^name = "raven"' "$1/pyproject.toml" 2>/dev/null
 }
 
-# Whether a uv.toml uv reads -- the user's, or the machine's -- has a line
-# matching the extended regular expression $1.
-uv_config_has() {
-  uv_pattern="$1"
+# The uv.toml files uv reads, one per line: the one UV_CONFIG_FILE names, or
+# the user's, then the machine's -- each of XDG_CONFIG_DIRS, then /etc.
+uv_config_files() {
   if [ -n "${UV_CONFIG_FILE:-}" ]; then
-    [ -f "$UV_CONFIG_FILE" ] && grep -Eq "$uv_pattern" "$UV_CONFIG_FILE"
+    printf '%s\n' "$UV_CONFIG_FILE"
     return
   fi
-  # The user's, then the machine's: each of XDG_CONFIG_DIRS, then /etc.
   uv_ifs="$IFS"
   IFS=:
   set -f
@@ -528,15 +540,75 @@ uv_config_has() {
   set +f
   IFS="$uv_ifs"
   for uv_root in "$@"; do
-    [ -f "$uv_root/uv/uv.toml" ] && grep -Eq "$uv_pattern" "$uv_root/uv/uv.toml" && return 0
+    printf '%s/uv/uv.toml\n' "$uv_root"
   done
-  return 1
+}
+
+# Whether a uv.toml uv reads -- the user's, or the machine's -- has a line
+# matching the extended regular expression $1.
+uv_config_has() {
+  uv_config_files | {
+    while IFS= read -r uv_file; do
+      [ -f "$uv_file" ] && grep -Eq "$1" "$uv_file" && exit 0
+    done
+    exit 1
+  }
+}
+
+# The address of the default index a uv.toml uv reads names: its index-url,
+# or the url of the index marked default = true, written as a table or inline.
+# The first file that names one decides, as it does for uv.
+uv_config_index() {
+  uv_config_files | while IFS= read -r uv_file; do
+    [ -f "$uv_file" ] || continue
+    uv_found="$(awk '
+      function value(text, q) {
+        sub(/^[^=]*=[ \t]*/, "", text)
+        q = substr(text, 1, 1)
+        if (q != "\"" && q != sq) return ""
+        text = substr(text, 2)
+        return index(text, q) ? substr(text, 1, index(text, q) - 1) : ""
+      }
+      BEGIN { sq = sprintf("%c", 39) }
+      /^[ \t]*\[/ { table = ($0 ~ /^[ \t]*\[\[[ \t]*index[ \t]*\]\]/); url = ""; dflt = 0; next }
+      /^[ \t]*index-url[ \t]*=/ { u = value($0); if (u != "") { print u; exit } }
+      /[{,][ \t]*default[ \t]*=[ \t]*true/ && match($0, /[{,][ \t]*url[ \t]*=/) {
+        u = value(substr($0, RSTART + 1)); if (u != "") { print u; exit }
+      }
+      table && /^[ \t]*url[ \t]*=/ { url = value($0) }
+      table && /^[ \t]*default[ \t]*=[ \t]*true/ { dflt = 1 }
+      table && dflt && url != "" { print url; exit }
+    ' "$uv_file")"
+    if [ -n "$uv_found" ]; then
+      printf '%s\n' "$uv_found"
+      break
+    fi
+  done
 }
 
 uv_index_chosen() {
   [ -n "${UV_DEFAULT_INDEX:-}${UV_INDEX_URL:-}${UV_INDEX:-}" ] && return 0
   uv_config_has '^[[:space:]]*index-url[[:space:]]*=' && return 0
-  uv_config_has '^[[:space:]]*default[[:space:]]*=[[:space:]]*true'
+  # A default index is marked default = true, in an [[index]] table or inline.
+  uv_config_has '(^|[{,[:space:]])default[[:space:]]*=[[:space:]]*true'
+}
+
+# The indexes the user named for uv, one per line, in the order uv asks them:
+# each of UV_INDEX's, then the default -- UV_DEFAULT_INDEX or UV_INDEX_URL, or
+# else the one a uv.toml names.
+uv_named_indexes() {
+  set -f
+  for uv_entry in ${UV_INDEX:-}; do
+    printf '%s\n' "$uv_entry" | sed 's/^[A-Za-z0-9._-]*=//'
+  done
+  set +f
+  if [ -n "${UV_DEFAULT_INDEX:-}" ]; then
+    printf '%s\n' "$UV_DEFAULT_INDEX"
+  elif [ -n "${UV_INDEX_URL:-}" ]; then
+    printf '%s\n' "$UV_INDEX_URL"
+  else
+    uv_config_index
+  fi
 }
 
 # uv resolves raven's dependencies from PyPI, and fetches a Python when the
