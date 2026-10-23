@@ -718,9 +718,11 @@ def _ps1_settings(*names: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _run_ps1(tmp_path: Path, name: str, body: str, *, env: dict[str, str] | None = None, **params: str):
-    """Run `body` under pwsh with install.ps1's functions within reach, each of
-    `params` handed in as a string parameter of the same name."""
+def _run_ps1(
+    tmp_path: Path, name: str, body: str, *, env: dict[str, str] | None = None, shell: str = "pwsh", **params: str
+):
+    """Run `body` under `shell` with install.ps1's functions within reach, each
+    of `params` handed in as a string parameter of the same name."""
     harness = tmp_path / f"{name}.ps1"
     names = ["Ps1", *params]
     harness.write_text(
@@ -729,7 +731,7 @@ def _run_ps1(tmp_path: Path, name: str, body: str, *, env: dict[str, str] | None
     )
     staging = tmp_path / "staging"
     staging.mkdir(exist_ok=True)
-    argv = [shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-File", str(harness), "-Ps1", str(INSTALL_PS1)]
+    argv = [shutil.which(shell), "-NoProfile", "-NonInteractive", "-File", str(harness), "-Ps1", str(INSTALL_PS1)]
     for key, value in params.items():
         argv += [f"-{key}", value]
     return subprocess.run(
@@ -3052,6 +3054,8 @@ foreach ($text in (Get-Install $names)) { Invoke-Expression $text }
 function Write-Warn([string]$Message) { [Console]::Out.WriteLine("WARN $Message") }
 $Served = @{}
 $Down = @($DownList -split ",")
+$named = [string](Get-UvConfigIndex)
+[Console]::Out.WriteLine("CONFIG=$named")
 Use-PackageMirrors
 [Console]::Out.WriteLine("INDEX=$env:UV_DEFAULT_INDEX")
 [Console]::Out.WriteLine("PYTHON=$env:UV_PYTHON_INSTALL_MIRROR")
@@ -3066,6 +3070,7 @@ def _run_ps1_package_step(
     down: tuple[str, ...] = (),
     env: dict[str, str] | None = None,
     uv_tomls: dict[str, str] | None = None,
+    shell: str = "pwsh",
 ):
     dist = tmp_path / "dist"
     dist.mkdir(exist_ok=True)
@@ -3085,6 +3090,7 @@ def _run_ps1_package_step(
         env={"APPDATA": str(tmp_path / "appdata"), "PROGRAMDATA": str(tmp_path / "programdata"), **(env or {})},
         WebRoot=str(dist),
         DownList=",".join(down),
+        shell=shell,
     )
     return result, dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
 
@@ -3163,10 +3169,14 @@ def test_a_windows_install_reads_a_uv_config_file_with_brackets(tmp_path: Path) 
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell")
-def test_a_windows_install_decodes_a_uv_config_file_as_utf8(tmp_path: Path) -> None:
+@pytest.mark.parametrize("shell", ["pwsh", "powershell"])
+def test_a_windows_install_decodes_a_uv_config_file_as_utf8(tmp_path: Path, shell: str) -> None:
     """Windows PowerShell 5.1 reads BOM-less files through the ANSI code page
-    unless told otherwise, which corrupts a non-ASCII index URL."""
+    unless told otherwise, which corrupts a non-ASCII index URL. The value
+    reader is asserted directly, because recognizing the ASCII key alone
+    cannot tell an intact URL from a mis-decoded one."""
+    if shutil.which(shell) is None:
+        pytest.skip(f"needs {shell}")
     chosen = tmp_path / "utf8"
     chosen.mkdir()
     url = "https://pypi.example.internal/caf\u00e9/simple"
@@ -3175,9 +3185,11 @@ def test_a_windows_install_decodes_a_uv_config_file_as_utf8(tmp_path: Path) -> N
         tmp_path,
         down=("https://pypi.org/",),
         env={"UV_CONFIG_FILE": str(chosen / "uv.toml")},
+        shell=shell,
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+    assert said["CONFIG"] == url
     assert said["INDEX"] == ""
 
 
