@@ -166,7 +166,15 @@ class CheckpointStore:
             if theirs is None:
                 continue
             if theirs[0] != mine[0] or (theirs[1] < mine[1] and other.checkpoint_id != named):
-                other_path.unlink(missing_ok=True)
+                try:
+                    other_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    # Windows refuses to delete a file another reader holds
+                    # open. The new checkpoint is already written and readers
+                    # match on scope, so a stale file left here is only clutter
+                    # the next write clears; losing this turn's history to it
+                    # would not be.
+                    logger.info("Could not remove superseded checkpoint {}: {}", other_path, exc)
         return path
 
     def chain(self, session_key: str, *, scope: str | None = None) -> list[CompactionCheckpoint]:

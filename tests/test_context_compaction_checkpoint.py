@@ -1627,6 +1627,32 @@ class TestTheStore:
         path = store.path_for(CompactionCheckpoint(**{**checkpoint.__dict__, "session_key": "../../etc/passwd"}))
         assert tmp_path in path.parents
 
+    async def test_a_superseded_file_another_reader_holds_does_not_cost_the_turn_its_history(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows refuses to delete a file another process has open. The new
+        checkpoint is written by then, so the stale one is left for the next
+        write instead of failing the history segment and sending the turn out
+        with nothing but its own message."""
+        builder = _builder(tmp_path, _RecordingProvider())
+        await builder.build(_ctx(_session(UNDER)))
+        await builder.build(_ctx(_session(OVER)))
+        [old] = CheckpointStore(tmp_path / CHECKPOINT_DIR)._checkpoint_files("s1")
+
+        def held_open(self, missing_ok=False):
+            raise PermissionError(32, "The process cannot access the file because it is being used", str(self))
+
+        monkeypatch.setattr(Path, "unlink", held_open)
+        other_log = "fedcba9876543210" * 2
+        session = _session(OVER)
+        await builder.build(_ctx(_session(UNDER), revision=_revision(session, log_id=other_log)))
+        segment = await builder.build(_ctx(session, revision=_revision(session, log_id=other_log)))
+
+        assert segment.meta["compaction_action"] == "compact"
+        assert len(segment.history) > 2, "the history segment failed and the turn kept only its own message"
+        assert old.exists()
+        assert len(CheckpointStore(tmp_path / CHECKPOINT_DIR)._checkpoint_files("s1")) == 2
+
 
 # ---------------------------------------------------------------------------
 # Which failures earn the shorter retry
